@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target
+
+# Local runtime data & logs
+/pkg/
+*.log
+
+# Environment variables (API keys)
+.env
+
+# Knowledge-graph tooling output
+graphify-out/
