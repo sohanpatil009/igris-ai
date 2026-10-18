@@ -33,8 +33,14 @@ tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 prost = "0.13"
 prost-types = "0.13"
 reqwest = { version = "0.11", features = ["stream", "json", "blocking"] }
+
+# Setup manager (model installers) + streaming downloads.
 futures = "0.3"
 dirs = "5"
+
+# TLS crypto provider used by the online STT gRPC client (default off;
+# enabled by the with_riva feature).
+rustls = { version = "0.23", optional = true, features = ["aws_lc_rs"] }
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -44,4 +50,9 @@ protoc-bin-vendored = "3"
 # Generates + compiles the NVIDIA Riva gRPC client (online STT). Requires
 # the riva proto tree from the desktop companion (../igris-ecosystem/proto).
 default = []
-with_riva = []
+with_riva = ["dep:rustls"]
+
+# Declared so cargo recognizes the cfg name build.rs turns on when libpiper
+# is installed (native FFI TTS). Without it TTS falls back to spawning
+# piper.exe.
+piper_ffi = []
