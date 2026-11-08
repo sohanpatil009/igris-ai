@@ -1,8 +1,8 @@
 // src/nlu/nlu_processor.rs - Unified NLU processing with NER and SBERT integration
 // Provides high-level interface combining NER, SBERT, and Intent recognition
 
-use crate::nlu::engine::GLOBAL_NLU;
 use crate::nlu::context::add_to_context_with_details;
+use crate::nlu::engine::GLOBAL_NLU;
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -38,17 +38,17 @@ impl ProcessedInput {
             is_valid: false,
         }
     }
-    
+
     /// Check if a specific entity type is present
     pub fn has_entity(&self, entity_type: &str) -> bool {
         self.entity_map.contains_key(entity_type)
     }
-    
+
     /// Get entity value by type
     pub fn get_entity(&self, entity_type: &str) -> Option<String> {
         self.entity_map.get(entity_type).cloned()
     }
-    
+
     /// Get all values for a specific entity type (for multiple occurrences)
     pub fn get_all_entities(&self, entity_type: &str) -> Vec<String> {
         self.entity_map
@@ -65,33 +65,26 @@ impl ProcessedInput {
 pub fn process_user_input(input: &str) -> Result<ProcessedInput> {
     // Process through the main NLU engine
     let intent_result = GLOBAL_NLU.process_input(input)?;
-    
+
     // Convert to our unified format
     let processed = ProcessedInput {
         original_input: input.to_string(),
         normalized_input: intent_result.normalized_input.clone(),
         intent: intent_result.intent_name.clone(),
         confidence: intent_result.confidence,
-        entities: intent_result
-            .entities
-            .values()
-            .cloned()
-            .collect(),
+        entities: intent_result.entities.values().cloned().collect(),
         entity_map: intent_result.entities,
         is_valid: intent_result.intent_name != "UnknownIntent",
     };
-    
+
     Ok(processed)
 }
 
 /// Process input and add to context in one call
 #[allow(dead_code)]
-pub fn process_and_remember(
-    input: &str,
-    response: &str,
-) -> Result<ProcessedInput> {
+pub fn process_and_remember(input: &str, response: &str) -> Result<ProcessedInput> {
     let processed = process_user_input(input)?;
-    
+
     // Add to context with full details
     add_to_context_with_details(
         input.to_string(),
@@ -102,7 +95,7 @@ pub fn process_and_remember(
         processed.confidence,
         processed.normalized_input.clone(),
     );
-    
+
     Ok(processed)
 }
 
@@ -110,7 +103,7 @@ pub fn process_and_remember(
 #[allow(dead_code)]
 pub fn extract_entity_details(processed: &ProcessedInput) -> HashMap<String, Vec<String>> {
     let mut details: HashMap<String, Vec<String>> = HashMap::new();
-    
+
     // Group entities by their base type
     for (key, value) in &processed.entity_map {
         // Extract the base type (before any suffixes)
@@ -119,12 +112,13 @@ pub fn extract_entity_details(processed: &ProcessedInput) -> HashMap<String, Vec
         } else {
             key.as_str()
         };
-        
-        details.entry(base_type.to_string())
-            .or_insert_with(Vec::new)
+
+        details
+            .entry(base_type.to_string())
+            .or_default()
             .push(value.clone());
     }
-    
+
     details
 }
 
@@ -156,9 +150,13 @@ mod tests {
     #[test]
     fn test_entity_operations() {
         let mut processed = ProcessedInput::unknown();
-        processed.entity_map.insert("app".to_string(), "chrome".to_string());
-        processed.entity_map.insert("action".to_string(), "open".to_string());
-        
+        processed
+            .entity_map
+            .insert("app".to_string(), "chrome".to_string());
+        processed
+            .entity_map
+            .insert("action".to_string(), "open".to_string());
+
         assert!(processed.has_entity("app"));
         assert_eq!(processed.get_entity("app"), Some("chrome".to_string()));
         assert!(!processed.has_entity("file"));

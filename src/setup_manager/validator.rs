@@ -1,8 +1,8 @@
 // src/setup_manager/validator.rs
 // Validates that all required files are present and properly structured
 
-use std::path::PathBuf;
 use dirs;
+use std::path::PathBuf;
 
 pub struct SetupValidator {
     pkg_dir: PathBuf,
@@ -26,9 +26,9 @@ impl SetupValidator {
 
     pub fn validate_all(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.validate_llvm()?;
-        self.validate_piper()?;
-        self.validate_sensevoice_model()?;
-        self.validate_voice_model()?;
+        self.validate_tts()?;
+        self.validate_stt()?;
+        self.validate_silero()?;
         self.validate_directories()?;
 
         println!("✅ All setup validations passed!");
@@ -47,11 +47,7 @@ impl SetupValidator {
 
         let clang_bin = bin_dir.join(clang_name);
         if !clang_bin.exists() {
-            return Err(format!(
-                "LLVM clang not found. Checked: {}",
-                clang_bin.display()
-            )
-            .into());
+            return Err(format!("LLVM clang not found. Checked: {}", clang_bin.display()).into());
         }
 
         println!("  ✓ LLVM clang found at: {}", clang_bin.display());
@@ -107,6 +103,76 @@ impl SetupValidator {
         Ok(())
     }
 
+    fn validate_tts(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let kokoro = self.pkg_dir.join("models/kokoro/model.onnx");
+        let kokoro_alt = self.pkg_dir.join("models/kokoro/model.int8.onnx");
+        let kokoro_voices = self.pkg_dir.join("models/kokoro/voices.bin");
+
+        if (kokoro.exists() || kokoro_alt.exists()) && kokoro_voices.exists() {
+            let model = if kokoro.exists() { kokoro } else { kokoro_alt };
+            let size = std::fs::metadata(&model)?.len();
+            if size < 10_000_000 {
+                return Err("Kokoro model file is too small (corrupted?)".into());
+            }
+            println!(
+                "✅ Kokoro TTS validated: {:.2} MB",
+                size as f64 / 1_000_000.0
+            );
+            return Ok(());
+        }
+
+        // Legacy Piper fallback.
+        self.validate_piper()?;
+        self.validate_voice_model()
+    }
+
+    fn validate_stt(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let encoder = self.pkg_dir.join("models/parakeet/encoder.int8.onnx");
+        let encoder_alt = self.pkg_dir.join("models/parakeet/encoder.onnx");
+        let decoder = self.pkg_dir.join("models/parakeet/decoder.int8.onnx");
+        let decoder_alt = self.pkg_dir.join("models/parakeet/decoder.onnx");
+        let joiner = self.pkg_dir.join("models/parakeet/joiner.int8.onnx");
+        let joiner_alt = self.pkg_dir.join("models/parakeet/joiner.onnx");
+        let tokens = self.pkg_dir.join("models/parakeet/tokens.txt");
+
+        if (encoder.exists() || encoder_alt.exists())
+            && (decoder.exists() || decoder_alt.exists())
+            && (joiner.exists() || joiner_alt.exists())
+            && tokens.exists()
+        {
+            let model = if encoder.exists() {
+                encoder
+            } else {
+                encoder_alt
+            };
+            let size = std::fs::metadata(&model)?.len();
+            if size < 10_000_000 {
+                return Err("Parakeet encoder is too small (corrupted?)".into());
+            }
+            println!(
+                "✅ Parakeet STT validated: {:.2} MB encoder",
+                size as f64 / 1_000_000.0
+            );
+            return Ok(());
+        }
+
+        // Legacy SenseVoice fallback.
+        self.validate_sensevoice_model()
+    }
+
+    fn validate_silero(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let model = self.pkg_dir.join("models/silero_vad.onnx");
+        if !model.exists() {
+            return Err("Silero VAD model not found (models/silero_vad.onnx)".into());
+        }
+        let size = std::fs::metadata(&model)?.len();
+        if size < 100_000 {
+            return Err("Silero VAD model file is too small (corrupted?)".into());
+        }
+        println!("✅ Silero VAD validated: {:.2} KB", size as f64 / 1024.0);
+        Ok(())
+    }
+
     fn validate_voice_model(&self) -> Result<(), Box<dyn std::error::Error>> {
         let model_path = self
             .pkg_dir
@@ -144,6 +210,8 @@ impl SetupValidator {
             self.pkg_dir.join("models"),
             self.pkg_dir.join("models/bold_voice"),
             self.pkg_dir.join("models/sense-voice"),
+            self.pkg_dir.join("models/parakeet"),
+            self.pkg_dir.join("models/kokoro"),
         ];
 
         for dir in dirs {

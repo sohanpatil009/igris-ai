@@ -1,0 +1,13 @@
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "command": "npx.cmd",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "F:\\major_project"
+      ]
+    }
+  ]
+}

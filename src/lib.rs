@@ -18,6 +18,10 @@ use std::sync::{Arc, Mutex};
 
 /// One-way seam to the companion host (config values + plugin snapshots).
 pub mod bridge;
+pub mod mcp;
+pub mod memory;
+pub mod security;
+pub mod tools;
 
 /// Self-contained installer for the assistant: model downloads, extraction,
 /// validation, per-platform tooling setup, and runtime permissions.
@@ -39,9 +43,12 @@ pub mod online;
 // Selected online LLM model for reasoning (label string), sourced from the
 // NVIDIA_NIM_MODEL env default like the original companion shell.
 pub static SELECTED_MODEL: once_cell::sync::Lazy<Arc<Mutex<String>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(
-        std::env::var("NVIDIA_NIM_MODEL").unwrap_or_else(|_| "meta/llama-3.1-70b-instruct".to_string())
-    )));
+    once_cell::sync::Lazy::new(|| {
+        Arc::new(Mutex::new(
+            std::env::var("NVIDIA_NIM_MODEL")
+                .unwrap_or_else(|_| "meta/llama-3.1-70b-instruct".to_string()),
+        ))
+    });
 
 pub fn set_selected_model(model: &str) {
     if let Ok(mut m) = SELECTED_MODEL.lock() {

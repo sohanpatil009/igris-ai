@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{VecDeque, HashMap};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Maximum number of conversation turns to remember
@@ -20,7 +20,12 @@ pub struct TaskStepRecord {
 
 impl TaskStepRecord {
     pub fn new(tool: String, command: String, result: String) -> Self {
-        Self { tool, command, result, timestamp: Utc::now() }
+        Self {
+            tool,
+            command,
+            result,
+            timestamp: Utc::now(),
+        }
     }
 }
 
@@ -58,7 +63,7 @@ impl ConversationTurn {
             normalized_input: String::new(),
         }
     }
-    
+
     /// Create a new turn with full NER/SBERT details
     pub fn with_details(
         user_input: String,
@@ -109,10 +114,10 @@ impl ContextMemory {
         if self.history.len() >= self.max_size {
             self.history.pop_front();
         }
-        
+
         // Update current topic based on intent
         self.current_topic = Some(turn.intent.clone());
-        
+
         // Merge entities into entity pool
         for (k, v) in &turn.entity_map {
             self.entity_pool.insert(k.clone(), v.clone());
@@ -120,7 +125,7 @@ impl ContextMemory {
         for e in &turn.entities {
             self.entity_pool.insert(e.clone(), e.clone());
         }
-        
+
         self.history.push_back(turn);
     }
 
@@ -129,7 +134,8 @@ impl ContextMemory {
         if self.task_history.len() >= 20 {
             self.task_history.pop_front();
         }
-        self.task_history.push_back(TaskStepRecord::new(tool, command, result));
+        self.task_history
+            .push_back(TaskStepRecord::new(tool, command, result));
     }
 
     /// Get recent task steps for context
@@ -157,13 +163,18 @@ impl ContextMemory {
         if !tasks.is_empty() {
             parts.push("Recent task results:".to_string());
             for task in &tasks {
-                parts.push(format!("  → {} ({}): {}", task.tool, task.command, task.result));
+                parts.push(format!(
+                    "  → {} ({}): {}",
+                    task.tool, task.command, task.result
+                ));
             }
         }
 
         // Available entities
         if !self.entity_pool.is_empty() {
-            let entries: Vec<String> = self.entity_pool.iter()
+            let entries: Vec<String> = self
+                .entity_pool
+                .iter()
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect();
             parts.push(format!("Known entities: {}", entries.join(", ")));
@@ -192,7 +203,9 @@ impl ContextMemory {
 
     /// Get the last assistant response
     pub fn get_last_response(&self) -> Option<String> {
-        self.history.back().map(|turn| turn.assistant_response.clone())
+        self.history
+            .back()
+            .map(|turn| turn.assistant_response.clone())
     }
 
     /// Get the current topic
@@ -220,9 +233,12 @@ impl ContextMemory {
     /// Resolve pronoun references (it, that, this, etc.)
     pub fn resolve_reference(&self, input: &str) -> String {
         let input_lower = input.to_lowercase();
-        
+
         // Check for pronouns
-        if input_lower.contains("it") || input_lower.contains("that") || input_lower.contains("this") {
+        if input_lower.contains("it")
+            || input_lower.contains("that")
+            || input_lower.contains("this")
+        {
             // Get the last mentioned entity
             if let Some(last_turn) = self.history.back() {
                 if !last_turn.entities.is_empty() {
@@ -237,7 +253,7 @@ impl ContextMemory {
                 }
             }
         }
-        
+
         input.to_string()
     }
 
@@ -248,7 +264,8 @@ impl ContextMemory {
         }
 
         let turn_count = self.history.len();
-        let topics: Vec<String> = self.history
+        let topics: Vec<String> = self
+            .history
             .iter()
             .map(|turn| turn.intent.clone())
             .collect::<std::collections::HashSet<_>>()
@@ -296,7 +313,7 @@ impl Default for ContextMemory {
 
 lazy_static::lazy_static! {
     /// Global context memory instance
-    pub static ref GLOBAL_CONTEXT: Arc<Mutex<ContextMemory>> = 
+    pub static ref GLOBAL_CONTEXT: Arc<Mutex<ContextMemory>> =
         Arc::new(Mutex::new(ContextMemory::new()));
 }
 
@@ -345,7 +362,10 @@ pub fn resolve_references(input: &str) -> String {
 
 /// Record a completed task step in the global context
 pub fn add_task_step(tool: String, command: String, result: String) {
-    GLOBAL_CONTEXT.lock().unwrap().add_task_step(tool, command, result);
+    GLOBAL_CONTEXT
+        .lock()
+        .unwrap()
+        .add_task_step(tool, command, result);
 }
 
 /// Get recent task steps
@@ -418,7 +438,10 @@ fn compute_reverse(tool: &str, args: &str, _result: &str) -> (Option<String>, Op
     match tool {
         "open_app" => {
             if let Some(app) = extract_json_field(args, "app") {
-                (Some("close_app".to_string()), Some(format!("{{\"app\":\"{}\"}}", app)))
+                (
+                    Some("close_app".to_string()),
+                    Some(format!("{{\"app\":\"{}\"}}", app)),
+                )
             } else {
                 (None, None)
             }
@@ -429,31 +452,52 @@ fn compute_reverse(tool: &str, args: &str, _result: &str) -> (Option<String>, Op
         }
         "camera_action" => {
             if args.contains("video_start") {
-                (Some("camera_action".to_string()), Some("{\"action\":\"video_stop\"}".to_string()))
+                (
+                    Some("camera_action".to_string()),
+                    Some("{\"action\":\"video_stop\"}".to_string()),
+                )
             } else {
                 (None, None)
             }
         }
         "write_file" | "file_operation" => {
             // Record what was written so delete can undo
-            (Some("file_operation".to_string()), Some(format!("{{\"action\":\"delete\",\"path\":{}}}", args)))
+            (
+                Some("file_operation".to_string()),
+                Some(format!("{{\"action\":\"delete\",\"path\":{}}}", args)),
+            )
         }
         "system_command" => {
             if args.contains("volume_up") {
-                (Some("system_command".to_string()), Some("{\"command\":\"volume_down\"}".to_string()))
+                (
+                    Some("system_command".to_string()),
+                    Some("{\"command\":\"volume_down\"}".to_string()),
+                )
             } else if args.contains("volume_down") {
-                (Some("system_command".to_string()), Some("{\"command\":\"volume_up\"}".to_string()))
+                (
+                    Some("system_command".to_string()),
+                    Some("{\"command\":\"volume_up\"}".to_string()),
+                )
             } else if args.contains("mute") {
-                (Some("system_command".to_string()), Some("{\"command\":\"unmute\"}".to_string()))
+                (
+                    Some("system_command".to_string()),
+                    Some("{\"command\":\"unmute\"}".to_string()),
+                )
             } else {
                 (None, None)
             }
         }
         "switch_mode" => {
             if args.contains("online") {
-                (Some("switch_mode".to_string()), Some("{\"mode\":\"offline\"}".to_string()))
+                (
+                    Some("switch_mode".to_string()),
+                    Some("{\"mode\":\"offline\"}".to_string()),
+                )
             } else {
-                (Some("switch_mode".to_string()), Some("{\"mode\":\"online\"}".to_string()))
+                (
+                    Some("switch_mode".to_string()),
+                    Some("{\"mode\":\"online\"}".to_string()),
+                )
             }
         }
         _ => (None, None),
@@ -513,7 +557,7 @@ mod tests {
             vec!["chrome".to_string()],
         );
         memory.add_turn(turn);
-        
+
         let resolved = memory.resolve_reference("close it");
         assert!(resolved.contains("chrome"));
     }

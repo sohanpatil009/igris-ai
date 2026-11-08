@@ -2,14 +2,19 @@
 // Optimized audio capture with VAD integration for low-latency recording
 // Eliminates fixed recording durations by detecting speech boundaries in real-time
 
-use crate::core::vad::{VoiceActivityDetector, VadConfig, VadEvent};
+use crate::core::paths;
+use crate::core::vad::{VadConfig, VadEvent, VoiceActivityDetector};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector as SileroVad};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Target sample rate for Whisper
+/// Target sample rate for the offline ASR models.
 const WHISPER_SAMPLE_RATE: u32 = 16000;
+
+/// Silero VAD expects 512-sample windows at 16 kHz.
+const SILERO_WINDOW: usize = 512;
 
 /// Maximum wait time for speech to start (ms)
 const MAX_WAIT_FOR_SPEECH_MS: u64 = 10000;
@@ -109,8 +114,14 @@ struct CaptureState {
     device_sample_rate: u32,
     /// Number of channels
     channels: usize,
-    /// VAD instance (if using VAD mode)
+    /// VAD instance (energy fallback, if the Silero model is unavailable)
     vad: Option<VoiceActivityDetector>,
+    /// Silero VAD (primary, ONNX)
+    silero: Option<SileroVad>,
+    /// Fixed-size frame buffer for Silero
+    silero_frame: Vec<f32>,
+    /// Completed Silero speech segment
+    silero_audio: Vec<f32>,
     /// Frame buffer for VAD processing
     frame_buffer: Vec<f32>,
     /// Whether capture is complete
@@ -125,11 +136,28 @@ struct CaptureState {
 
 impl CaptureState {
     fn new(device_sample_rate: u32, channels: usize, vad_config: Option<VadConfig>) -> Self {
+        let silero = if vad_config.is_some() {
+            init_silero_vad()
+        } else {
+            None
+        };
+
+        // Fall back to the energy VAD only when the ONNX model is missing or
+        // fails to initialize.
+        let vad = if vad_config.is_some() && silero.is_none() {
+            vad_config.map(VoiceActivityDetector::new)
+        } else {
+            None
+        };
+
         Self {
             raw_buffer: Vec::with_capacity(device_sample_rate as usize * 15), // 15 sec capacity
             device_sample_rate,
             channels,
-            vad: vad_config.map(VoiceActivityDetector::new),
+            vad,
+            silero,
+            silero_frame: Vec::with_capacity(SILERO_WINDOW * 2),
+            silero_audio: Vec::new(),
             frame_buffer: Vec::with_capacity(512),
             complete: false,
             speech_detected: false,
@@ -163,12 +191,38 @@ impl CaptureState {
         // Store raw samples
         self.raw_buffer.extend(&mono_samples);
 
-        // Process through VAD if enabled
-        if let Some(ref mut vad) = self.vad {
-            // Resample to 16kHz for VAD processing
-            let resampled =
-                resample_chunk(&mono_samples, self.device_sample_rate, WHISPER_SAMPLE_RATE);
+        // Resample once for both VAD paths.
+        let resampled = resample_chunk(&mono_samples, self.device_sample_rate, WHISPER_SAMPLE_RATE);
 
+        // Primary path: Silero VAD (ONNX).
+        if let Some(ref silero) = self.silero {
+            self.silero_frame.extend_from_slice(&resampled);
+
+            while self.silero_frame.len() >= SILERO_WINDOW {
+                let frame: Vec<f32> = self.silero_frame.drain(..SILERO_WINDOW).collect();
+                silero.accept_waveform(&frame);
+
+                if self.speech_start_time.is_none() && silero.detected() {
+                    self.speech_detected = true;
+                    self.speech_start_time = Some(Instant::now());
+                }
+
+                if !silero.is_empty() {
+                    if let Some(segment) = silero.front() {
+                        self.silero_audio = segment.samples().to_vec();
+                        self.speech_detected = true;
+                        self.complete = true;
+                        silero.clear();
+                        return;
+                    }
+                }
+            }
+
+            return;
+        }
+
+        // Fallback: energy/spectral VAD.
+        if let Some(ref mut vad) = self.vad {
             for sample in resampled {
                 if let Some((_, Some(event))) = vad.process_sample(sample, &mut self.frame_buffer) {
                     match event {
@@ -188,6 +242,17 @@ impl CaptureState {
 
     /// Get final audio at 16kHz
     fn get_resampled_audio(&self) -> Vec<f32> {
+        if self.silero.is_some() {
+            if !self.silero_audio.is_empty() {
+                return self.silero_audio.clone();
+            }
+            return resample_linear(
+                &self.raw_buffer,
+                self.device_sample_rate,
+                WHISPER_SAMPLE_RATE,
+            );
+        }
+
         if let Some(ref vad) = self.vad {
             // Use VAD's trimmed audio
             vad.get_audio().to_vec()
@@ -200,6 +265,47 @@ impl CaptureState {
             )
         }
     }
+}
+
+/// Build the Silero VAD from the ONNX model pack.
+fn init_silero_vad() -> Option<SileroVad> {
+    let Some(model) = paths::find_file("models/silero_vad.onnx") else {
+        eprintln!("[VAD] silero_vad.onnx not found; falling back to energy VAD");
+        return None;
+    };
+
+    let config = VadModelConfig {
+        silero_vad: SileroVadModelConfig {
+            model: Some(model.to_string_lossy().into_owned()),
+            threshold: 0.5,
+            min_silence_duration: 0.35,
+            min_speech_duration: 0.2,
+            window_size: SILERO_WINDOW as i32,
+            max_speech_duration: 15.0,
+        },
+        sample_rate: WHISPER_SAMPLE_RATE as i32,
+        num_threads: 1,
+        provider: Some("cpu".into()),
+        debug: false,
+        ..Default::default()
+    };
+
+    match SileroVad::create(&config, 30.0) {
+        Some(vad) => {
+            eprintln!("[VAD] Silero VAD ready: {}", model.display());
+            Some(vad)
+        }
+        None => {
+            eprintln!("[VAD] Failed to create Silero VAD; falling back to energy VAD");
+            None
+        }
+    }
+}
+
+/// Probe whether the Silero VAD model can be loaded. Used by tools and the
+/// GUI status panel; the capture path builds its own detector per stream.
+pub fn silero_vad_available() -> bool {
+    init_silero_vad().is_some()
 }
 
 /// Capture audio with VAD-based endpoint detection
@@ -216,7 +322,10 @@ pub fn capture_audio_vad(
     let channels = stream_config.channels() as usize;
 
     if config.debug {
-        println!("ðŸŽ¤ Audio device: {} Hz, {} channels", sample_rate, channels);
+        println!(
+            "ðŸŽ¤ Audio device: {} Hz, {} channels",
+            sample_rate, channels
+        );
     }
 
     let vad_config = config.mode.to_vad_config();

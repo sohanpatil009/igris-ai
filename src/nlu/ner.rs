@@ -51,7 +51,7 @@ impl Entity {
             confidence: 1.0,
         }
     }
-    
+
     pub fn with_confidence(mut self, confidence: f32) -> Self {
         self.confidence = confidence;
         self
@@ -70,12 +70,12 @@ impl NerEngine {
             patterns: HashMap::new(),
             application_names: Vec::new(),
         };
-        
+
         engine.initialize_patterns();
         engine.initialize_application_names();
         engine
     }
-    
+
     /// Initialize regex patterns for entity extraction
     fn initialize_patterns(&mut self) {
         // Number patterns
@@ -87,16 +87,13 @@ impl NerEngine {
                 r"\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)\b",
             ],
         );
-        
+
         // Percentage patterns — full match span prevents overlap with Number
         self.add_pattern(
             EntityType::Percentage,
-            vec![
-                r"\b(\d+)\s*(?:percent|%)\b",
-                r"\b(half|quarter|full)\b",
-            ],
+            vec![r"\b(\d+)\s*(?:percent|%)\b", r"\b(half|quarter|full)\b"],
         );
-        
+
         // Duration patterns — capture group 1 includes both number and unit
         self.add_pattern(
             EntityType::Duration,
@@ -106,7 +103,7 @@ impl NerEngine {
                 r"\bafter\s+(\d+\s*(?:seconds?|minutes?|hours?))\b",
             ],
         );
-        
+
         // File patterns
         self.add_pattern(
             EntityType::File,
@@ -115,7 +112,7 @@ impl NerEngine {
                 r"\b([a-zA-Z0-9._\-]+\.(?:txt|pdf|doc|docx|jpg|png|mp3|mp4|zip|exe))\b",
             ],
         );
-        
+
         // Folder patterns
         self.add_pattern(
             EntityType::Folder,
@@ -125,7 +122,7 @@ impl NerEngine {
                 r"\bpath\s+([a-zA-Z0-9._\-/\\:]+)\b",
             ],
         );
-        
+
         // System action patterns
         self.add_pattern(
             EntityType::SystemAction,
@@ -134,7 +131,7 @@ impl NerEngine {
                 r"\b(turn\s+off|power\s+off|shut\s+down)\b",
             ],
         );
-        
+
         // Volume level patterns
         self.add_pattern(
             EntityType::VolumeLevel,
@@ -145,7 +142,7 @@ impl NerEngine {
                 r"\b(mute|unmute|max|maximum|min|minimum)\b",
             ],
         );
-        
+
         // Brightness level patterns
         self.add_pattern(
             EntityType::BrightnessLevel,
@@ -155,7 +152,7 @@ impl NerEngine {
                 r"\b(increase|decrease|raise|lower)\s+brightness\s+(?:by\s+)?(\d+)\b",
             ],
         );
-        
+
         // Network interface patterns
         self.add_pattern(
             EntityType::NetworkInterface,
@@ -166,17 +163,17 @@ impl NerEngine {
             ],
         );
     }
-    
+
     /// Add patterns for an entity type
     fn add_pattern(&mut self, entity_type: EntityType, patterns: Vec<&str>) {
         let compiled_patterns: Vec<Regex> = patterns
             .iter()
             .filter_map(|p| Regex::new(&format!("(?i){}", p)).ok())
             .collect();
-        
+
         self.patterns.insert(entity_type, compiled_patterns);
     }
-    
+
     /// Initialize application names from plugins
     /// All applications are now managed via the plugin system
     fn initialize_application_names(&mut self) {
@@ -187,25 +184,25 @@ impl NerEngine {
         for plugin in plugins {
             // Add plugin name as searchable entity
             app_names.push(plugin.name.clone());
-            
+
             // Add all commands from this plugin
             for command in &plugin.commands {
                 // Add full trigger
                 app_names.push(command.trigger.clone());
-                
+
                 // Add individual keywords from trigger for better matching
                 for word in command.trigger.split_whitespace() {
                     if word.len() > 2 && !word.eq("the") && !word.eq("and") && !word.eq("open") {
                         app_names.push(word.to_string());
                     }
                 }
-                
+
                 // Add examples as alternative keywords
                 for example in &command.examples {
                     app_names.push(example.clone());
                 }
             }
-            
+
             // Add plugin keywords
             for keyword in &plugin.keywords {
                 if keyword.len() > 2 {
@@ -220,15 +217,15 @@ impl NerEngine {
 
         self.application_names = app_names;
     }
-    
+
     /// Extract all entities from text
     pub fn extract_entities(&self, text: &str) -> Vec<Entity> {
         let mut entities = Vec::new();
         let text_lower = text.to_lowercase();
-        
+
         // Extract application names first (highest priority)
         entities.extend(self.extract_applications(&text_lower));
-        
+
         // Extract non-Number entity types (more specific types take priority)
         for (entity_type, patterns) in &self.patterns {
             if *entity_type == EntityType::Number {
@@ -238,20 +235,20 @@ impl NerEngine {
                 self.match_and_add(pattern, &text_lower, entity_type, &mut entities);
             }
         }
-        
+
         // Extract Number entities last (generic, only where nothing more specific matched)
         if let Some(patterns) = self.patterns.get(&EntityType::Number) {
             for pattern in patterns {
                 self.match_and_add(pattern, &text_lower, &EntityType::Number, &mut entities);
             }
         }
-        
+
         // Sort by position in text
         entities.sort_by_key(|e| e.start_pos);
-        
+
         entities
     }
-    
+
     fn match_and_add(
         &self,
         pattern: &Regex,
@@ -274,25 +271,28 @@ impl NerEngine {
             }
         }
     }
-    
+
     /// Extract application names from text
     fn extract_applications(&self, text: &str) -> Vec<Entity> {
         let mut entities = Vec::new();
-        
+
         for app_name in &self.application_names {
             if let Some(pos) = text.find(app_name) {
-                entities.push(Entity::new(
-                    EntityType::Application,
-                    app_name.clone(),
-                    pos,
-                    pos + app_name.len(),
-                ).with_confidence(0.9));
+                entities.push(
+                    Entity::new(
+                        EntityType::Application,
+                        app_name.clone(),
+                        pos,
+                        pos + app_name.len(),
+                    )
+                    .with_confidence(0.9),
+                );
             }
         }
-        
+
         entities
     }
-    
+
     /// Check if entity overlaps with existing entities.
     /// Only blocks same-type overlaps (prevents duplicate Number or duplicate Application).
     /// Different entity types at the same span are both valuable (e.g. "20" is both a Number and a Percentage).
@@ -304,14 +304,14 @@ impl NerEngine {
                     || (entity.start_pos <= e.start_pos && entity.end_pos >= e.end_pos))
         })
     }
-    
+
     /// Extract specific entity type from text
     pub fn extract_entity_type(&self, text: &str, entity_type: EntityType) -> Option<Entity> {
         self.extract_entities(text)
             .into_iter()
             .find(|e| e.entity_type == entity_type)
     }
-    
+
     /// Extract all entities of a specific type
     pub fn extract_all_of_type(&self, text: &str, entity_type: EntityType) -> Vec<Entity> {
         self.extract_entities(text)
@@ -319,7 +319,7 @@ impl NerEngine {
             .filter(|e| e.entity_type == entity_type)
             .collect()
     }
-    
+
     /// Convert word numbers to digits
     pub fn word_to_number(&self, word: &str) -> Option<u32> {
         match word.to_lowercase().as_str() {
@@ -349,48 +349,48 @@ impl NerEngine {
             _ => word.parse::<u32>().ok(),
         }
     }
-    
+
     /// Extract numeric value from entity
     pub fn extract_number(&self, entity: &Entity) -> Option<u32> {
         self.word_to_number(&entity.value)
     }
-    
+
     /// Parse percentage from text
     pub fn parse_percentage(&self, text: &str) -> Option<u8> {
         if let Some(entity) = self.extract_entity_type(text, EntityType::Percentage) {
             return self.extract_number(&entity).map(|n| n.min(100) as u8);
         }
-        
+
         // Try direct number extraction
         if let Some(entity) = self.extract_entity_type(text, EntityType::Number) {
             return self.extract_number(&entity).map(|n| n.min(100) as u8);
         }
-        
+
         None
     }
-    
+
     /// Parse duration in seconds
     pub fn parse_duration_seconds(&self, text: &str) -> Option<u64> {
         if let Some(entity) = self.extract_entity_type(text, EntityType::Duration) {
             let value_str = &entity.value;
-            
+
             // Extract number and unit
             let re = Regex::new(r"(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)").ok()?;
             if let Some(captures) = re.captures(value_str) {
                 let number = captures.get(1)?.as_str().parse::<u64>().ok()?;
                 let unit = captures.get(2)?.as_str().to_lowercase();
-                
+
                 let multiplier = match unit.as_str() {
                     "second" | "seconds" | "sec" | "secs" => 1,
                     "minute" | "minutes" | "min" | "mins" => 60,
                     "hour" | "hours" | "hr" | "hrs" => 3600,
                     _ => 1,
                 };
-                
+
                 return Some(number * multiplier);
             }
         }
-        
+
         None
     }
 }
@@ -416,9 +416,15 @@ mod tests {
     fn ensure_test_bridge() {
         use crate::bridge::{self, HostConfig, PluginCommandSnapshot, PluginSnapshot};
 
-        fn speaker_id() -> String { "051".to_string() }
-        fn assistant_name() -> String { "IGRIS".to_string() }
-        fn personality() -> bridge::Personality { bridge::Personality::Igris }
+        fn speaker_id() -> String {
+            "051".to_string()
+        }
+        fn assistant_name() -> String {
+            "IGRIS".to_string()
+        }
+        fn personality() -> bridge::Personality {
+            bridge::Personality::Igris
+        }
         fn plugins() -> Vec<PluginSnapshot> {
             vec![PluginSnapshot {
                 name: "apps".to_string(),
@@ -432,7 +438,11 @@ mod tests {
         }
 
         bridge::install(
-            HostConfig { speaker_id, assistant_name, personality },
+            HostConfig {
+                speaker_id,
+                assistant_name,
+                personality,
+            },
             plugins,
         );
     }
@@ -442,7 +452,9 @@ mod tests {
         ensure_test_bridge();
         let ner = NerEngine::new();
         let entities = ner.extract_entities("open chrome browser");
-        assert!(entities.iter().any(|e| e.entity_type == EntityType::Application));
+        assert!(entities
+            .iter()
+            .any(|e| e.entity_type == EntityType::Application));
     }
 
     #[test]
@@ -451,21 +463,24 @@ mod tests {
         let entities = ner.extract_entities("set volume to 50");
         assert!(entities.iter().any(|e| e.entity_type == EntityType::Number));
     }
-    
+
     #[test]
     fn test_parse_percentage() {
         let ner = NerEngine::new();
-        assert_eq!(ner.parse_percentage("increase volume by 20 percent"), Some(20));
+        assert_eq!(
+            ner.parse_percentage("increase volume by 20 percent"),
+            Some(20)
+        );
         assert_eq!(ner.parse_percentage("set to 75%"), Some(75));
     }
-    
+
     #[test]
     fn test_parse_duration() {
         let ner = NerEngine::new();
         assert_eq!(ner.parse_duration_seconds("in 5 minutes"), Some(300));
         assert_eq!(ner.parse_duration_seconds("after 2 hours"), Some(7200));
     }
-    
+
     #[test]
     fn test_word_to_number() {
         let ner = NerEngine::new();

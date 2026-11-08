@@ -1,0 +1,5 @@
+command,mode,exec_ms,success
+system_info,offline,0,true
+system_info,offline,0,true
+git_status,offline,228,true
+code_search,offline,9624,true

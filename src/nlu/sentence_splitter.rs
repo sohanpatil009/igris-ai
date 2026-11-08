@@ -30,7 +30,14 @@ pub fn split_utterance(input: &str) -> Vec<String> {
 
     // Step 2: Within each comma-separated part, split on conjunctions
     // Use longest separators first to avoid "and then" being split by "and"
-    let separators = [" and then ", " , then ", " then ", " and ", " but ", " also "];
+    let separators = [
+        " and then ",
+        " , then ",
+        " then ",
+        " and ",
+        " but ",
+        " also ",
+    ];
 
     let mut result: Vec<String> = Vec::new();
     for part in &comma_split {
@@ -177,7 +184,9 @@ mod tests {
 
     #[test]
     fn test_verbose_sentence() {
-        let result = split_utterance("hey igris can you open chrome and search for cats and then set an alarm for 7 am");
+        let result = split_utterance(
+            "hey igris can you open chrome and search for cats and then set an alarm for 7 am",
+        );
         assert_eq!(
             result,
             vec![

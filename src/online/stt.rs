@@ -1,7 +1,7 @@
 #[cfg(feature = "with_riva")]
-use tonic::transport::{Channel, Endpoint};
-#[cfg(feature = "with_riva")]
 use tonic::metadata::MetadataValue;
+#[cfg(feature = "with_riva")]
+use tonic::transport::{Channel, Endpoint};
 
 #[cfg(feature = "with_riva")]
 fn init_rustls_crypto() {
@@ -31,9 +31,9 @@ mod generated {
 }
 
 #[cfg(feature = "with_riva")]
-pub use generated::{AudioEncoding, RequestId, RecognizeRequest, RecognitionConfig};
-#[cfg(feature = "with_riva")]
 pub use generated::riva_speech_recognition_client::RivaSpeechRecognitionClient;
+#[cfg(feature = "with_riva")]
+pub use generated::{AudioEncoding, RecognitionConfig, RecognizeRequest, RequestId};
 
 #[cfg(feature = "with_riva")]
 pub struct OnlineStt {
@@ -47,11 +47,10 @@ impl OnlineStt {
         init_rustls_crypto();
         println!("[Parakeet STT] Initializing gRPC client...");
 
-        let api_key = std::env::var("NVIDIA_API_KEY")
-            .map_err(|e| {
-                println!("[Parakeet STT] ERROR: NVIDIA_API_KEY not set: {}", e);
-                "NVIDIA_API_KEY not set in .env"
-            })?;
+        let api_key = std::env::var("NVIDIA_API_KEY").map_err(|e| {
+            println!("[Parakeet STT] ERROR: NVIDIA_API_KEY not set: {}", e);
+            "NVIDIA_API_KEY not set in .env"
+        })?;
 
         println!("[Parakeet STT] Connecting to {} ...", GRPC_ENDPOINT);
 
@@ -72,9 +71,16 @@ impl OnlineStt {
         Ok(Self { client, api_key })
     }
 
-    pub async fn transcribe(&mut self, audio_samples: &[f32]) -> Result<String, Box<dyn std::error::Error>> {
+    pub async fn transcribe(
+        &mut self,
+        audio_samples: &[f32],
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let duration_ms = (audio_samples.len() as f64 / SAMPLE_RATE as f64) * 1000.0;
-        println!("[Parakeet STT] Transcribing {:.0}ms of audio ({} samples)", duration_ms, audio_samples.len());
+        println!(
+            "[Parakeet STT] Transcribing {:.0}ms of audio ({} samples)",
+            duration_ms,
+            audio_samples.len()
+        );
 
         let audio_bytes: Vec<u8> = audio_samples
             .iter()
@@ -84,7 +90,11 @@ impl OnlineStt {
             })
             .collect();
 
-        println!("[Parakeet STT] Raw PCM: {} bytes ({} samples)", audio_bytes.len(), audio_samples.len());
+        println!(
+            "[Parakeet STT] Raw PCM: {} bytes ({} samples)",
+            audio_bytes.len(),
+            audio_samples.len()
+        );
 
         let request = RecognizeRequest {
             config: Some(RecognitionConfig {
@@ -108,17 +118,19 @@ impl OnlineStt {
             id: None,
         };
 
-        println!("[Parakeet STT] gRPC Recognize via {} (function-id: {})", GRPC_ENDPOINT, FUNCTION_ID);
+        println!(
+            "[Parakeet STT] gRPC Recognize via {} (function-id: {})",
+            GRPC_ENDPOINT, FUNCTION_ID
+        );
 
         let mut tonic_req = tonic::Request::new(request);
         tonic_req.metadata_mut().insert(
             "authorization",
             MetadataValue::try_from(&format!("Bearer {}", self.api_key))?,
         );
-        tonic_req.metadata_mut().insert(
-            "function-id",
-            MetadataValue::try_from(FUNCTION_ID)?,
-        );
+        tonic_req
+            .metadata_mut()
+            .insert("function-id", MetadataValue::try_from(FUNCTION_ID)?);
 
         let response = self.client.recognize(tonic_req).await?;
         let response = response.into_inner();
@@ -139,7 +151,9 @@ impl OnlineStt {
 }
 
 #[cfg(feature = "with_riva")]
-pub async fn transcribe_online(audio_samples: &[f32]) -> Result<String, Box<dyn std::error::Error>> {
+pub async fn transcribe_online(
+    audio_samples: &[f32],
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut stt = OnlineStt::new().await?;
     stt.transcribe(audio_samples).await
 }
@@ -150,17 +164,28 @@ pub struct OnlineStt;
 #[cfg(not(feature = "with_riva"))]
 impl OnlineStt {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Err(Box::<dyn std::error::Error>::from("riva proto not available: build with feature 'with_riva' and provide proto files"))
+        Err(Box::<dyn std::error::Error>::from(
+            "riva proto not available: build with feature 'with_riva' and provide proto files",
+        ))
     }
 
-    pub async fn transcribe(&mut self, _audio_samples: &[f32]) -> Result<String, Box<dyn std::error::Error>> {
-        Err(Box::<dyn std::error::Error>::from("riva proto not available: build with feature 'with_riva' and provide proto files"))
+    pub async fn transcribe(
+        &mut self,
+        _audio_samples: &[f32],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        Err(Box::<dyn std::error::Error>::from(
+            "riva proto not available: build with feature 'with_riva' and provide proto files",
+        ))
     }
 }
 
 #[cfg(not(feature = "with_riva"))]
-pub async fn transcribe_online(_audio_samples: &[f32]) -> Result<String, Box<dyn std::error::Error>> {
-    Err(Box::<dyn std::error::Error>::from("riva proto not available: build with feature 'with_riva' and provide proto files"))
+pub async fn transcribe_online(
+    _audio_samples: &[f32],
+) -> Result<String, Box<dyn std::error::Error>> {
+    Err(Box::<dyn std::error::Error>::from(
+        "riva proto not available: build with feature 'with_riva' and provide proto files",
+    ))
 }
 
 #[cfg(test)]

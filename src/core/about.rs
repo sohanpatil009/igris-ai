@@ -4,8 +4,6 @@
 // Includes architecture and flowchart explanations
 /// IGRIS introduction sections
 
-
-
 pub struct IgrisAbout;
 
 impl IgrisAbout {
@@ -165,50 +163,71 @@ impl AboutSection {
     /// Parse section from user query
     pub fn from_query(query: &str) -> Option<Self> {
         let query_lower = query.to_lowercase();
-        
+
         // Architecture queries
-        if query_lower.contains("architecture") || query_lower.contains("design") 
-            || query_lower.contains("structure") || query_lower.contains("how are you built")
-            || query_lower.contains("system design") {
+        if query_lower.contains("architecture")
+            || query_lower.contains("design")
+            || query_lower.contains("structure")
+            || query_lower.contains("how are you built")
+            || query_lower.contains("system design")
+        {
             Some(Self::Architecture)
         }
         // Voice flow queries
-        else if query_lower.contains("voice flow") || query_lower.contains("voice processing")
-            || query_lower.contains("how do you listen") || query_lower.contains("how do you hear")
-            || query_lower.contains("speech pipeline") || query_lower.contains("audio flow") {
+        else if query_lower.contains("voice flow")
+            || query_lower.contains("voice processing")
+            || query_lower.contains("how do you listen")
+            || query_lower.contains("how do you hear")
+            || query_lower.contains("speech pipeline")
+            || query_lower.contains("audio flow")
+        {
             Some(Self::VoiceFlow)
         }
         // NLU queries
-        else if query_lower.contains("nlu") || query_lower.contains("understand")
-            || query_lower.contains("language") || query_lower.contains("intent")
-            || query_lower.contains("how do you process") {
+        else if query_lower.contains("nlu")
+            || query_lower.contains("understand")
+            || query_lower.contains("language")
+            || query_lower.contains("intent")
+            || query_lower.contains("how do you process")
+        {
             Some(Self::Nlu)
         }
         // App queries
-        else if query_lower.contains("app") || query_lower.contains("plugin")
-            || query_lower.contains("launch") || query_lower.contains("open") {
+        else if query_lower.contains("app")
+            || query_lower.contains("plugin")
+            || query_lower.contains("launch")
+            || query_lower.contains("open")
+        {
             Some(Self::Apps)
         }
         // Camera queries
-        else if query_lower.contains("camera") || query_lower.contains("photo") 
-            || query_lower.contains("video") || query_lower.contains("record") {
+        else if query_lower.contains("camera")
+            || query_lower.contains("photo")
+            || query_lower.contains("video")
+            || query_lower.contains("record")
+        {
             Some(Self::Camera)
         }
         // Setup queries
-        else if query_lower.contains("setup") || query_lower.contains("install")
-            || query_lower.contains("download") || query_lower.contains("first time") {
+        else if query_lower.contains("setup")
+            || query_lower.contains("install")
+            || query_lower.contains("download")
+            || query_lower.contains("first time")
+        {
             Some(Self::SetupFlow)
         }
         // Tech stack queries
-        else if query_lower.contains("tech") || query_lower.contains("built with")
-            || query_lower.contains("stack") || query_lower.contains("technology") {
+        else if query_lower.contains("tech")
+            || query_lower.contains("built with")
+            || query_lower.contains("stack")
+            || query_lower.contains("technology")
+        {
             Some(Self::Tech)
-        }
-        else {
+        } else {
             None
         }
     }
-    
+
     /// Get all sections for full explanation
     pub fn all_sections() -> Vec<Self> {
         vec![
@@ -227,7 +246,7 @@ impl AboutSection {
 /// Check if query is asking about IGRIS
 pub fn is_about_query(query: &str) -> bool {
     let query_lower = query.to_lowercase();
-    
+
     // Check for "tell me about yourself" patterns
     let about_patterns = [
         "tell me about yourself",
@@ -245,23 +264,16 @@ pub fn is_about_query(query: &str) -> bool {
         "tell me about igris",
         "what is igris",
     ];
-    
+
     about_patterns.iter().any(|p| query_lower.contains(p))
 }
 
 /// Check if query is asking for detailed info
 pub fn wants_detailed_info(query: &str) -> bool {
     let query_lower = query.to_lowercase();
-    
-    let detailed_patterns = [
-        "detail",
-        "everything",
-        "all",
-        "full",
-        "complete",
-        "explain",
-    ];
-    
+
+    let detailed_patterns = ["detail", "everything", "all", "full", "complete", "explain"];
+
     detailed_patterns.iter().any(|p| query_lower.contains(p))
 }
 
@@ -280,15 +292,36 @@ mod tests {
 
     #[test]
     fn test_section_detection() {
-        assert_eq!(AboutSection::from_query("explain your architecture"), Some(AboutSection::Architecture));
-        assert_eq!(AboutSection::from_query("how does voice processing work"), Some(AboutSection::VoiceFlow));
-        assert_eq!(AboutSection::from_query("how do you understand me"), Some(AboutSection::Nlu));
-        assert_eq!(AboutSection::from_query("what apps can you open"), Some(AboutSection::Apps));
-        assert_eq!(AboutSection::from_query("camera features"), Some(AboutSection::Camera));
-        assert_eq!(AboutSection::from_query("setup process"), Some(AboutSection::SetupFlow));
-        assert_eq!(AboutSection::from_query("tech stack"), Some(AboutSection::Tech));
+        assert_eq!(
+            AboutSection::from_query("explain your architecture"),
+            Some(AboutSection::Architecture)
+        );
+        assert_eq!(
+            AboutSection::from_query("how does voice processing work"),
+            Some(AboutSection::VoiceFlow)
+        );
+        assert_eq!(
+            AboutSection::from_query("how do you understand me"),
+            Some(AboutSection::Nlu)
+        );
+        assert_eq!(
+            AboutSection::from_query("what apps can you open"),
+            Some(AboutSection::Apps)
+        );
+        assert_eq!(
+            AboutSection::from_query("camera features"),
+            Some(AboutSection::Camera)
+        );
+        assert_eq!(
+            AboutSection::from_query("setup process"),
+            Some(AboutSection::SetupFlow)
+        );
+        assert_eq!(
+            AboutSection::from_query("tech stack"),
+            Some(AboutSection::Tech)
+        );
     }
-    
+
     #[test]
     fn test_all_sections() {
         let sections = AboutSection::all_sections();

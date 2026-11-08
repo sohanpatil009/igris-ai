@@ -11,8 +11,9 @@ use std::sync::OnceLock;
 
 /// Assistant personality presets (moved here so the persona texts travel
 /// with the brain). The companion's config layer re-exports this type.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Personality {
+    #[default]
     Igris,
     Alita,
     Custom(String),
@@ -29,8 +30,8 @@ impl Personality {
 
     pub fn speaker_id(&self) -> &str {
         match self {
-            Personality::Igris => "051",  // Deep male voice
-            Personality::Alita => "001",  // Female voice
+            Personality::Igris => "051", // Deep male voice
+            Personality::Alita => "001", // Female voice
             Personality::Custom(_) => "051",
         }
     }
@@ -66,12 +67,6 @@ impl Personality {
             Personality::Alita => "Hey! What's up? How can I help?",
             Personality::Custom(_) => "I'm listening.",
         }
-    }
-}
-
-impl Default for Personality {
-    fn default() -> Self {
-        Personality::Igris
     }
 }
 
@@ -153,6 +148,12 @@ pub fn config() -> &'static HostConfig {
         "igris-ai host bridge not installed — call igris_ai::bridge::install() before \
          initializing the assistant",
     )
+}
+
+/// Whether the host bridge has been installed. Useful for tools, examples, and
+/// tests that run the brain without a companion app.
+pub fn is_installed() -> bool {
+    BRIDGE.get().is_some()
 }
 
 /// Plugin snapshots for entity extraction; empty when the host provides none.

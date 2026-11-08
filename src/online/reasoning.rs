@@ -12,6 +12,7 @@ pub enum LlmProvider {
     Groq,
     Google,
     Openrouter,
+    Local,
 }
 
 impl LlmProvider {
@@ -22,6 +23,7 @@ impl LlmProvider {
             Self::Groq => "Groq",
             Self::Google => "Google Gemini",
             Self::Openrouter => "OpenRouter",
+            Self::Local => "Local (Ollama)",
         }
     }
 
@@ -32,6 +34,7 @@ impl LlmProvider {
             Self::Groq => "groq",
             Self::Google => "google",
             Self::Openrouter => "openrouter",
+            Self::Local => "local",
         }
     }
 
@@ -42,6 +45,7 @@ impl LlmProvider {
             Self::Groq => "https://api.groq.com/openai/v1",
             Self::Google => "https://generativelanguage.googleapis.com/v1beta",
             Self::Openrouter => "https://openrouter.ai/api/v1",
+            Self::Local => "http://127.0.0.1:11434/v1",
         }
     }
 
@@ -52,6 +56,7 @@ impl LlmProvider {
             Self::Groq => "GROQ_API_KEY",
             Self::Google => "GOOGLE_API_KEY",
             Self::Openrouter => "OPENROUTER_API_KEY",
+            Self::Local => "IGRIS_LOCAL_LLM_API_KEY",
         }
     }
 
@@ -62,13 +67,21 @@ impl LlmProvider {
             "groq" => Self::Groq,
             "google" => Self::Google,
             "openrouter" => Self::Openrouter,
+            "local" => Self::Local,
             _ => Self::Nvidia,
         }
     }
 
     /// All providers as a slice.
     pub fn all() -> &'static [Self] {
-        &[Self::Nvidia, Self::Openai, Self::Groq, Self::Google, Self::Openrouter]
+        &[
+            Self::Nvidia,
+            Self::Openai,
+            Self::Groq,
+            Self::Google,
+            Self::Openrouter,
+            Self::Local,
+        ]
     }
 }
 
@@ -76,27 +89,36 @@ impl LlmProvider {
 /// Each entry is (model_id, display_name).
 pub const AVAILABLE_MODELS: &[(&str, &str)] = &[
     // NVIDIA
-    ("meta/llama-3.1-70b-instruct",            "Llama 3.1 70B (NVIDIA)"),
-    ("meta/llama-3.1-8b-instruct",             "Llama 3.1 8B (NVIDIA)"),
-    ("qwen/qwen3-next-80b-a3b-instruct",       "Qwen 3 80B MoE (NVIDIA)"),
-    ("qwen/qwen-2.5-72b-instruct",             "Qwen 2.5 72B (NVIDIA)"),
-    ("nvidia/llama-3.3-nemotron-super-49b-v1", "Nemotron 49B (NVIDIA)"),
-    ("nvidia/nemotron-4-340b-instruct",        "Nemotron 340B (NVIDIA)"),
-    ("mistralai/ministral-14b-instruct-2512",  "Ministral 14B (NVIDIA)"),
-    ("google/gemma-2-27b-it",                 "Gemma 2 27B (NVIDIA)"),
-    ("google/gemma-2-9b-it",                  "Gemma 2 9B (NVIDIA)"),
+    ("meta/llama-3.1-70b-instruct", "Llama 3.1 70B (NVIDIA)"),
+    ("meta/llama-3.1-8b-instruct", "Llama 3.1 8B (NVIDIA)"),
+    (
+        "qwen/qwen3-next-80b-a3b-instruct",
+        "Qwen 3 80B MoE (NVIDIA)",
+    ),
+    ("qwen/qwen-2.5-72b-instruct", "Qwen 2.5 72B (NVIDIA)"),
+    (
+        "nvidia/llama-3.3-nemotron-super-49b-v1",
+        "Nemotron 49B (NVIDIA)",
+    ),
+    ("nvidia/nemotron-4-340b-instruct", "Nemotron 340B (NVIDIA)"),
+    (
+        "mistralai/ministral-14b-instruct-2512",
+        "Ministral 14B (NVIDIA)",
+    ),
+    ("google/gemma-2-27b-it", "Gemma 2 27B (NVIDIA)"),
+    ("google/gemma-2-9b-it", "Gemma 2 9B (NVIDIA)"),
     // OpenAI
-    ("gpt-4o",                                  "GPT-4o (OpenAI)"),
-    ("gpt-4o-mini",                             "GPT-4o Mini (OpenAI)"),
-    ("gpt-4-turbo",                             "GPT-4 Turbo (OpenAI)"),
-    ("o1-mini",                                 "o1 Mini (OpenAI)"),
+    ("gpt-4o", "GPT-4o (OpenAI)"),
+    ("gpt-4o-mini", "GPT-4o Mini (OpenAI)"),
+    ("gpt-4-turbo", "GPT-4 Turbo (OpenAI)"),
+    ("o1-mini", "o1 Mini (OpenAI)"),
     // Groq
-    ("llama-3.3-70b-versatile",                 "Llama 3.3 70B (Groq)"),
-    ("llama-3.1-8b-instant",                    "Llama 3.1 8B (Groq)"),
-    ("mixtral-8x7b-32768",                      "Mixtral 8x7B (Groq)"),
-    ("gemma2-9b-it",                            "Gemma 2 9B (Groq)"),
+    ("llama-3.3-70b-versatile", "Llama 3.3 70B (Groq)"),
+    ("llama-3.1-8b-instant", "Llama 3.1 8B (Groq)"),
+    ("mixtral-8x7b-32768", "Mixtral 8x7B (Groq)"),
+    ("gemma2-9b-it", "Gemma 2 9B (Groq)"),
     // OpenRouter
-    ("z-ai/glm-5.2:free",                       "GLM 5.2 Free (OpenRouter)"),
+    ("z-ai/glm-5.2:free", "GLM 5.2 Free (OpenRouter)"),
 ];
 
 /// Model used for fast tool routing and intent classification.
@@ -163,14 +185,38 @@ impl OnlineReasoning {
     }
 
     /// Create with a specific provider (reads the matching API key from env).
+    /// Local provider does not require a key and reads its URL/model from
+    /// `IGRIS_LOCAL_LLM_URL` / `IGRIS_LOCAL_LLM_MODEL`.
     pub fn with_provider(provider: LlmProvider) -> Result<Self, Box<dyn std::error::Error>> {
-        let api_key = env::var(provider.api_key_env())
-            .map_err(|_| format!("{} not set in .env", provider.api_key_env()))?;
-
-        let base_url = provider.base_url().to_string();
-
-        let model = env::var("NVIDIA_NIM_MODEL")
-            .unwrap_or_else(|_| "meta/llama-3.1-8b-instruct".to_string());
+        let (api_key, base_url, model) = match provider {
+            LlmProvider::Local => {
+                let raw_url = env::var("IGRIS_LOCAL_LLM_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:11434/v1".to_string());
+                let mut url = raw_url.trim().trim_end_matches('/').to_string();
+                if !url.ends_with("/v1") {
+                    url.push_str("/v1");
+                }
+                let key = env::var("IGRIS_LOCAL_LLM_API_KEY").unwrap_or_default();
+                let model = env::var("IGRIS_LOCAL_LLM_MODEL")
+                    .unwrap_or_else(|_| "qwen2.5:3b-instruct".to_string());
+                (key, url, model)
+            }
+            other => {
+                let key = env::var(other.api_key_env())
+                    .map_err(|_| format!("{} not set in .env", other.api_key_env()))?;
+                // Provider-specific model env (was: NVIDIA_NIM_MODEL for all).
+                let (env_name, default_model) = match other {
+                    LlmProvider::Nvidia => ("NVIDIA_NIM_MODEL", "meta/llama-3.1-8b-instruct"),
+                    LlmProvider::Openai => ("OPENAI_MODEL", "gpt-4o-mini"),
+                    LlmProvider::Groq => ("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                    LlmProvider::Google => ("GOOGLE_MODEL", "gemini-2.0-flash"),
+                    LlmProvider::Openrouter => ("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+                    LlmProvider::Local => unreachable!(),
+                };
+                let model = env::var(env_name).unwrap_or_else(|_| default_model.to_string());
+                (key, other.base_url().to_string(), model)
+            }
+        };
 
         Ok(Self {
             client: Client::builder()
@@ -188,7 +234,10 @@ impl OnlineReasoning {
     }
 
     /// Switch to a different provider (updates base_url + api_key from env).
-    pub fn set_provider(&mut self, provider: LlmProvider) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn set_provider(
+        &mut self,
+        provider: LlmProvider,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.api_key = env::var(provider.api_key_env())
             .map_err(|_| format!("{} not set in .env", provider.api_key_env()))?;
         self.base_url = provider.base_url().to_string();
@@ -196,10 +245,17 @@ impl OnlineReasoning {
     }
 
     /// Run reasoning through NVIDIA NIM (OpenAI-compatible chat completions)
-    pub async fn reason(&self, system_prompt: &str, user_query: &str) -> Result<String, Box<dyn std::error::Error>> {
+    pub async fn reason(
+        &self,
+        system_prompt: &str,
+        user_query: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("{}/chat/completions", self.base_url);
         println!("[NIM] POST {}", url);
-        println!("[NIM] Model: {} | User query: \"{}\"", self.model, user_query);
+        println!(
+            "[NIM] Model: {} | User query: \"{}\"",
+            self.model, user_query
+        );
         println!("[NIM] System prompt length: {} chars", system_prompt.len());
 
         let messages = vec![
@@ -233,17 +289,19 @@ impl OnlineReasoning {
             chat_template_kwargs,
         };
 
-        println!("[NIM] Request: model={}, max_tokens={}, temp={}, top_p={}, seed={}",
-            request.model, request.max_tokens, request.temperature, request.top_p, request.seed);
+        println!(
+            "[NIM] Request: model={}, max_tokens={}, temp={}, top_p={}, seed={}",
+            request.model, request.max_tokens, request.temperature, request.top_p, request.seed
+        );
 
-        let response = self
+        let mut req = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
+            .header("Content-Type", "application/json");
+        if !self.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+        let response = req.json(&request).send().await?;
 
         let status = response.status();
         println!("[NIM] Response status: {}", status);
@@ -263,10 +321,17 @@ impl OnlineReasoning {
             .unwrap_or_default();
 
         if let Some(usage) = result.usage {
-            println!("[NIM] Tokens: {} prompt + {} completion = {} total",
-                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens);
+            println!(
+                "[NIM] Tokens: {} prompt + {} completion = {} total",
+                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+            );
         }
-        println!("[NIM] Response: \"{}\"", &content[..content.len().min(200)]);
+        let preview_end = content.len().min(200);
+        let mut idx = preview_end;
+        while idx > 0 && !content.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        println!("[NIM] Response: \"{}\"", &content[..idx]);
         println!("[NIM] Response length: {} chars", content.len());
 
         Ok(content.trim().to_string())
@@ -380,17 +445,39 @@ pub fn online_tool_system_prompt(conversation_context: &str) -> String {
 }
 
 /// Run online reasoning with the currently selected model and provider.
-pub async fn reason_online(system_prompt: &str, user_query: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Falls back to the local provider (then surfaces a clear error) so a
+/// missing key or unreachable endpoint degrades gracefully.
+pub async fn reason_online(
+    system_prompt: &str,
+    user_query: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let model = crate::get_selected_model();
     let provider = LlmProvider::from_key(&crate::get_selected_provider());
-    let mut reasoning = OnlineReasoning::with_provider(provider)?;
-    reasoning.set_model(&model);
-    reasoning.reason(system_prompt, user_query).await
+    if let Ok(mut reasoning) = OnlineReasoning::with_provider(provider) {
+        reasoning.set_model(&model);
+        if let Ok(answer) = reasoning.reason(system_prompt, user_query).await {
+            if !answer.trim().is_empty() {
+                return Ok(answer);
+            }
+        }
+    }
+    // Local fallback.
+    if let Ok(local) = OnlineReasoning::with_provider(LlmProvider::Local) {
+        if let Ok(answer) = local.reason(system_prompt, user_query).await {
+            if !answer.trim().is_empty() {
+                return Ok(answer);
+            }
+        }
+    }
+    Err("no reasoning provider available (online and local both failed)".into())
 }
 
 /// Run online reasoning with the fast model for tool routing / intent classification.
 /// Always uses NVIDIA provider (Gemma 9B) regardless of the user's chat provider selection.
-pub async fn reason_online_fast(system_prompt: &str, user_query: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub async fn reason_online_fast(
+    system_prompt: &str,
+    user_query: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut reasoning = OnlineReasoning::with_provider(LlmProvider::Nvidia)?;
     reasoning.set_model(FAST_MODEL);
     reasoning.reason(system_prompt, user_query).await
@@ -421,7 +508,8 @@ pub fn parse_tool_call(output: &str) -> Option<(&'static str, &'static str)> {
     let tool = extract_json_string_field(json_str, "tool")?;
 
     // Try "args" then "arguments" field
-    let args = if let Some(args_field) = json_str.find("\"args\"")
+    let args = if let Some(args_field) = json_str
+        .find("\"args\"")
         .or_else(|| json_str.find("\"arguments\""))
     {
         let after_field = &json_str[args_field..];
@@ -433,7 +521,10 @@ pub fn parse_tool_call(output: &str) -> Option<(&'static str, &'static str)> {
         "{}".to_string()
     };
 
-    Some((Box::leak(tool.into_boxed_str()), Box::leak(args.into_boxed_str())))
+    Some((
+        Box::leak(tool.into_boxed_str()),
+        Box::leak(args.into_boxed_str()),
+    ))
 }
 
 /// Parse one or more tool calls from the LLM output.
@@ -492,7 +583,8 @@ fn extract_single_call(json: &str) -> Option<(&str, &str)> {
     let val_end = json[val_start..].find('"')? + val_start;
     let tool = &json[val_start..val_end];
 
-    let args_brace = json.find("\"args\"")
+    let args_brace = json
+        .find("\"args\"")
         .or_else(|| json.find("\"arguments\""))?;
     let after_field = &json[args_brace..];
     let brace = after_field.find('{')? + args_brace;
@@ -519,7 +611,10 @@ mod tests {
     async fn test_online_reasoning() {
         let reasoning = OnlineReasoning::new().unwrap();
         let result = reasoning
-            .reason("You are a helpful assistant.", "What is the capital of France?")
+            .reason(
+                "You are a helpful assistant.",
+                "What is the capital of France?",
+            )
             .await;
         println!("Result: {:?}", result);
     }

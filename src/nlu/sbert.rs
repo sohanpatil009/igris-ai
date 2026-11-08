@@ -32,18 +32,18 @@ impl SbertTokenizer {
     /// Load tokenizer from tokenizer.json
     pub fn load(model_path: &PathBuf) -> Result<Self> {
         let tokenizer_path = model_path.join("tokenizer.json");
-        
+
         if !tokenizer_path.exists() {
             return Err(anyhow!("Tokenizer file not found: {:?}", tokenizer_path));
         }
-        
+
         let file = File::open(&tokenizer_path)?;
         let reader = BufReader::new(file);
         let tokenizer_json: serde_json::Value = serde_json::from_reader(reader)?;
-        
+
         let mut vocab = HashMap::new();
         let mut id_to_token = HashMap::new();
-        
+
         // Parse vocabulary from tokenizer.json
         if let Some(model) = tokenizer_json.get("model") {
             if let Some(vocab_obj) = model.get("vocab") {
@@ -57,13 +57,13 @@ impl SbertTokenizer {
                 }
             }
         }
-        
+
         // Get special token IDs
         let unk_token_id = *vocab.get("[UNK]").unwrap_or(&0);
         let cls_token_id = *vocab.get("[CLS]").unwrap_or(&101);
         let sep_token_id = *vocab.get("[SEP]").unwrap_or(&102);
         let pad_token_id = *vocab.get("[PAD]").unwrap_or(&0);
-        
+
         Ok(Self {
             vocab,
             id_to_token,
@@ -74,15 +74,15 @@ impl SbertTokenizer {
             max_length: 128,
         })
     }
-    
+
     /// Tokenize text into token IDs
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut tokens = vec![self.cls_token_id];
-        
+
         // Simple whitespace + subword tokenization
         let text_lower = text.to_lowercase();
         let words: Vec<&str> = text_lower.split_whitespace().collect();
-        
+
         for word in words {
             // Try full word first
             if let Some(&id) = self.vocab.get(word) {
@@ -92,58 +92,58 @@ impl SbertTokenizer {
                 let subwords = self.wordpiece_tokenize(word);
                 tokens.extend(subwords);
             }
-            
+
             if tokens.len() >= self.max_length - 1 {
                 break;
             }
         }
-        
+
         tokens.push(self.sep_token_id);
-        
+
         // Pad to max_length
         while tokens.len() < self.max_length {
             tokens.push(self.pad_token_id);
         }
-        
+
         tokens.truncate(self.max_length);
         tokens
     }
-    
+
     /// WordPiece tokenization for unknown words
     fn wordpiece_tokenize(&self, word: &str) -> Vec<u32> {
         let mut tokens = Vec::new();
         let mut start = 0;
-        
+
         while start < word.len() {
             let mut end = word.len();
             let mut found = false;
-            
+
             while start < end {
                 let substr = if start == 0 {
                     word[start..end].to_string()
                 } else {
                     format!("##{}", &word[start..end])
                 };
-                
+
                 if let Some(&id) = self.vocab.get(&substr) {
                     tokens.push(id);
                     found = true;
                     start = end;
                     break;
                 }
-                
+
                 end -= 1;
             }
-            
+
             if !found {
                 tokens.push(self.unk_token_id);
                 start += 1;
             }
         }
-        
+
         tokens
     }
-    
+
     /// Get attention mask (1 for real tokens, 0 for padding)
     pub fn get_attention_mask(&self, token_ids: &[u32]) -> Vec<f32> {
         token_ids
@@ -178,18 +178,18 @@ impl SbertEngine {
             embeddings_cache: HashMap::new(),
         }
     }
-    
+
     /// Initialize SBERT engine with model files
     pub fn initialize(&mut self) -> Result<()> {
         let model_path = PathBuf::from("./pkg/models/sbert");
-        
+
         // Check if model files exist
         if !model_path.exists() {
             println!("⚠️ SBERT model not found, using fallback mode");
             self.load_precomputed_embeddings();
             return Ok(());
         }
-        
+
         // Load tokenizer
         match SbertTokenizer::load(&model_path) {
             Ok(tokenizer) => {
@@ -200,20 +200,23 @@ impl SbertEngine {
                 println!("⚠️ Failed to load tokenizer: {}, using fallback", e);
             }
         }
-        
+
         // Load precomputed embeddings for common intents
         self.load_precomputed_embeddings();
         self.model_loaded = true;
-        
-        println!("✅ SBERT engine initialized with {} intent embeddings", self.intent_embeddings.len());
+
+        println!(
+            "✅ SBERT engine initialized with {} intent embeddings",
+            self.intent_embeddings.len()
+        );
         Ok(())
     }
-    
+
     /// Load precomputed embeddings for common phrases
     fn load_precomputed_embeddings(&mut self) {
         // These are real SBERT embeddings precomputed for common intents
         // In production, you'd load these from a file or compute them once
-        
+
         let intent_phrases = vec![
             // Open app intents
             ("open_app", "open chrome"),
@@ -226,7 +229,6 @@ impl SbertEngine {
             ("open_app", "open spotify"),
             ("open_app", "launch discord"),
             ("open_app", "open vscode"),
-            
             // Close app intents
             ("close_app", "close chrome"),
             ("close_app", "quit firefox"),
@@ -235,7 +237,6 @@ impl SbertEngine {
             ("close_app", "kill process"),
             ("close_app", "shut down program"),
             ("close_app", "close all apps"),
-            
             // System control
             ("system_control", "shutdown computer"),
             ("system_control", "restart system"),
@@ -251,7 +252,6 @@ impl SbertEngine {
             ("system_control", "disable bluetooth"),
             ("system_control", "increase brightness"),
             ("system_control", "lower brightness"),
-            
             // File operations
             ("file_operation", "create file"),
             ("file_operation", "delete document"),
@@ -260,7 +260,6 @@ impl SbertEngine {
             ("file_operation", "rename file"),
             ("file_operation", "open folder"),
             ("file_operation", "search files"),
-            
             // Camera control
             ("camera_control", "open camera"),
             ("camera_control", "camera"),
@@ -275,7 +274,6 @@ impl SbertEngine {
             ("camera_control", "record video"),
             ("camera_control", "start recording"),
             ("camera_control", "stop recording"),
-            
             // Web search
             ("web_search", "search for"),
             ("web_search", "google something"),
@@ -285,7 +283,6 @@ impl SbertEngine {
             ("web_search", "who is"),
             ("web_search", "where is"),
             ("web_search", "how to"),
-            
             // Assistant control
             ("assistant_control", "go to sleep"),
             ("assistant_control", "standby mode"),
@@ -293,18 +290,17 @@ impl SbertEngine {
             ("assistant_control", "quit igris"),
             ("assistant_control", "goodbye"),
             ("assistant_control", "shut down assistant"),
-            
             // Greeting
             ("greeting", "hello"),
             ("greeting", "hi there"),
             ("greeting", "good morning"),
             ("greeting", "hey igris"),
         ];
-        
+
         for (intent, phrase) in intent_phrases {
             // Generate a simple hash-based embedding as fallback
             let embedding = self.generate_fallback_embedding(phrase);
-            
+
             self.intent_embeddings.push(IntentEmbedding {
                 intent_name: intent.to_string(),
                 phrase: phrase.to_string(),
@@ -318,23 +314,23 @@ impl SbertEngine {
     fn generate_fallback_embedding(&self, text: &str) -> Vec<f32> {
         let mut embedding = vec![0.0f32; EMBEDDING_DIM];
         let text_lower = text.to_lowercase();
-        
+
         // Character trigram hashing
         let chars: Vec<char> = text_lower.chars().collect();
         for i in 0..chars.len().saturating_sub(2) {
-            let trigram: String = chars[i..i+3].iter().collect();
+            let trigram: String = chars[i..i + 3].iter().collect();
             let hash = self.hash_string(&trigram);
             let idx = (hash as usize) % EMBEDDING_DIM;
             embedding[idx] += 1.0;
         }
-        
+
         // Word unigram features
         for word in text_lower.split_whitespace() {
             let hash = self.hash_string(word);
             let idx = (hash as usize) % EMBEDDING_DIM;
             embedding[idx] += 2.0; // Words weighted more than trigrams
         }
-        
+
         // Normalize embedding
         let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
@@ -342,10 +338,10 @@ impl SbertEngine {
                 *val /= norm;
             }
         }
-        
+
         embedding
     }
-    
+
     /// Simple string hash function
     fn hash_string(&self, s: &str) -> u64 {
         let mut hash: u64 = 5381;
@@ -354,99 +350,101 @@ impl SbertEngine {
         }
         hash
     }
-    
+
     /// Compute embedding for input text
     pub fn embed(&mut self, text: &str) -> Vec<f32> {
         // Check cache first
         if let Some(cached) = self.embeddings_cache.get(text) {
             return cached.clone();
         }
-        
+
         let embedding = self.generate_fallback_embedding(text);
-        
+
         // Cache the result
         if self.embeddings_cache.len() < 1000 {
-            self.embeddings_cache.insert(text.to_string(), embedding.clone());
+            self.embeddings_cache
+                .insert(text.to_string(), embedding.clone());
         }
-        
+
         embedding
     }
-    
+
     /// Compute cosine similarity between two embeddings
     pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         if a.len() != b.len() {
             return 0.0;
         }
-        
+
         let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
         let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
         let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        
+
         if norm_a == 0.0 || norm_b == 0.0 {
             return 0.0;
         }
-        
+
         dot / (norm_a * norm_b)
     }
-    
+
     /// Find the most similar intent for input text
     pub fn find_intent(&mut self, text: &str) -> Option<(String, f32)> {
         let input_embedding = self.embed(text);
-        
+
         let mut best_intent = String::new();
         let mut best_score = 0.0f32;
-        
+
         for intent_emb in &self.intent_embeddings {
             let similarity = Self::cosine_similarity(&input_embedding, &intent_emb.embedding);
-            
+
             if similarity > best_score {
                 best_score = similarity;
                 best_intent = intent_emb.intent_name.clone();
             }
         }
-        
+
         if best_score > 0.3 {
             Some((best_intent, best_score))
         } else {
             None
         }
     }
-    
+
     /// Find top-k most similar intents
     pub fn find_top_intents(&mut self, text: &str, k: usize) -> Vec<(String, f32)> {
         let input_embedding = self.embed(text);
-        
-        let mut scores: Vec<(String, f32)> = self.intent_embeddings
+
+        let mut scores: Vec<(String, f32)> = self
+            .intent_embeddings
             .iter()
             .map(|intent_emb| {
                 let similarity = Self::cosine_similarity(&input_embedding, &intent_emb.embedding);
                 (intent_emb.intent_name.clone(), similarity)
             })
             .collect();
-        
+
         // Sort by similarity descending
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         // Deduplicate by intent name, keeping highest score
         let mut seen = std::collections::HashSet::new();
         scores.retain(|(intent, _)| seen.insert(intent.clone()));
-        
+
         scores.truncate(k);
         scores
     }
-    
+
     /// Compute semantic similarity between two texts
     pub fn text_similarity(&mut self, text1: &str, text2: &str) -> f32 {
         let emb1 = self.embed(text1);
         let emb2 = self.embed(text2);
         Self::cosine_similarity(&emb1, &emb2)
     }
-    
+
     /// Extract semantic entities from text using similarity matching
     pub fn extract_semantic_entities(&mut self, text: &str) -> HashMap<String, String> {
         let mut entities = HashMap::new();
         let text_lower = text.to_lowercase();
-        
+
         // First, check plugin commands for entity extraction
         let plugins = crate::bridge::plugin_snapshots();
         for plugin in plugins {
@@ -458,7 +456,7 @@ impl SbertEngine {
                     entities.insert("plugin_action".to_string(), command.action_type.clone());
                     break;
                 }
-                
+
                 // Try individual keywords from trigger
                 for keyword in command.trigger.split_whitespace() {
                     if keyword.len() > 2 && text_lower.contains(keyword) {
@@ -467,7 +465,7 @@ impl SbertEngine {
                         break;
                     }
                 }
-                
+
                 // Check examples
                 for example in &command.examples {
                     if text_lower.contains(&example.to_lowercase()) {
@@ -476,17 +474,17 @@ impl SbertEngine {
                         break;
                     }
                 }
-                
+
                 if entities.contains_key("plugin_trigger") {
                     break;
                 }
             }
-            
+
             if entities.contains_key("plugin_trigger") {
                 break;
             }
         }
-        
+
         // Application extraction using semantic similarity
         let app_patterns = vec![
             ("chrome", "browser"),
@@ -511,14 +509,14 @@ impl SbertEngine {
             ("cmd", "system"),
             ("powershell", "system"),
         ];
-        
+
         for (app_name, _category) in &app_patterns {
             if text_lower.contains(app_name) {
                 entities.insert("app".to_string(), app_name.to_string());
                 break;
             }
         }
-        
+
         // If no exact match, try semantic similarity for app names
         if !entities.contains_key("app") {
             let words: Vec<&str> = text_lower.split_whitespace().collect();
@@ -537,7 +535,7 @@ impl SbertEngine {
                 }
             }
         }
-        
+
         // Extract numbers/percentages
         let number_regex = regex::Regex::new(r"\b(\d+)\b").ok();
         if let Some(re) = number_regex {
@@ -547,26 +545,33 @@ impl SbertEngine {
                 }
             }
         }
-        
+
         // Extract action verbs
-        let actions = ["open", "close", "start", "stop", "launch", "quit", "exit", 
-                       "increase", "decrease", "set", "turn", "enable", "disable",
-                       "mute", "unmute", "lock", "shutdown", "restart", "search"];
-        
+        let actions = [
+            "open", "close", "start", "stop", "launch", "quit", "exit", "increase", "decrease",
+            "set", "turn", "enable", "disable", "mute", "unmute", "lock", "shutdown", "restart",
+            "search",
+        ];
+
         for action in &actions {
             if text_lower.contains(action) {
                 entities.insert("action".to_string(), action.to_string());
                 break;
             }
         }
-        
+
         // Extract targets (wifi, bluetooth, volume, brightness)
         let targets = [
-            ("wifi", "network"), ("wi-fi", "network"), ("wireless", "network"),
-            ("bluetooth", "network"), ("volume", "audio"), ("sound", "audio"),
-            ("brightness", "display"), ("screen", "display"),
+            ("wifi", "network"),
+            ("wi-fi", "network"),
+            ("wireless", "network"),
+            ("bluetooth", "network"),
+            ("volume", "audio"),
+            ("sound", "audio"),
+            ("brightness", "display"),
+            ("screen", "display"),
         ];
-        
+
         for (target, category) in &targets {
             if text_lower.contains(target) {
                 entities.insert("target".to_string(), target.to_string());
@@ -574,20 +579,20 @@ impl SbertEngine {
                 break;
             }
         }
-        
+
         entities
     }
-    
+
     /// Check if model is loaded
     pub fn is_loaded(&self) -> bool {
         self.model_loaded || !self.intent_embeddings.is_empty()
     }
-    
+
     /// Get number of loaded intent embeddings
     pub fn intent_count(&self) -> usize {
         self.intent_embeddings.len()
     }
-    
+
     /// Add custom intent embedding
     pub fn add_intent(&mut self, intent_name: &str, phrase: &str) {
         let embedding = self.generate_fallback_embedding(phrase);
@@ -597,7 +602,7 @@ impl SbertEngine {
             embedding,
         });
     }
-    
+
     /// Clear embedding cache
     pub fn clear_cache(&mut self) {
         self.embeddings_cache.clear();
@@ -621,18 +626,20 @@ impl SharedSbertEngine {
             engine: std::sync::Arc::new(std::sync::Mutex::new(SbertEngine::new())),
         }
     }
-    
+
     pub fn initialize(&self) -> Result<()> {
-        let mut engine = self.engine.lock()
+        let mut engine = self
+            .engine
+            .lock()
             .map_err(|_| anyhow!("Failed to acquire SBERT lock"))?;
         engine.initialize()
     }
-    
+
     pub fn find_intent(&self, text: &str) -> Option<(String, f32)> {
         let mut engine = self.engine.lock().ok()?;
         engine.find_intent(text)
     }
-    
+
     pub fn find_top_intents(&self, text: &str, k: usize) -> Vec<(String, f32)> {
         if let Ok(mut engine) = self.engine.lock() {
             engine.find_top_intents(text, k)
@@ -640,7 +647,7 @@ impl SharedSbertEngine {
             Vec::new()
         }
     }
-    
+
     pub fn text_similarity(&self, text1: &str, text2: &str) -> f32 {
         if let Ok(mut engine) = self.engine.lock() {
             engine.text_similarity(text1, text2)
@@ -648,7 +655,7 @@ impl SharedSbertEngine {
             0.0
         }
     }
-    
+
     pub fn extract_semantic_entities(&self, text: &str) -> HashMap<String, String> {
         if let Ok(mut engine) = self.engine.lock() {
             engine.extract_semantic_entities(text)
@@ -656,12 +663,12 @@ impl SharedSbertEngine {
             HashMap::new()
         }
     }
-    
+
     pub fn embed(&self, text: &str) -> Option<Vec<f32>> {
         let mut engine = self.engine.lock().ok()?;
         Some(engine.embed(text))
     }
-    
+
     pub fn is_loaded(&self) -> bool {
         if let Ok(engine) = self.engine.lock() {
             engine.is_loaded()
@@ -669,7 +676,7 @@ impl SharedSbertEngine {
             false
         }
     }
-    
+
     pub fn add_intent(&self, intent_name: &str, phrase: &str) {
         if let Ok(mut engine) = self.engine.lock() {
             engine.add_intent(intent_name, phrase);
@@ -691,50 +698,50 @@ lazy_static::lazy_static! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_sbert_initialization() {
         let mut engine = SbertEngine::new();
         engine.load_precomputed_embeddings();
         assert!(engine.intent_count() > 0);
     }
-    
+
     #[test]
     fn test_cosine_similarity() {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
         assert!((SbertEngine::cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
-        
+
         let c = vec![0.0, 1.0, 0.0];
         assert!(SbertEngine::cosine_similarity(&a, &c).abs() < 0.001);
     }
-    
+
     #[test]
     fn test_find_intent() {
         let mut engine = SbertEngine::new();
         engine.load_precomputed_embeddings();
-        
+
         if let Some((intent, score)) = engine.find_intent("open chrome browser") {
             assert_eq!(intent, "open_app");
             assert!(score > 0.3);
         }
     }
-    
+
     #[test]
     fn test_text_similarity() {
         let mut engine = SbertEngine::new();
-        
+
         let sim1 = engine.text_similarity("open chrome", "launch chrome");
         let sim2 = engine.text_similarity("open chrome", "close firefox");
-        
+
         // Similar phrases should have higher similarity
         assert!(sim1 > sim2);
     }
-    
+
     #[test]
     fn test_semantic_entity_extraction() {
         let mut engine = SbertEngine::new();
-        
+
         let entities = engine.extract_semantic_entities("open chrome browser");
         assert!(entities.contains_key("app"));
         assert_eq!(entities.get("app"), Some(&"chrome".to_string()));

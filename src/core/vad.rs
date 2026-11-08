@@ -106,31 +106,81 @@ pub struct VadConfig {
 }
 
 // ---- Default-value helpers for serde ----
-fn default_enabled() -> bool { true }
-fn default_frame_ms() -> u32 { 20 }
-fn default_sample_rate() -> u32 { 16000 }
-fn default_speech_threshold() -> f32 { 0.65 }
-fn default_start_frames() -> u32 { 3 }
-fn default_end_frames() -> u32 { 12 }
-fn default_hangover_ms() -> u32 { 250 }
-fn default_min_speech_ms() -> u32 { 200 }
-fn default_max_speech_ms() -> u32 { 15_000 }
-fn default_pre_speech_buffer_ms() -> u32 { 300 }
-fn default_post_speech_buffer_ms() -> u32 { 200 }
-fn default_noise_floor_adaptation() -> f32 { 0.05 }
-fn default_noise_gate_multiplier() -> f32 { 2.5 }
-fn default_noise_gate_min() -> f32 { 0.003 }
-fn default_weight_energy() -> f32 { 0.35 }
-fn default_weight_zcr() -> f32 { 0.15 }
-fn default_weight_centroid() -> f32 { 0.15 }
-fn default_weight_flux() -> f32 { 0.15 }
-fn default_weight_band_energy() -> f32 { 0.20 }
-fn default_energy_threshold() -> f32 { 0.02 }
-fn default_zcr_threshold() -> f32 { 0.30 }
-fn default_centroid_min() -> f32 { 250.0 }
-fn default_centroid_max() -> f32 { 3600.0 }
-fn default_flux_min() -> f32 { 0.005 }
-fn default_band_ratio_min() -> f32 { 0.35 }
+fn default_enabled() -> bool {
+    true
+}
+fn default_frame_ms() -> u32 {
+    20
+}
+fn default_sample_rate() -> u32 {
+    16000
+}
+fn default_speech_threshold() -> f32 {
+    0.65
+}
+fn default_start_frames() -> u32 {
+    3
+}
+fn default_end_frames() -> u32 {
+    12
+}
+fn default_hangover_ms() -> u32 {
+    250
+}
+fn default_min_speech_ms() -> u32 {
+    200
+}
+fn default_max_speech_ms() -> u32 {
+    15_000
+}
+fn default_pre_speech_buffer_ms() -> u32 {
+    300
+}
+fn default_post_speech_buffer_ms() -> u32 {
+    200
+}
+fn default_noise_floor_adaptation() -> f32 {
+    0.05
+}
+fn default_noise_gate_multiplier() -> f32 {
+    2.5
+}
+fn default_noise_gate_min() -> f32 {
+    0.003
+}
+fn default_weight_energy() -> f32 {
+    0.35
+}
+fn default_weight_zcr() -> f32 {
+    0.15
+}
+fn default_weight_centroid() -> f32 {
+    0.15
+}
+fn default_weight_flux() -> f32 {
+    0.15
+}
+fn default_weight_band_energy() -> f32 {
+    0.20
+}
+fn default_energy_threshold() -> f32 {
+    0.02
+}
+fn default_zcr_threshold() -> f32 {
+    0.30
+}
+fn default_centroid_min() -> f32 {
+    250.0
+}
+fn default_centroid_max() -> f32 {
+    3600.0
+}
+fn default_flux_min() -> f32 {
+    0.005
+}
+fn default_band_ratio_min() -> f32 {
+    0.35
+}
 
 impl Default for VadConfig {
     fn default() -> Self {
@@ -287,7 +337,10 @@ pub enum VadState {
     /// Active speech — may include hangover frames
     Speaking { frames: u32, hangover_frames: u32 },
     /// Speech ended at feature level, counting silence confirmations
-    PostSpeech { silence_frames: u32, total_frames: u32 },
+    PostSpeech {
+        silence_frames: u32,
+        total_frames: u32,
+    },
 }
 
 // --------------- Feature Extraction ---------------
@@ -488,9 +541,10 @@ impl VoiceActivityDetector {
 
         let rms = compute_rms(samples);
         let zcr = compute_zcr(samples);
-        let gate_threshold =
-            self.noise
-                .threshold(self.config.noise_gate_multiplier, self.config.noise_gate_min);
+        let gate_threshold = self.noise.threshold(
+            self.config.noise_gate_multiplier,
+            self.config.noise_gate_min,
+        );
         let passes_gate = rms > gate_threshold;
 
         let (centroid, flux, band_ratio) = if passes_gate {
@@ -569,9 +623,9 @@ impl VoiceActivityDetector {
     ) -> f32 {
         let w = &self.config;
 
-        let noise_threshold =
-            self.noise
-                .threshold(w.noise_gate_multiplier, w.noise_gate_min);
+        let noise_threshold = self
+            .noise
+            .threshold(w.noise_gate_multiplier, w.noise_gate_min);
 
         let energy_score = if rms <= noise_threshold {
             0.0
@@ -748,12 +802,7 @@ impl VoiceActivityDetector {
 
     // ---- Buffer management ----
 
-    fn manage_buffers(
-        &mut self,
-        samples: &[f32],
-        new_state: &VadState,
-        event: Option<VadEvent>,
-    ) {
+    fn manage_buffers(&mut self, samples: &[f32], new_state: &VadState, event: Option<VadEvent>) {
         match event {
             Some(VadEvent::SpeechStarted) => {
                 self.speech_buffer.clear();
@@ -761,8 +810,7 @@ impl VoiceActivityDetector {
                 self.speech_buffer.extend_from_slice(samples);
             }
             Some(VadEvent::SpeechEnded | VadEvent::MaxDurationReached) => {
-                if let VadState::Idle = new_state {
-                }
+                if let VadState::Idle = new_state {}
             }
             None => match *new_state {
                 VadState::Idle | VadState::PreSpeech { .. } => {
@@ -1161,7 +1209,10 @@ mod tests {
 
         let audio = vad.take_audio();
         assert!(!audio.is_empty(), "audio should have been captured");
-        assert!(vad.get_audio().is_empty(), "buffer should be empty after take");
+        assert!(
+            vad.get_audio().is_empty(),
+            "buffer should be empty after take"
+        );
     }
 
     #[test]

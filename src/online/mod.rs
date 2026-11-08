@@ -1,9 +1,11 @@
 // src/online/mod.rs - Online mode modules using NVIDIA NIM APIs
 
+pub mod intent_router;
+pub mod local_reasoning;
 pub mod reasoning;
 pub mod stt;
 pub mod task_planner;
-pub mod intent_router;
+pub mod web_search;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -70,5 +72,8 @@ pub async fn check_internet_connectivity() -> bool {
     false
 }
 
-pub use reasoning::{reason_online, reason_online_with_model, reason_online_fast, OnlineReasoning, LlmProvider, AVAILABLE_MODELS, FAST_MODEL};
+pub use reasoning::{
+    reason_online, reason_online_fast, reason_online_with_model, LlmProvider, OnlineReasoning,
+    AVAILABLE_MODELS, FAST_MODEL,
+};
 pub use stt::{transcribe_online, OnlineStt};

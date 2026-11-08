@@ -40,9 +40,7 @@ extern "C" {
 
     fn piper_free(synth: *mut std::ffi::c_void);
 
-    fn piper_default_synthesize_options(
-        synth: *mut std::ffi::c_void,
-    ) -> PiperSynthesizeOptions;
+    fn piper_default_synthesize_options(synth: *mut std::ffi::c_void) -> PiperSynthesizeOptions;
 
     fn piper_synthesize_start(
         synth: *mut std::ffi::c_void,
@@ -50,10 +48,7 @@ extern "C" {
         options: *const PiperSynthesizeOptions,
     ) -> i32;
 
-    fn piper_synthesize_next(
-        synth: *mut std::ffi::c_void,
-        chunk: *mut PiperAudioChunk,
-    ) -> i32;
+    fn piper_synthesize_next(synth: *mut std::ffi::c_void, chunk: *mut PiperAudioChunk) -> i32;
 }
 
 pub struct PiperVoice {
@@ -64,7 +59,11 @@ unsafe impl Send for PiperVoice {}
 unsafe impl Sync for PiperVoice {}
 
 impl PiperVoice {
-    pub fn new(model_path: &str, config_path: &str, espeak_data_path: &str) -> Result<Self, String> {
+    pub fn new(
+        model_path: &str,
+        config_path: &str,
+        espeak_data_path: &str,
+    ) -> Result<Self, String> {
         // Validate paths exist before calling FFI (prevents segfault)
         if !std::path::Path::new(model_path).exists() {
             return Err(format!("Model file not found: {}", model_path));
@@ -73,14 +72,22 @@ impl PiperVoice {
             return Err(format!("Config file not found: {}", config_path));
         }
         if !std::path::Path::new(espeak_data_path).exists() {
-            return Err(format!("espeak-ng-data dir not found: {}", espeak_data_path));
+            return Err(format!(
+                "espeak-ng-data dir not found: {}",
+                espeak_data_path
+            ));
         }
 
         let model = CString::new(model_path).map_err(|e| format!("Invalid model path: {}", e))?;
-        let config = CString::new(config_path).map_err(|e| format!("Invalid config path: {}", e))?;
-        let espeak = CString::new(espeak_data_path).map_err(|e| format!("Invalid espeak path: {}", e))?;
+        let config =
+            CString::new(config_path).map_err(|e| format!("Invalid config path: {}", e))?;
+        let espeak =
+            CString::new(espeak_data_path).map_err(|e| format!("Invalid espeak path: {}", e))?;
 
-        let msg = format!("[TTS-FFI] piper_create({}, {}, {})", model_path, config_path, espeak_data_path);
+        let msg = format!(
+            "[TTS-FFI] piper_create({}, {}, {})",
+            model_path, config_path, espeak_data_path
+        );
         eprintln!("{}", msg);
         log_to_file(&msg);
 
@@ -133,9 +140,8 @@ impl PiperVoice {
 
             sample_rate = chunk.sample_rate;
             if !chunk.samples.is_null() && chunk.num_samples > 0 {
-                let samples = unsafe {
-                    std::slice::from_raw_parts(chunk.samples, chunk.num_samples)
-                };
+                let samples =
+                    unsafe { std::slice::from_raw_parts(chunk.samples, chunk.num_samples) };
                 all_samples.extend_from_slice(samples);
             }
         }

@@ -2,17 +2,17 @@
 // Handles downloading all required files with progress tracking
 // Platform-specific downloads for Windows, Linux, and macOS
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
-use tokio::sync::mpsc;
+use crate::setup_manager::SetupEvent;
+use dirs;
+use regex::Regex;
 use reqwest::Client;
 use std::fs::File;
 use std::io::Write;
-use crate::setup_manager::SetupEvent;
-use regex::Regex;
+use std::path::PathBuf;
 use std::process::Command;
-use dirs;
+use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct DownloadFile {
@@ -53,7 +53,10 @@ pub struct FileDownloader {
 }
 
 impl FileDownloader {
-    pub fn new(pkg_dir: PathBuf, event_sender: Arc<Mutex<mpsc::UnboundedSender<SetupEvent>>>) -> Self {
+    pub fn new(
+        pkg_dir: PathBuf,
+        event_sender: Arc<Mutex<mpsc::UnboundedSender<SetupEvent>>>,
+    ) -> Self {
         Self {
             pkg_dir,
             event_sender,
@@ -69,7 +72,9 @@ impl FileDownloader {
                 if final_path.exists() {
                     // For directories, check they contain actual files (not just an empty dir)
                     let is_complete = if final_path.is_dir() {
-                        final_path.read_dir().map_or(false, |mut entries| entries.next().is_some())
+                        final_path
+                            .read_dir()
+                            .is_ok_and(|mut entries| entries.next().is_some())
                     } else {
                         true
                     };
@@ -99,7 +104,9 @@ impl FileDownloader {
             // For directories, only skip if they contain files (empty dirs from
             // create_directories() must still be downloaded/extracted)
             let is_complete = if target.is_dir() {
-                target.read_dir().map_or(false, |mut entries| entries.next().is_some())
+                target
+                    .read_dir()
+                    .is_ok_and(|mut entries| entries.next().is_some())
             } else {
                 target.exists()
             };
@@ -242,6 +249,32 @@ impl FileDownloader {
             final_path: Some(self.pkg_dir.join("models/sense-voice/tokens.txt")),
         });
 
+        // Primary offline STT: NVIDIA Parakeet-TDT 0.6B v3 (int8).
+        files.push(DownloadFile {
+            name: "Parakeet STT",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2".to_string(),
+            filename: "parakeet.tar.bz2".to_string(),
+            final_path: Some(self.pkg_dir.join("models/parakeet")),
+        });
+
+        // Primary offline TTS: Kokoro-82M multi-language (ONNX).
+        files.push(DownloadFile {
+            name: "Kokoro TTS",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2".to_string(),
+            filename: "kokoro.tar.bz2".to_string(),
+            final_path: Some(self.pkg_dir.join("models/kokoro")),
+        });
+
+        // Silero VAD drives endpointing for both STT engines.
+        files.push(DownloadFile {
+            name: "Silero VAD",
+            url:
+                "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+                    .to_string(),
+            filename: "silero_vad.onnx".to_string(),
+            final_path: Some(self.pkg_dir.join("models/silero_vad.onnx")),
+        });
+
         // Only add LLVM if not installed (skip on macOS - use brew instead)
         #[cfg(not(target_os = "macos"))]
         if !llvm_installed {
@@ -266,7 +299,7 @@ impl FileDownloader {
                 final_path: Some(llvm_final),
             });
         }
-        
+
         // macOS: LLVM will be installed via brew in validator/extractor
         #[cfg(target_os = "macos")]
         if !llvm_installed {
@@ -286,11 +319,23 @@ impl FileDownloader {
             "sbert-config.json" => Some(self.pkg_dir.join("models/sbert/config.json")),
             "sbert-tokenizer.json" => Some(self.pkg_dir.join("models/sbert/tokenizer.json")),
             "sense-voice.tar.bz2" => Some(self.pkg_dir.join("models/sense-voice")),
-            "en_US-libritts_r-medium.onnx" => Some(self.pkg_dir.join("models/bold_voice/en_US-libritts_r-medium.onnx")),
-            "en_US-libritts_r-medium.onnx.json" => Some(self.pkg_dir.join("models/bold_voice/en_US-libritts_r-medium.onnx.json")),
+            "en_US-libritts_r-medium.onnx" => Some(
+                self.pkg_dir
+                    .join("models/bold_voice/en_US-libritts_r-medium.onnx"),
+            ),
+            "en_US-libritts_r-medium.onnx.json" => Some(
+                self.pkg_dir
+                    .join("models/bold_voice/en_US-libritts_r-medium.onnx.json"),
+            ),
             "sense-voice-model.onnx" => Some(self.pkg_dir.join("models/sense-voice/model.onnx")),
             "sense-voice-tokens.txt" => Some(self.pkg_dir.join("models/sense-voice/tokens.txt")),
-            "qwen2.5-1.5b-instruct-q4_k_m.gguf" => Some(self.pkg_dir.join("models/qwen2.5-1.5b-instruct-q4_k_m.gguf")),
+            "parakeet.tar.bz2" => Some(self.pkg_dir.join("models/parakeet")),
+            "kokoro.tar.bz2" => Some(self.pkg_dir.join("models/kokoro")),
+            "silero_vad.onnx" => Some(self.pkg_dir.join("models/silero_vad.onnx")),
+            "qwen2.5-1.5b-instruct-q4_k_m.gguf" => Some(
+                self.pkg_dir
+                    .join("models/qwen2.5-1.5b-instruct-q4_k_m.gguf"),
+            ),
             "ffmpeg.zip" | "ffmpeg.tar.xz" => Some(self.pkg_dir.join("ffmpeg")),
             _ => None,
         }
@@ -306,9 +351,8 @@ impl FileDownloader {
 const LLVM_RELEASE_TAG: &str = "llvmorg-21.1.8";
 
 async fn resolve_llvm_download_url(client: &Client) -> Result<String, Box<dyn std::error::Error>> {
-    let release_page = format!(
-        "https://github.com/llvm/llvm-project/releases/tag/{LLVM_RELEASE_TAG}"
-    );
+    let release_page =
+        format!("https://github.com/llvm/llvm-project/releases/tag/{LLVM_RELEASE_TAG}");
     let html = client.get(release_page).send().await?.text().await?;
 
     let href_re = Regex::new(&format!(
@@ -343,15 +387,25 @@ async fn resolve_llvm_download_url(client: &Client) -> Result<String, Box<dyn st
             // 64-bit Windows
             Box::new(|u| {
                 (u.contains("windows") || u.contains("pc-windows"))
-                    && (u.contains("x86_64") || u.contains("win64") || u.contains("amd64") || u.contains("X64"))
-                    && !u.contains("i686") && !u.contains("win32") && !u.contains("i386")
+                    && (u.contains("x86_64")
+                        || u.contains("win64")
+                        || u.contains("amd64")
+                        || u.contains("X64"))
+                    && !u.contains("i686")
+                    && !u.contains("win32")
+                    && !u.contains("i386")
             })
         } else if cfg!(target_arch = "x86") {
             // 32-bit Windows
             Box::new(|u| {
                 (u.contains("windows") || u.contains("pc-windows"))
-                    && (u.contains("i686") || u.contains("win32") || u.contains("i386") || u.contains("x86"))
-                    && !u.contains("x86_64") && !u.contains("win64") && !u.contains("amd64")
+                    && (u.contains("i686")
+                        || u.contains("win32")
+                        || u.contains("i386")
+                        || u.contains("x86"))
+                    && !u.contains("x86_64")
+                    && !u.contains("win64")
+                    && !u.contains("amd64")
             })
         } else if cfg!(target_arch = "aarch64") {
             // ARM64 Windows
@@ -376,7 +430,9 @@ async fn resolve_llvm_download_url(client: &Client) -> Result<String, Box<dyn st
     } else {
         // macOS - shouldn't reach here as we skip LLVM download on macOS
         if cfg!(target_arch = "aarch64") {
-            Box::new(|u| u.contains("apple-darwin") && (u.contains("arm64") || u.contains("aarch64")))
+            Box::new(|u| {
+                u.contains("apple-darwin") && (u.contains("arm64") || u.contains("aarch64"))
+            })
         } else {
             Box::new(|u| u.contains("apple-darwin") && u.contains("x86_64"))
         }
@@ -399,10 +455,10 @@ async fn resolve_llvm_download_url(client: &Client) -> Result<String, Box<dyn st
         return Ok(u);
     }
 
-    Err(format!(
-        "Failed to find LLVM binary archive for this platform in {LLVM_RELEASE_TAG}"
+    Err(
+        format!("Failed to find LLVM binary archive for this platform in {LLVM_RELEASE_TAG}")
+            .into(),
     )
-    .into())
 }
 
 // Add this function to check if LLVM is installed

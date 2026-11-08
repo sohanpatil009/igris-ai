@@ -1,13 +1,13 @@
 // src/setup_manager/extractor.rs
 // Handles extracting and organizing downloaded files
 
+use crate::setup_manager::SetupEvent;
+use dirs;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
-use std::fs;
-use crate::setup_manager::SetupEvent;
-use dirs;
 
 pub struct ExtractTask {
     pub name: &'static str,
@@ -22,7 +22,10 @@ pub struct FileExtractor {
 }
 
 impl FileExtractor {
-    pub fn new(pkg_dir: PathBuf, event_sender: Arc<Mutex<mpsc::UnboundedSender<SetupEvent>>>) -> Self {
+    pub fn new(
+        pkg_dir: PathBuf,
+        event_sender: Arc<Mutex<mpsc::UnboundedSender<SetupEvent>>>,
+    ) -> Self {
         Self {
             pkg_dir,
             event_sender,
@@ -35,19 +38,19 @@ impl FileExtractor {
         {
             self.install_llvm_via_brew().await?;
         }
-        
+
         let tasks = self.get_extract_tasks();
 
         for task in tasks {
             self.extract_file(&task).await?;
         }
-        
+
         // Cleanup downloads folder after extraction - no longer needed
         self.cleanup_downloads()?;
 
         Ok(())
     }
-    
+
     /// Remove downloads folder after extraction to save space
     fn cleanup_downloads(&self) -> Result<(), Box<dyn std::error::Error>> {
         let downloads_dir = self.pkg_dir.join("downloads");
@@ -58,82 +61,82 @@ impl FileExtractor {
         }
         Ok(())
     }
-    
+
     /// Install LLVM via Homebrew on macOS and set environment variables
     #[cfg(target_os = "macos")]
     async fn install_llvm_via_brew(&self) -> Result<(), Box<dyn std::error::Error>> {
         use std::process::Command;
-        
+
         // Check if LLVM is already installed
         let llvm_check = Command::new("llvm-config").arg("--version").output();
         if llvm_check.is_ok() && llvm_check.unwrap().status.success() {
             println!("[Setup] LLVM already installed");
             return Ok(());
         }
-        
+
         self.send_event(SetupEvent::Extracting {
             name: "LLVM (Homebrew)".to_string(),
             progress: 0,
         });
-        
+
         // Check if Homebrew is installed
         let brew_check = Command::new("brew").arg("--version").output();
         if brew_check.is_err() || !brew_check.unwrap().status.success() {
-            return Err("Homebrew is not installed. Please install Homebrew first: https://brew.sh".into());
+            return Err(
+                "Homebrew is not installed. Please install Homebrew first: https://brew.sh".into(),
+            );
         }
-        
+
         println!("[Setup] Installing LLVM via Homebrew...");
-        
+
         self.send_event(SetupEvent::Extracting {
             name: "LLVM (Homebrew)".to_string(),
             progress: 30,
         });
-        
+
         // Install LLVM via brew
-        let install_result = Command::new("brew")
-            .args(["install", "llvm"])
-            .output()?;
-        
+        let install_result = Command::new("brew").args(["install", "llvm"]).output()?;
+
         if !install_result.status.success() {
             let stderr = String::from_utf8_lossy(&install_result.stderr);
             return Err(format!("Failed to install LLVM via Homebrew: {}", stderr).into());
         }
-        
+
         self.send_event(SetupEvent::Extracting {
             name: "LLVM (Homebrew)".to_string(),
             progress: 80,
         });
-        
+
         // Get LLVM path from brew
-        let llvm_prefix = Command::new("brew")
-            .args(["--prefix", "llvm"])
-            .output()?;
-        
-        let llvm_path = String::from_utf8_lossy(&llvm_prefix.stdout).trim().to_string();
-        
+        let llvm_prefix = Command::new("brew").args(["--prefix", "llvm"]).output()?;
+
+        let llvm_path = String::from_utf8_lossy(&llvm_prefix.stdout)
+            .trim()
+            .to_string();
+
         if !llvm_path.is_empty() {
             println!("[Setup] LLVM installed at: {}", llvm_path);
-            
+
             // Set environment variables in shell profile
             self.setup_llvm_env_macos(&llvm_path)?;
         }
-        
+
         self.send_event(SetupEvent::Extracting {
             name: "LLVM (Homebrew)".to_string(),
             progress: 100,
         });
-        
+
         println!("[Setup] LLVM installation complete");
         Ok(())
     }
-    
+
     /// Setup LLVM environment variables on macOS
     #[cfg(target_os = "macos")]
     fn setup_llvm_env_macos(&self, llvm_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::Write;
-        
+
         let home = std::env::var("HOME")?;
-        
+
         // Environment variable exports
         let env_exports = format!(
             r#"
@@ -144,7 +147,7 @@ export LDFLAGS="-L{llvm_path}/lib"
 export CPPFLAGS="-I{llvm_path}/include"
 "#
         );
-        
+
         // Try to add to .zshrc (default on modern macOS)
         let zshrc_path = format!("{}/.zshrc", home);
         if let Ok(mut file) = fs::OpenOptions::new()
@@ -159,7 +162,7 @@ export CPPFLAGS="-I{llvm_path}/include"
                 println!("[Setup] Added LLVM env vars to ~/.zshrc");
             }
         }
-        
+
         // Also try .bash_profile for older systems
         let bash_profile_path = format!("{}/.bash_profile", home);
         if let Ok(mut file) = fs::OpenOptions::new()
@@ -173,11 +176,18 @@ export CPPFLAGS="-I{llvm_path}/include"
                 println!("[Setup] Added LLVM env vars to ~/.bash_profile");
             }
         }
-        
+
         // Set for current process
         std::env::set_var("LLVM_SYS_180_PREFIX", llvm_path);
-        std::env::set_var("PATH", format!("{}/bin:{}", llvm_path, std::env::var("PATH").unwrap_or_default()));
-        
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}/bin:{}",
+                llvm_path,
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+
         Ok(())
     }
 
@@ -222,8 +232,11 @@ export CPPFLAGS="-I{llvm_path}/include"
         }
 
         // Determine archive type and extract accordingly
-        let extension = archive_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        
+        let extension = archive_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
         match extension {
             "zip" => {
                 fs::create_dir_all(&extract_dir)?;
@@ -290,9 +303,7 @@ export CPPFLAGS="-I{llvm_path}/include"
 
             {
                 let mut cmd = std::process::Command::new("powershell");
-                cmd.arg("-NoProfile")
-                    .arg("-Command")
-                    .arg(ps_cmd);
+                cmd.arg("-NoProfile").arg("-Command").arg(ps_cmd);
                 #[cfg(target_os = "windows")]
                 {
                     use std::os::windows::process::CommandExt;
@@ -362,9 +373,7 @@ export CPPFLAGS="-I{llvm_path}/include"
     }
 
     fn flatten_directory(&self, dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-        let entries: Vec<_> = fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .collect();
+        let entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
 
         // If there's only one subdirectory, move its contents up
         if entries.len() == 1 {
@@ -380,7 +389,7 @@ export CPPFLAGS="-I{llvm_path}/include"
                 // Move them to parent
                 for nested_path in nested_entries {
                     let filename = nested_path.file_name().unwrap();
-                    let dest = dir.join(&filename);
+                    let dest = dir.join(filename);
 
                     if nested_path.is_dir() {
                         fs::create_dir_all(&dest).ok();
@@ -473,7 +482,36 @@ export CPPFLAGS="-I{llvm_path}/include"
                 flatten: false,
             });
         }
-        
+
+        // Parakeet is the primary STT engine.
+        if downloads_dir.join("parakeet.tar.bz2").exists() {
+            tasks.push(ExtractTask {
+                name: "Parakeet STT",
+                archive: "parakeet.tar.bz2".to_string(),
+                extract_to: PathBuf::from("models/parakeet"),
+                flatten: true,
+            });
+        }
+
+        // Kokoro is the primary TTS engine.
+        if downloads_dir.join("kokoro.tar.bz2").exists() {
+            tasks.push(ExtractTask {
+                name: "Kokoro TTS",
+                archive: "kokoro.tar.bz2".to_string(),
+                extract_to: PathBuf::from("models/kokoro"),
+                flatten: true,
+            });
+        }
+
+        if downloads_dir.join("silero_vad.onnx").exists() {
+            tasks.push(ExtractTask {
+                name: "Silero VAD",
+                archive: "silero_vad.onnx".to_string(),
+                extract_to: PathBuf::from("models/silero_vad.onnx"),
+                flatten: false,
+            });
+        }
+
         // Add FFmpeg extraction task (Windows and Linux only, macOS uses brew)
         #[cfg(not(target_os = "macos"))]
         {
@@ -482,7 +520,7 @@ export CPPFLAGS="-I{llvm_path}/include"
             } else {
                 "ffmpeg.tar.xz"
             };
-            
+
             if self.pkg_dir.join("downloads").join(ffmpeg_archive).exists() {
                 tasks.push(ExtractTask {
                     name: "FFmpeg",
@@ -492,7 +530,7 @@ export CPPFLAGS="-I{llvm_path}/include"
                 });
             }
         }
-        
+
         // Only add LLVM extraction task on Windows and Linux (macOS uses brew)
         #[cfg(not(target_os = "macos"))]
         {
@@ -501,15 +539,18 @@ export CPPFLAGS="-I{llvm_path}/include"
             } else {
                 "llvm.tar.xz"
             };
-            
-            tasks.insert(0, ExtractTask {
-                name: "LLVM",
-                archive: llvm_archive.to_string(),
-                extract_to: Self::llvm_install_dir(),
-                flatten: true,
-            });
+
+            tasks.insert(
+                0,
+                ExtractTask {
+                    name: "LLVM",
+                    archive: llvm_archive.to_string(),
+                    extract_to: Self::llvm_install_dir(),
+                    flatten: true,
+                },
+            );
         }
-        
+
         tasks
     }
 

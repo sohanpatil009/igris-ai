@@ -1,12 +1,12 @@
 // src/nlu/engine.rs - Conversational NLU with SBERT semantic understanding
 // Enhanced for natural language processing with filler word removal and alias support
 
+use crate::nlu::ner::{EntityType, GLOBAL_NER};
+use crate::nlu::sbert::GLOBAL_SBERT;
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use crate::nlu::sbert::GLOBAL_SBERT;
-use crate::nlu::ner::{GLOBAL_NER, EntityType};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // FILLER WORDS & NORMALIZATION
@@ -14,18 +14,62 @@ use crate::nlu::ner::{GLOBAL_NER, EntityType};
 
 /// Common filler words to remove for better intent matching
 const FILLER_WORDS: &[&str] = &[
-    "okay", "ok", "now", "please", "can", "you", "could", "would", "just",
-    "actually", "basically", "literally", "really", "very", "so", "well",
-    "um", "uh", "like", "i", "want", "to", "need", "the", "a", "an",
-    "hey", "hi", "hello", "yo", "alright", "right", "sure", "yeah",
-    "gonna", "wanna", "gotta", "lemme", "let", "me", "my", "for", "me",
-    "kindly", "if", "possible", "maybe", "perhaps", "think", "guess",
+    "okay",
+    "ok",
+    "now",
+    "please",
+    "can",
+    "you",
+    "could",
+    "would",
+    "just",
+    "actually",
+    "basically",
+    "literally",
+    "really",
+    "very",
+    "so",
+    "well",
+    "um",
+    "uh",
+    "like",
+    "i",
+    "want",
+    "to",
+    "need",
+    "the",
+    "a",
+    "an",
+    "hey",
+    "hi",
+    "hello",
+    "yo",
+    "alright",
+    "right",
+    "sure",
+    "yeah",
+    "gonna",
+    "wanna",
+    "gotta",
+    "lemme",
+    "let",
+    "me",
+    "my",
+    "for",
+    "me",
+    "kindly",
+    "if",
+    "possible",
+    "maybe",
+    "perhaps",
+    "think",
+    "guess",
 ];
 
 /// Normalize input by removing filler words and cleaning
 fn normalize_input(input: &str) -> String {
     let filler_set: HashSet<&str> = FILLER_WORDS.iter().copied().collect();
-    
+
     input
         .to_lowercase()
         .chars()
@@ -50,6 +94,23 @@ fn light_normalize(input: &str) -> String {
         .join(" ")
 }
 
+/// Free-function Levenshtein distance (used by resolve_app_name and fuzzy matching)
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // APP ALIASES
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -57,23 +118,29 @@ fn light_normalize(input: &str) -> String {
 /// Application name aliases for better recognition
 fn get_app_aliases() -> HashMap<&'static str, Vec<&'static str>> {
     let mut aliases = HashMap::new();
-    
+
     // Browsers
-    aliases.insert("chrome", vec!["chrome", "google chrome", "google", "browser"]);
+    aliases.insert(
+        "chrome",
+        vec!["chrome", "google chrome", "google", "browser"],
+    );
     aliases.insert("firefox", vec!["firefox", "mozilla", "mozilla firefox"]);
     aliases.insert("edge", vec!["edge", "microsoft edge", "msedge"]);
     aliases.insert("brave", vec!["brave", "brave browser"]);
     aliases.insert("opera", vec!["opera", "opera browser"]);
     aliases.insert("safari", vec!["safari"]);
-    
+
     // Editors & IDEs
     aliases.insert("notepad", vec!["notepad", "note pad", "text editor"]);
-    aliases.insert("vscode", vec!["vscode", "vs code", "visual studio code", "code"]);
+    aliases.insert(
+        "vscode",
+        vec!["vscode", "vs code", "visual studio code", "code"],
+    );
     aliases.insert("sublime", vec!["sublime", "sublime text"]);
     aliases.insert("atom", vec!["atom", "atom editor"]);
     aliases.insert("vim", vec!["vim", "vi"]);
     aliases.insert("notepad++", vec!["notepad++", "notepad plus plus", "npp"]);
-    
+
     // Communication
     aliases.insert("discord", vec!["discord"]);
     aliases.insert("slack", vec!["slack"]);
@@ -82,34 +149,62 @@ fn get_app_aliases() -> HashMap<&'static str, Vec<&'static str>> {
     aliases.insert("skype", vec!["skype"]);
     aliases.insert("telegram", vec!["telegram"]);
     aliases.insert("whatsapp", vec!["whatsapp", "whats app"]);
-    
+
     // Media
     aliases.insert("spotify", vec!["spotify", "music"]);
     aliases.insert("vlc", vec!["vlc", "vlc player", "media player"]);
     aliases.insert("youtube", vec!["youtube", "yt"]);
-    
+
     // Utilities
     aliases.insert("calculator", vec!["calculator", "calc"]);
-    aliases.insert("explorer", vec!["explorer", "file explorer", "files", "my computer", "this pc"]);
-    aliases.insert("terminal", vec!["terminal", "cmd", "command prompt", "powershell", "shell", "console"]);
+    aliases.insert(
+        "explorer",
+        vec![
+            "explorer",
+            "file explorer",
+            "files",
+            "my computer",
+            "this pc",
+        ],
+    );
+    aliases.insert(
+        "terminal",
+        vec![
+            "terminal",
+            "cmd",
+            "command prompt",
+            "powershell",
+            "shell",
+            "console",
+        ],
+    );
     aliases.insert("settings", vec!["settings", "control panel", "preferences"]);
-    aliases.insert("task manager", vec!["task manager", "taskmanager", "processes"]);
-    
+    aliases.insert(
+        "task manager",
+        vec!["task manager", "taskmanager", "processes"],
+    );
+
     // Office
     aliases.insert("word", vec!["word", "microsoft word", "ms word"]);
-    aliases.insert("excel", vec!["excel", "microsoft excel", "ms excel", "spreadsheet"]);
-    aliases.insert("powerpoint", vec!["powerpoint", "ppt", "microsoft powerpoint", "presentation"]);
+    aliases.insert(
+        "excel",
+        vec!["excel", "microsoft excel", "ms excel", "spreadsheet"],
+    );
+    aliases.insert(
+        "powerpoint",
+        vec!["powerpoint", "ppt", "microsoft powerpoint", "presentation"],
+    );
     aliases.insert("outlook", vec!["outlook", "email", "mail"]);
-    
+
     // Games & Entertainment
     aliases.insert("steam", vec!["steam"]);
     aliases.insert("epic", vec!["epic", "epic games", "epic launcher"]);
-    
+
     // Development
     aliases.insert("git", vec!["git", "git bash"]);
     aliases.insert("docker", vec!["docker"]);
     aliases.insert("postman", vec!["postman", "api tester"]);
-    
+
     aliases
 }
 
@@ -117,7 +212,7 @@ fn get_app_aliases() -> HashMap<&'static str, Vec<&'static str>> {
 fn resolve_app_name(input: &str) -> Option<String> {
     let input_lower = input.to_lowercase();
     let aliases = get_app_aliases();
-    
+
     // Direct match first
     for (canonical, alias_list) in &aliases {
         for alias in alias_list {
@@ -126,7 +221,7 @@ fn resolve_app_name(input: &str) -> Option<String> {
             }
         }
     }
-    
+
     // Fuzzy match - check if input contains any alias
     for (canonical, alias_list) in &aliases {
         for alias in alias_list {
@@ -135,8 +230,27 @@ fn resolve_app_name(input: &str) -> Option<String> {
             }
         }
     }
-    
-    // Return original if no alias found
+
+    // Typo tolerance: pick nearest alias within edit distance 2
+    if !aliases.is_empty() {
+        let mut best: Option<&str> = None;
+        let mut best_dist = usize::MAX;
+        for (canonical, alias_list) in &aliases {
+            for alias in alias_list {
+                let d = edit_distance(&input_lower, alias);
+                if d < best_dist {
+                    best_dist = d;
+                    best = Some(canonical);
+                }
+            }
+        }
+        if best_dist <= 2 {
+            if let Some(c) = best {
+                return Some(c.to_string());
+            }
+        }
+    }
+
     if !input_lower.is_empty() {
         Some(input_lower)
     } else {
@@ -231,6 +345,12 @@ pub struct NluEngine {
     sbert_initialized: bool,
 }
 
+impl Default for NluEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NluEngine {
     pub fn new() -> Self {
         Self {
@@ -243,12 +363,12 @@ impl NluEngine {
 
     pub fn initialize(&mut self) -> Result<()> {
         println!("🧠 Initializing Conversational NLU engine...");
-        
+
         // Initialize NER engine
         println!("📍 Initializing Named Entity Recognition engine...");
         let _ = &GLOBAL_NER; // Initialize global NER
         println!("✅ NER engine ready");
-        
+
         if self.config.use_sbert {
             match GLOBAL_SBERT.initialize() {
                 Ok(_) => {
@@ -261,11 +381,14 @@ impl NluEngine {
                 }
             }
         }
-        
+
         self.setup_default_intents();
         self.setup_entity_patterns()?;
-        
-        println!("✅ Conversational NLU ready with {} intents", self.intents.len());
+
+        println!(
+            "✅ Conversational NLU ready with {} intents",
+            self.intents.len()
+        );
         println!("✅ NER patterns configured for entity extraction");
         Ok(())
     }
@@ -411,19 +534,30 @@ impl NluEngine {
     fn setup_entity_patterns(&mut self) -> Result<()> {
         let patterns = vec![
             // App extraction - more flexible patterns
-            EntityPattern::new("app", r"(?:open|launch|start|run|close|quit|exit|kill|stop|fire\s+up|bring\s+up)\s+(?:the\s+)?([a-zA-Z0-9\s]+?)(?:\s+app|\s+application|\s+please|\s+now|$)")?,
-            EntityPattern::new("app_simple", r"(?:open|launch|start|close|quit)\s+([a-zA-Z0-9]+)")?,
-            
+            EntityPattern::new(
+                "app",
+                r"(?:open|launch|start|run|close|quit|exit|kill|stop|fire\s+up|bring\s+up)\s+(?:the\s+)?([a-zA-Z0-9\s]+?)(?:\s+app|\s+application|\s+please|\s+now|$)",
+            )?,
+            EntityPattern::new(
+                "app_simple",
+                r"(?:open|launch|start|close|quit)\s+([a-zA-Z0-9]+)",
+            )?,
             // File patterns
-            EntityPattern::new("file", r"(?:file|document)\s+(?:called\s+|named\s+)?([a-zA-Z0-9._\-/\\]+)")?,
-            EntityPattern::new("folder", r"(?:folder|directory)\s+(?:called\s+|named\s+)?([a-zA-Z0-9._\-/\\]+)")?,
-            
+            EntityPattern::new(
+                "file",
+                r"(?:file|document)\s+(?:called\s+|named\s+)?([a-zA-Z0-9._\-/\\]+)",
+            )?,
+            EntityPattern::new(
+                "folder",
+                r"(?:folder|directory)\s+(?:called\s+|named\s+)?([a-zA-Z0-9._\-/\\]+)",
+            )?,
             // System actions
-            EntityPattern::new("action", r"(shutdown|restart|sleep|hibernate|lock|mute|unmute)")?,
-            
+            EntityPattern::new(
+                "action",
+                r"(shutdown|restart|sleep|hibernate|lock|mute|unmute)",
+            )?,
             // Volume/brightness levels
             EntityPattern::new("level", r"(?:to\s+)?(\d+)\s*(?:percent|%)?")?,
-            
             // Time expressions
             EntityPattern::new("time", r"(?:in|after)\s+(\d+)\s+(minutes?|hours?|seconds?)")?,
         ];
@@ -432,22 +566,135 @@ impl NluEngine {
         Ok(())
     }
 
+    fn edit_distance(a: &str, b: &str) -> usize {
+        let a: Vec<char> = a.chars().collect();
+        let b: Vec<char> = b.chars().collect();
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        let mut cur = vec![0usize; b.len() + 1];
+        for (i, ca) in a.iter().enumerate() {
+            cur[0] = i + 1;
+            for (j, cb) in b.iter().enumerate() {
+                let cost = if ca == cb { 0 } else { 1 };
+                cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+            }
+            std::mem::swap(&mut prev, &mut cur);
+        }
+        prev[b.len()]
+    }
+
+    fn rule_intent(&self, input: &str) -> Option<IntentResult> {
+        let low = input.to_lowercase();
+        let open_verbs = [
+            "open ",
+            "launch ",
+            "start ",
+            "run ",
+            "fire up ",
+            "bring up ",
+            "show me ",
+            "show ",
+            "get ",
+        ];
+        let close_verbs = ["close ", "quit ", "exit ", "kill ", "stop ", "shut "];
+
+        for v in &open_verbs {
+            if let Some(pos) = low.find(v) {
+                let after = low[pos + v.len()..].trim();
+                if !after.is_empty() {
+                    let first: String = after
+                        .split_whitespace()
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let app = resolve_app_name(&first).unwrap_or(first);
+                    let mut entities = HashMap::new();
+                    entities.insert("app".to_string(), app);
+                    return Some(IntentResult {
+                        intent_name: "open_app".to_string(),
+                        confidence: 0.92,
+                        entities,
+                        normalized_input: input.to_string(),
+                    });
+                }
+            }
+        }
+
+        for v in &close_verbs {
+            if let Some(pos) = low.find(v) {
+                let after = low[pos + v.len()..].trim();
+                if !after.is_empty() {
+                    let first: String = after
+                        .split_whitespace()
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let app = resolve_app_name(&first).unwrap_or(first);
+                    let mut entities = HashMap::new();
+                    entities.insert("app".to_string(), app);
+                    return Some(IntentResult {
+                        intent_name: "close_app".to_string(),
+                        confidence: 0.92,
+                        entities,
+                        normalized_input: input.to_string(),
+                    });
+                }
+            }
+        }
+
+        if low.contains("search")
+            || low.starts_with("what ")
+            || low.starts_with("who ")
+            || low.starts_with("where ")
+            || low.starts_with("how ")
+            || low.starts_with("tell me about")
+        {
+            let mut entities = HashMap::new();
+            entities.insert("query".to_string(), input.to_string());
+            return Some(IntentResult {
+                intent_name: "web_search".to_string(),
+                confidence: 0.80,
+                entities,
+                normalized_input: input.to_string(),
+            });
+        }
+
+        if low == "hello"
+            || low == "hi"
+            || low == "hey"
+            || low.starts_with("good morning")
+            || low.starts_with("good evening")
+        {
+            return Some(IntentResult {
+                intent_name: "greeting".to_string(),
+                confidence: 0.95,
+                entities: HashMap::new(),
+                normalized_input: input.to_string(),
+            });
+        }
+
+        None
+    }
+
     /// Main processing function - handles natural language
     pub fn process_input(&self, input: &str) -> Result<IntentResult> {
+        if let Some(res) = self.rule_intent(input) {
+            // Best-effort entity repair using NER is already done in rule_intent.
+            return Ok(res);
+        }
         let light_cleaned = light_normalize(input);
         let normalized = if self.config.use_filler_removal {
             normalize_input(input)
         } else {
             light_cleaned.clone()
         };
-        
+
         // Try SBERT semantic matching
         if self.sbert_initialized && self.config.use_sbert {
             // Try with normalized input first
             if let Some((intent_name, confidence)) = GLOBAL_SBERT.find_intent(&normalized) {
                 if confidence >= self.config.similarity_threshold {
                     let entities = self.extract_entities_smart(&light_cleaned, &intent_name)?;
-                    
+
                     return Ok(IntentResult {
                         intent_name,
                         confidence,
@@ -456,12 +703,12 @@ impl NluEngine {
                     });
                 }
             }
-            
+
             // Try with light-cleaned input (more context)
             if let Some((intent_name, confidence)) = GLOBAL_SBERT.find_intent(&light_cleaned) {
                 if confidence >= self.config.similarity_threshold {
                     let entities = self.extract_entities_smart(&light_cleaned, &intent_name)?;
-                    
+
                     return Ok(IntentResult {
                         intent_name,
                         confidence,
@@ -471,7 +718,7 @@ impl NluEngine {
                 }
             }
         }
-        
+
         // Fallback to keyword matching with both versions
         let (best_intent, best_confidence) = self.keyword_match(&normalized, &light_cleaned);
 
@@ -500,9 +747,9 @@ impl NluEngine {
                 let sim1 = self.jaccard_similarity(normalized, phrase);
                 // Try original
                 let sim2 = self.jaccard_similarity(original, phrase);
-                
+
                 let similarity = sim1.max(sim2);
-                
+
                 if similarity > best_confidence {
                     best_confidence = similarity;
                     best_intent = intent.name.clone();
@@ -514,13 +761,25 @@ impl NluEngine {
     }
 
     fn jaccard_similarity(&self, input: &str, phrase: &str) -> f32 {
-        let input_words: HashSet<_> = input.split_whitespace().collect();
-        let phrase_words: HashSet<_> = phrase.split_whitespace().collect();
-        
-        let intersection = input_words.intersection(&phrase_words).count();
-        let union = input_words.union(&phrase_words).count();
-        
-        if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
+        let input_words: Vec<&str> = input.split_whitespace().collect();
+        let phrase_words: Vec<&str> = phrase.split_whitespace().collect();
+
+        // Fuzzy-aware intersection using edit distance <= 2
+        let mut intersection = 0usize;
+        for iw in &input_words {
+            if phrase_words
+                .iter()
+                .any(|pw| *pw == *iw || edit_distance(iw, pw) <= 2)
+            {
+                intersection += 1;
+            }
+        }
+        let union = input_words.len().max(phrase_words.len()).max(1);
+        if union == 0 {
+            0.0
+        } else {
+            intersection as f32 / union as f32
+        }
     }
 
     /// Smart entity extraction based on intent type
@@ -529,7 +788,7 @@ impl NluEngine {
 
         // First, use NER for structured entity extraction
         let ner_entities = GLOBAL_NER.extract_entities(input);
-        
+
         // Map NER entities to standard keys
         for ner_entity in ner_entities {
             match ner_entity.entity_type {
@@ -587,20 +846,26 @@ impl NluEngine {
                         if pattern.name == "action" {
                             if let Some(captures) = pattern.regex.captures(input) {
                                 if let Some(matched) = captures.get(1) {
-                                    entities.insert("action".to_string(), matched.as_str().trim().to_string());
+                                    entities.insert(
+                                        "action".to_string(),
+                                        matched.as_str().trim().to_string(),
+                                    );
                                 }
                             }
                         }
                     }
                 }
-                
+
                 // Extract volume/brightness level if available
                 if !entities.contains_key("volume") && !entities.contains_key("level") {
                     for pattern in &self.entity_patterns {
                         if pattern.name == "level" {
                             if let Some(captures) = pattern.regex.captures(input) {
                                 if let Some(matched) = captures.get(1) {
-                                    entities.insert("level".to_string(), matched.as_str().trim().to_string());
+                                    entities.insert(
+                                        "level".to_string(),
+                                        matched.as_str().trim().to_string(),
+                                    );
                                 }
                             }
                         }
@@ -610,7 +875,14 @@ impl NluEngine {
             "web_search" => {
                 // Extract search query
                 if !entities.contains_key("query") {
-                    let search_terms = vec!["search for", "google", "look up", "find", "what is", "who is"];
+                    let search_terms = vec![
+                        "search for",
+                        "google",
+                        "look up",
+                        "find",
+                        "what is",
+                        "who is",
+                    ];
                     for term in search_terms {
                         if let Some(pos) = input.find(term) {
                             let query = &input[pos + term.len()..].trim();
@@ -628,7 +900,10 @@ impl NluEngine {
                     if !entities.contains_key(&pattern.name) {
                         if let Some(captures) = pattern.regex.captures(input) {
                             if let Some(matched) = captures.get(1) {
-                                entities.insert(pattern.name.clone(), matched.as_str().trim().to_string());
+                                entities.insert(
+                                    pattern.name.clone(),
+                                    matched.as_str().trim().to_string(),
+                                );
                             }
                         }
                     }
@@ -666,7 +941,7 @@ impl NluEngine {
                 }
             }
         }
-        
+
         // Fallback: find known app names in input
         let aliases = get_app_aliases();
         for (canonical, alias_list) in &aliases {
@@ -676,9 +951,11 @@ impl NluEngine {
                 }
             }
         }
-        
+
         // Last resort: extract last word after action verb
-        let action_words = ["open", "launch", "start", "run", "close", "quit", "exit", "kill", "stop"];
+        let action_words = [
+            "open", "launch", "start", "run", "close", "quit", "exit", "kill", "stop",
+        ];
         for action in action_words {
             if let Some(pos) = input.find(action) {
                 let after = &input[pos + action.len()..].trim();
@@ -691,7 +968,7 @@ impl NluEngine {
                 }
             }
         }
-        
+
         None
     }
 }
@@ -702,6 +979,12 @@ impl NluEngine {
 
 pub struct SharedNluEngine {
     engine: std::sync::Arc<std::sync::Mutex<NluEngine>>,
+}
+
+impl Default for SharedNluEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SharedNluEngine {
@@ -722,9 +1005,12 @@ impl SharedNluEngine {
     }
 
     pub fn is_sbert_enabled(&self) -> bool {
-        self.engine.lock().map(|e| e.sbert_initialized).unwrap_or(false)
+        self.engine
+            .lock()
+            .map(|e| e.sbert_initialized)
+            .unwrap_or(false)
     }
-    
+
     pub fn get_similarity(&self, text1: &str, text2: &str) -> f32 {
         GLOBAL_SBERT.text_similarity(text1, text2)
     }
@@ -750,9 +1036,15 @@ mod tests {
 
     #[test]
     fn test_app_alias_resolution() {
-        assert_eq!(resolve_app_name("google chrome"), Some("chrome".to_string()));
+        assert_eq!(
+            resolve_app_name("google chrome"),
+            Some("chrome".to_string())
+        );
         assert_eq!(resolve_app_name("vs code"), Some("vscode".to_string()));
-        assert_eq!(resolve_app_name("file explorer"), Some("explorer".to_string()));
+        assert_eq!(
+            resolve_app_name("file explorer"),
+            Some("explorer".to_string())
+        );
     }
 
     #[test]

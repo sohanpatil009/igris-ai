@@ -46,6 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("cargo:rustc-cfg=piper_ffi");
         }
     }
+    // Declare the custom cfg so cargo's unexpected_cfgs lint stays quiet.
+    println!("cargo::rustc-check-cfg=cfg(piper_ffi)");
 
     Ok(())
 }

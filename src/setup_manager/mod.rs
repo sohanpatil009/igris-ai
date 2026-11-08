@@ -2,24 +2,28 @@
 
 pub mod downloader;
 pub mod extractor;
-pub mod validator;
+pub mod model_pack;
 pub mod permissions;
 pub mod platforms;
+pub mod validator;
 
 // Re-exports for convenience
 pub use downloader::FileDownloader;
 pub use extractor::FileExtractor;
-pub use validator::SetupValidator;
+pub use model_pack::{
+    download_model_pack, install_model_pack, status as model_pack_status, ModelPackStatus,
+};
 pub use permissions::PermissionsConfig;
-pub use platforms::{PlatformSetup, current_platform, command_exists};
+pub use platforms::{command_exists, current_platform, PlatformSetup};
+pub use validator::SetupValidator;
 
+use dirs;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
-use dirs;
 
 #[derive(Clone, Debug)]
 pub enum SetupEvent {
@@ -47,11 +51,9 @@ impl SetupManager {
 
     pub async fn run_setup(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Use platform-specific setup
-        let platform_setup = platforms::get_platform_setup(
-            self.pkg_dir.clone(),
-            self.event_sender.clone(),
-        );
-        
+        let platform_setup =
+            platforms::get_platform_setup(self.pkg_dir.clone(), self.event_sender.clone());
+
         platform_setup.run_setup().await
     }
 
@@ -110,32 +112,22 @@ pub fn cleanup_temp_files() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Verify installation integrity
 pub fn verify_installation() -> Result<bool, Box<dyn std::error::Error>> {
-    let pkg_dir = PathBuf::from("./pkg");
+    let pkg_dir = crate::core::paths::pkg_dir();
+    let status = model_pack::status_in(&pkg_dir);
 
-    let required_paths = vec![
-        pkg_dir.join("piper"),
-        pkg_dir.join("models/sense-voice/model.onnx"),
-        pkg_dir.join("models/sense-voice/tokens.txt"),
-        pkg_dir.join("models/sbert/pytorch_model.bin"),
-        pkg_dir.join("models/sbert/config.json"),
-        pkg_dir.join("models/sbert/tokenizer.json"),
-        pkg_dir.join("models/bold_voice/en_US-libritts_r-medium.onnx"),
-        pkg_dir.join("models/bold_voice/en_US-libritts_r-medium.onnx.json"),
-    ];
-
-    // The reasoning LLM model is optional — downloaded separately if user wants smart fallback.
-
-    let all_exist = required_paths.iter().all(|p| p.exists());
-
-    if all_exist {
-        println!("✅ Installation verified successfully");
+    if status.ready {
+        println!("✅ Offline voice pack verified");
         Ok(true)
     } else {
-        println!("❌ Installation incomplete. Missing files detected.");
-        for path in &required_paths {
-            if !path.exists() {
-                println!("  Missing: {}", path.display());
-            }
+        println!("❌ Offline voice pack incomplete.");
+        if !status.stt_ready {
+            println!("  Missing STT: models/parakeet/");
+        }
+        if !status.tts_ready {
+            println!("  Missing TTS: models/kokoro/");
+        }
+        if !status.vad_ready {
+            println!("  Missing VAD: models/silero_vad.onnx");
         }
         Ok(false)
     }
@@ -154,9 +146,8 @@ fn llvm_bin_dir() -> Option<PathBuf> {
 }
 
 fn ensure_llvm_in_path() -> io::Result<()> {
-    let llvm_bin = llvm_bin_dir().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "Unable to resolve LLVM bin directory")
-    })?;
+    let llvm_bin =
+        llvm_bin_dir().ok_or_else(|| io::Error::other("Unable to resolve LLVM bin directory"))?;
 
     if cfg!(target_os = "windows") {
         ensure_llvm_in_path_windows(&llvm_bin)
@@ -166,9 +157,8 @@ fn ensure_llvm_in_path() -> io::Result<()> {
 }
 
 fn ensure_llvm_in_path_unix(llvm_bin: &PathBuf) -> io::Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "Unable to resolve home directory")
-    })?;
+    let home =
+        dirs::home_dir().ok_or_else(|| io::Error::other("Unable to resolve home directory"))?;
 
     // Best-effort: update a broadly-supported profile file.
     let profile_path = home.join(".profile");
@@ -210,9 +200,7 @@ foreach ($t in $targets) {
     let ps_script = ps_template.replace("__LLVM_BIN__", &llvm_bin_str);
 
     let mut cmd = std::process::Command::new("powershell");
-    cmd.arg("-NoProfile")
-        .arg("-Command")
-        .arg(ps_script);
+    cmd.arg("-NoProfile").arg("-Command").arg(ps_script);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -221,10 +209,10 @@ foreach ($t in $targets) {
     let out = cmd.output()?;
 
     if !out.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("PowerShell failed: {}", String::from_utf8_lossy(&out.stderr)),
-        ));
+        return Err(io::Error::other(format!(
+            "PowerShell failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
     }
 
     Ok(())

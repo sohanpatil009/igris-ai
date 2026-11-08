@@ -1,10 +1,14 @@
-
 // Optimized Text-to-Speech with audio caching for low latency
 // Audio caching eliminates repeated synthesis for common phrases
 // This module replaces tts.rs with caching support for faster responses
 
+use crate::core::paths;
 use once_cell::sync::Lazy;
 use rodio::{Decoder, OutputStream, Sink};
+use sherpa_onnx::{
+    GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsKokoroModelConfig,
+    OfflineTtsModelConfig,
+};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, File};
@@ -36,8 +40,12 @@ const MAX_CACHE_ENTRIES: usize = 100;
 /// Cache entry expiry time (1 hour)
 const CACHE_EXPIRY_SECS: u64 = 3600;
 
-/// Audio output directory
-const AUDIO_DIR: &str = "./pkg/audio";
+/// Audio output directory (resolved cross-platform)
+fn audio_dir() -> PathBuf {
+    let dir = paths::pkg_dir().join("audio");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
 
 /// Single TTS output file (gets overwritten on each synthesis)
 const TTS_OUTPUT_FILE: &str = "tts_output.wav";
@@ -46,12 +54,27 @@ const TTS_OUTPUT_FILE: &str = "tts_output.wav";
 fn get_speaker_id() -> String {
     // Host-provided persona speaker id, default fallback guards a
     // half-initialized bridge (host may load config later).
-    if let Ok(config) = std::panic::catch_unwind(|| {
+    if crate::bridge::is_installed() {
         (crate::bridge::config().speaker_id)()
-    }) {
-        config
     } else {
         "051".to_string()
+    }
+}
+
+/// Kokoro uses its own speaker numbering. Map the persona to a Kokoro voice
+/// instead of reusing the Piper libritts speaker id (51 is a Chinese voice in
+/// Kokoro, not the intended deep English assistant).
+fn kokoro_speaker_id() -> i32 {
+    use crate::bridge::Personality;
+
+    if !crate::bridge::is_installed() {
+        return 26; // bm_george, British male
+    }
+
+    match (crate::bridge::config().personality)() {
+        Personality::Igris => 26, // bm_george, British male
+        Personality::Alita => 3,  // af_heart, American female
+        Personality::Custom(_) => 26,
     }
 }
 
@@ -106,10 +129,16 @@ pub struct TtsStats {
     pub avg_latency_ms: f64,
 }
 
+impl Default for TtsCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TtsCache {
     pub fn new() -> Self {
         // Ensure audio directory exists
-        let _ = fs::create_dir_all(AUDIO_DIR);
+        let _ = fs::create_dir_all(audio_dir());
 
         Self {
             cache: RwLock::new(HashMap::new()),
@@ -128,9 +157,10 @@ impl TtsCache {
             }
         }
 
-        // Verify Piper is available
-        let _ = get_piper_path()?;
-        let _ = get_model_path()?;
+        // The concrete backend is selected by TtsEngine::initialize. The cache
+        // itself only needs a writable audio directory so it can start even
+        // when Piper is absent and Kokoro is the bundled engine.
+        fs::create_dir_all(audio_dir())?;
 
         {
             let mut initialized = self.initialized.write().unwrap();
@@ -250,20 +280,50 @@ impl TtsCache {
 
 /// TTS Engine - the main interface
 pub struct TtsEngine {
+    /// Kokoro-82M via sherpa-onnx (primary, cross-platform, no external binary).
+    kokoro: RwLock<Option<OfflineTts>>,
+    /// Whether initialization has found a usable backend.
+    initialized: std::sync::atomic::AtomicBool,
     #[cfg(all(target_os = "windows", piper_ffi))]
     piper_voice: std::sync::RwLock<Option<super::piper_ffi::PiperVoice>>,
 }
 
 /// Global TTS engine instance
 pub static TTS_ENGINE: Lazy<TtsEngine> = Lazy::new(|| TtsEngine {
+    kokoro: RwLock::new(None),
+    initialized: std::sync::atomic::AtomicBool::new(false),
     #[cfg(all(target_os = "windows", piper_ffi))]
     piper_voice: std::sync::RwLock::new(None),
 });
 
 impl TtsEngine {
-    /// Initialize the TTS engine (call once at startup)
+    /// Initialize the TTS engine (idempotent; retries if no backend was found,
+    /// so a model pack installed while the app is running is picked up).
     pub fn initialize(&self) -> TtsResult<()> {
+        if self.initialized.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+
         TTS_CACHE.initialize()?;
+
+        // Primary path: Kokoro-82M through sherpa-onnx.
+        match self.init_kokoro() {
+            Ok(()) => {
+                self.initialized
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let msg = "[TTS] Kokoro-82M initialized (sherpa-onnx, CPU)";
+                eprintln!("{}", msg);
+                #[cfg(target_os = "windows")]
+                log_to_file(msg);
+                return Ok(());
+            }
+            Err(e) => {
+                let msg = format!("[TTS] Kokoro unavailable: {}", e);
+                eprintln!("{}", msg);
+                #[cfg(target_os = "windows")]
+                log_to_file(&msg);
+            }
+        }
 
         #[cfg(all(target_os = "windows", piper_ffi))]
         {
@@ -282,7 +342,10 @@ impl TtsEngine {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or(espeak);
 
-            let msg = format!("[TTS] FFI paths: model={}, config={}, espeak={}", model_abs, config_abs, espeak_abs);
+            let msg = format!(
+                "[TTS] FFI paths: model={}, config={}, espeak={}",
+                model_abs, config_abs, espeak_abs
+            );
             eprintln!("{}", msg);
             log_to_file(&msg);
 
@@ -294,14 +357,110 @@ impl TtsEngine {
                     *self.piper_voice.write().unwrap() = Some(voice);
                 }
                 Err(e) => {
-                    let msg = format!("[TTS] Piper FFI init failed: {} (falling back to process spawn)", e);
+                    let msg = format!(
+                        "[TTS] Piper FFI init failed: {} (falling back to process spawn)",
+                        e
+                    );
                     eprintln!("{}", msg);
                     log_to_file(&msg);
                 }
             }
         }
 
+        // No Kokoro. If a Piper binary exists, the process fallback is usable;
+        // remember that so we do not reload models on every utterance.
+        if get_piper_path().is_ok() {
+            self.initialized
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
         Ok(())
+    }
+
+    /// Load Kokoro-82M from the cross-platform model pack.
+    fn init_kokoro(&self) -> TtsResult<()> {
+        if self.kokoro.read().unwrap().is_some() {
+            return Ok(());
+        }
+
+        let dir =
+            paths::model_dir("kokoro").ok_or("Kokoro model directory not found (models/kokoro)")?;
+
+        let model = ["model.onnx", "model.int8.onnx", "kokoro.onnx"]
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|p| p.is_file())
+            .ok_or_else(|| format!("Kokoro model.onnx not found in {}", dir.display()))?;
+        let voices = dir.join("voices.bin");
+        if !voices.is_file() {
+            return Err(format!("Kokoro voices.bin not found in {}", dir.display()).into());
+        }
+        let tokens = ["tokens.txt", "tokenizer.json"]
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|p| p.is_file())
+            .ok_or_else(|| format!("Kokoro tokens.txt not found in {}", dir.display()))?;
+        let data_dir = dir.join("espeak-ng-data");
+        let data_dir = if data_dir.is_dir() {
+            Some(data_dir.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        let dict_dir = dir.join("dict");
+        let dict_dir = if dict_dir.is_dir() {
+            Some(dict_dir.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        let lexicon = ["lexicon-us-en.txt", "lexicon-zh.txt"]
+            .iter()
+            .map(|name| dir.join(name))
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(",");
+        let lexicon = if lexicon.is_empty() {
+            None
+        } else {
+            Some(lexicon)
+        };
+
+        let mut config = OfflineTtsConfig::default();
+        config.model = OfflineTtsModelConfig {
+            kokoro: OfflineTtsKokoroModelConfig {
+                model: Some(model.to_string_lossy().into_owned()),
+                voices: Some(voices.to_string_lossy().into_owned()),
+                tokens: Some(tokens.to_string_lossy().into_owned()),
+                data_dir,
+                length_scale: 1.0,
+                dict_dir,
+                lexicon,
+                lang: None,
+            },
+            num_threads: 2,
+            provider: Some("cpu".into()),
+            ..Default::default()
+        };
+
+        let tts =
+            OfflineTts::create(&config).ok_or("Failed to create sherpa-onnx Kokoro TTS engine")?;
+
+        let speakers = tts.num_speakers();
+        if speakers > 0 {
+            eprintln!("[TTS] Kokoro speakers: {}", speakers);
+        }
+
+        *self.kokoro.write().unwrap() = Some(tts);
+        Ok(())
+    }
+
+    /// Name of the active TTS backend.
+    pub fn backend_name(&self) -> &'static str {
+        if self.kokoro.read().map(|g| g.is_some()).unwrap_or(false) {
+            "kokoro-82m"
+        } else {
+            "piper"
+        }
     }
 
     /// Speak text (main API - blocking)
@@ -312,6 +471,33 @@ impl TtsEngine {
         eprintln!("{}", debug_msg);
         #[cfg(target_os = "windows")]
         log_to_file(&debug_msg);
+
+        // Primary: Kokoro-82M through sherpa-onnx.
+        {
+            let kokoro_guard = self.kokoro.read().unwrap();
+            if let Some(tts) = kokoro_guard.as_ref() {
+                let sid = kokoro_speaker_id().clamp(0, (tts.num_speakers() - 1).max(0));
+                let generation = GenerationConfig {
+                    sid,
+                    speed: 1.0,
+                    ..Default::default()
+                };
+
+                match tts.generate_with_config(text, &generation, None::<fn(&[f32], f32) -> bool>) {
+                    Some(audio) => {
+                        let output_path = audio_dir().join(TTS_OUTPUT_FILE);
+                        let output = output_path.to_string_lossy().into_owned();
+                        if audio.save(&output) {
+                            let elapsed = start.elapsed().as_millis() as u64;
+                            TTS_CACHE.update_stats(false, elapsed);
+                            return play_audio_file(&output_path);
+                        }
+                        eprintln!("[TTS] Kokoro could not write {}", output);
+                    }
+                    None => eprintln!("[TTS] Kokoro produced no audio, falling back to Piper"),
+                }
+            }
+        }
 
         // Try FFI on Windows first (no process spawning)
         #[cfg(all(target_os = "windows", piper_ffi))]
@@ -326,7 +512,10 @@ impl TtsEngine {
                         return play_wav_bytes(&wav_bytes);
                     }
                     Err(e) => {
-                        let msg = format!("[TTS] FFI synthesis failed: {} (falling back to process)", e);
+                        let msg = format!(
+                            "[TTS] FFI synthesis failed: {} (falling back to process)",
+                            e
+                        );
                         eprintln!("{}", msg);
                         log_to_file(&msg);
                     }
@@ -413,7 +602,7 @@ fn play_wav_bytes(wav: &[u8]) -> TtsResult<()> {
 /// Synthesize text to audio file
 fn synthesize_to_file_internal(text: &str, speaker_id: Option<&str>) -> TtsResult<PathBuf> {
     // Use single output file (gets overwritten each time)
-    let output_path = PathBuf::from(AUDIO_DIR).join(TTS_OUTPUT_FILE);
+    let output_path = audio_dir().join(TTS_OUTPUT_FILE);
 
     // Use Piper for all platforms
     let speaker = speaker_id.unwrap_or_else(|| {
@@ -432,14 +621,14 @@ fn run_piper_synthesis(text: &str, output_path: &Path, speaker_id: &str) -> TtsR
 
     let piper_path = get_piper_path()?;
     let model_path = get_model_path()?;
-    
+
     // Get espeak-ng-data directory path
     let data_dir = get_espeak_data_dir()?;
-    
+
     // Run Piper with file output
     #[cfg(target_os = "windows")]
     let mut child = Command::new(&piper_path)
-        .args(&[
+        .args([
             "--model",
             &model_path,
             "--data-dir",
@@ -465,7 +654,7 @@ fn run_piper_synthesis(text: &str, output_path: &Path, speaker_id: &str) -> TtsR
             "--speaker",
             speaker_id,
         ])
-        .env("ESPEAK_DATA_PATH", &data_dir)  // Set environment variable
+        .env("ESPEAK_DATA_PATH", &data_dir) // Set environment variable
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -499,6 +688,13 @@ fn run_piper_synthesis(text: &str, output_path: &Path, speaker_id: &str) -> TtsR
 
 /// Get Piper executable path
 fn get_piper_path() -> TtsResult<String> {
+    // Cross-platform model pack first.
+    for relative in ["piper/piper.exe", "piper/piper"] {
+        if let Some(path) = paths::find_file(relative) {
+            return Ok(path.to_string_lossy().into_owned());
+        }
+    }
+
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.to_path_buf()))
@@ -507,8 +703,14 @@ fn get_piper_path() -> TtsResult<String> {
     let paths = vec![
         "./pkg/piper/piper.exe".to_string(),
         "pkg/piper/piper.exe".to_string(),
-        exe_dir.join("pkg/piper/piper.exe").to_string_lossy().to_string(),
-        exe_dir.join("piper/piper.exe").to_string_lossy().to_string(),
+        exe_dir
+            .join("pkg/piper/piper.exe")
+            .to_string_lossy()
+            .to_string(),
+        exe_dir
+            .join("piper/piper.exe")
+            .to_string_lossy()
+            .to_string(),
         "./piper/piper.exe".to_string(),
         "piper/piper.exe".to_string(),
         "./pkg/piper/piper".to_string(),
@@ -526,6 +728,10 @@ fn get_piper_path() -> TtsResult<String> {
 
 /// Get voice model path
 fn get_model_path() -> TtsResult<String> {
+    if let Some(path) = paths::find_file("models/bold_voice/en_US-libritts_r-medium.onnx") {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+
     // Build exe-relative base path for bundled apps
     let exe_dir = std::env::current_exe()
         .ok()
@@ -535,8 +741,14 @@ fn get_model_path() -> TtsResult<String> {
     let paths = vec![
         "./pkg/models/bold_voice/en_US-libritts_r-medium.onnx".to_string(),
         "pkg/models/bold_voice/en_US-libritts_r-medium.onnx".to_string(),
-        exe_dir.join("pkg/models/bold_voice/en_US-libritts_r-medium.onnx").to_string_lossy().to_string(),
-        exe_dir.join("models/bold_voice/en_US-libritts_r-medium.onnx").to_string_lossy().to_string(),
+        exe_dir
+            .join("pkg/models/bold_voice/en_US-libritts_r-medium.onnx")
+            .to_string_lossy()
+            .to_string(),
+        exe_dir
+            .join("models/bold_voice/en_US-libritts_r-medium.onnx")
+            .to_string_lossy()
+            .to_string(),
     ];
 
     for path in paths {
@@ -550,6 +762,10 @@ fn get_model_path() -> TtsResult<String> {
 
 /// Get espeak-ng-data directory path
 fn get_espeak_data_dir() -> TtsResult<String> {
+    if let Some(path) = paths::find_dir("piper/espeak-ng-data") {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+
     // Build exe-relative base path for bundled apps
     let exe_dir = std::env::current_exe()
         .ok()
@@ -568,8 +784,14 @@ fn get_espeak_data_dir() -> TtsResult<String> {
         "./pkg/piper/lib/espeak-ng-data".to_string(),
         "pkg/piper/lib/espeak-ng-data".to_string(),
         // Windows paths (exe-relative for bundled apps)
-        exe_dir.join("pkg/piper/espeak-ng-data").to_string_lossy().to_string(),
-        exe_dir.join("piper/espeak-ng-data").to_string_lossy().to_string(),
+        exe_dir
+            .join("pkg/piper/espeak-ng-data")
+            .to_string_lossy()
+            .to_string(),
+        exe_dir
+            .join("piper/espeak-ng-data")
+            .to_string_lossy()
+            .to_string(),
         exe_dir.join("espeak-ng-data").to_string_lossy().to_string(),
         // Linux paths
         "/usr/share/espeak-ng-data".to_string(),
@@ -599,8 +821,16 @@ pub fn init_tts() -> TtsResult<()> {
     TTS_ENGINE.initialize()
 }
 
+/// Active TTS backend name ("kokoro-82m" or "piper").
+pub fn backend_name() -> &'static str {
+    TTS_ENGINE.backend_name()
+}
+
 /// Speak text (blocking) - returns TtsResult for internal use
 pub fn speak(text: &str) -> TtsResult<()> {
+    // The Tauri host and CLI only call this after setup, but examples and
+    // tests may not. Make initialization lazy and idempotent.
+    TTS_ENGINE.initialize()?;
     TTS_ENGINE.speak(text)
 }
 
@@ -613,6 +843,31 @@ pub fn speak_compat(text: &str) -> Result<(), Box<dyn Error>> {
 /// Synthesize to file without playing
 pub fn synthesize(text: &str) -> TtsResult<PathBuf> {
     synthesize_to_file_internal(text, None)
+}
+
+/// Synthesize to a specific path using the active backend (Kokoro or Piper).
+pub fn synthesize_to_file(text: &str, destination: &Path) -> TtsResult<()> {
+    let _ = TTS_ENGINE.initialize();
+
+    if let Some(tts) = TTS_ENGINE.kokoro.read().unwrap().as_ref() {
+        let sid = kokoro_speaker_id().clamp(0, (tts.num_speakers() - 1).max(0));
+        let generation = GenerationConfig {
+            sid,
+            speed: 1.0,
+            ..Default::default()
+        };
+        if let Some(audio) =
+            tts.generate_with_config(text, &generation, None::<fn(&[f32], f32) -> bool>)
+        {
+            if audio.save(&destination.to_string_lossy()) {
+                return Ok(());
+            }
+        }
+    }
+
+    let produced = synthesize_to_file_internal(text, None)?;
+    fs::copy(produced, destination)?;
+    Ok(())
 }
 
 /// Clear audio cache

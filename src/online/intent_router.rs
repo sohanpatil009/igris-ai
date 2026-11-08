@@ -1,18 +1,6 @@
 /// Intent Router — lightweight LLM call for intent classification.
-///
-/// Uses NVIDIA NIM with a compact prompt (no personality, no conversation history)
-/// to classify the user's intent into one or more tool calls. This replaces the
-/// hash-based NLU when online mode is active, providing real semantic understanding
-/// at a fraction of the cost of full LLM reasoning.
-///
-/// Cost: ~500 tokens vs ~5000+ tokens for full reasoning.
-/// Timeout: 15s (matches full reasoning timeout).
-
 use crate::online::task_planner::{parse_llm_response, TaskPlan};
 
-/// Attempt to route a command through the lightweight intent router.
-/// Uses the fast model (Gemma 9B) for quick intent classification.
-/// Returns a TaskPlan if the LLM responds with valid tool calls, None otherwise.
 pub async fn route_intent(command: &str) -> Option<TaskPlan> {
     let system_prompt = intent_router_prompt();
     let timeout = std::time::Duration::from_secs(15);
@@ -48,57 +36,39 @@ pub async fn route_intent(command: &str) -> Option<TaskPlan> {
     }
 }
 
-/// Build the compact intent routing system prompt.
-/// Much shorter than the full reasoning prompt — no personality, no conversation history.
 fn intent_router_prompt() -> String {
     let prompt = r#"You are an intent router. Classify the user's command and output the corresponding tool call(s) as JSON ONLY.
 
-Available tools:
-1. open_app {"app": "name"} — Open any application (chrome, firefox, vscode, spotify, discord, etc.)
-2. close_app {"app": "name"} — Close a named application by name
-3. close_all_apps {} — Close all windows/applications launched by IGRIS (use for "close everything", "close all windows", "close all my apps")
-4. close_current_window {} — Close the currently focused window (use for "close this window", "close this", "close the current window")
-5. close_current_tab {} — Close the currently focused tab (use for "close this tab", "close this file", "close the current tab", "close tab")
-5. search_web {"query": "..."} — Search the web and read results aloud (use for facts, questions, news only)
-6. browser_search {"site": "amazon|youtube|github|wikipedia|reddit|...", "query": "..."} — Search for something on a specific site. PREFERRED for "search for X on Y" patterns (amazon, youtube, github, etc.)
-7. open_website {"url": "...", "browser": "chrome|firefox|safari|edge|brave"} — Open a URL in the specified browser (omit browser to use default). Include the browser name if the user mentions one. Works with http://, https://, and mailto: URIs. PREFERRED for all browser + search combos.
-8. system_command {"command": "shutdown|restart|sleep|lock|volume_up|volume_down|mute"} — System control
-9. camera_action {"action": "photo|video_start|video_stop"} — Camera operations
-10. file_operation {"action": "create|delete|open|list|read|write", "path": "..."} — File operations
-11. set_alarm {"time": "..."} — Set an alarm
-12. set_reminder {"text": "..."} — Set a reminder
-13. get_weather {"location": "city name"} — Get weather for any city
-14. tell_fact {} — Tell an interesting fact
-15. tell_joke {} — Tell a joke
-16. take_screenshot {} — Take a screenshot
-17. get_system_info {"info": "os|memory|cpu|ip|uptime|all"} — System information
-18. clipboard_action {"action": "read|write", "text": "..."} — Clipboard operations
-19. read_file {"path": "..."} — Read a text file
-20. write_file {"path": "...", "content": "..."} — Write a text file
-21. compose_email {"to": "...", "subject": "...", "body": "..."} — Compose an email and open the default email client
-22. generate_code {"language": "...", "code": "...", "filename": "..."} — Generate code and open in IDE (extension auto-detected from language)
-23. general_chat {"response": "..."} — Greetings, farewells, casual chat
-24. switch_mode {"mode": "online|offline"} — Switch between online and offline
-25. switch_previous_tab {} — Switch to the previous tab (use for "switch tab", "go back a tab", "previous tab", "switch to previous tab")
-26. switch_previous_window {} — Switch to the previous window of the same app (use for "switch window", "previous window")
+Available tools (use EXACT registry names; never invent names):
+1. app_control {"action":"launch|close|focus|list","app":"name"} — control applications (launch allowlist: chrome, firefox, edge, vscode, notepad, calc, mspaint, spotify, discord, taskmgr, etc.)
+2. browser_control {"action":"open_url|search","url":"https://...","query":"..."} — open a URL or search the web in the default browser (http/https only)
+3. window_control {"action":"minimize|maximize|restore|snap_left|snap_right|move","title":"substring","process":"name","x":0,"y":0} — window management
+4. volume_control {"action":"get|set|up|down|mute|unmute","level":0-100} — volume
+5. media_control {"action":"play_pause|next|previous|stop"} — media playback
+6. screenshot {} — capture screen to temp and return path
+7. clipboard_read {} — read clipboard (max 32 KB)
+8. clipboard_write {"text":"..."} — write text to clipboard
+9. file_search {"query":"...","root":"optional"} — search files by name/content under sandbox roots
+10. file_trash {"path":"..."} — move a file to the recycle bin (approval required)
+11. power_control {"action":"lock|sleep|shutdown|restart"} — power (approval required)
+12. brightness_control {"action":"get|set","level":0-100} — display brightness
+13. input_automation {"action":"type_text|press_keys|click","text":"...","keys":"allowed-sequence","x":0,"y":0} — type / keys / click (approval required)
+14. system_info {"info":"os|memory|cpu|ip|uptime|all"} — system information
+15. web_search {"query":"..."} — open a Google web search
+16. read_file {"path":"..."} — read a text file inside the sandbox
+17. shell_run {"command":"allowlisted single command"} — run a validated shell command (approval required)
+18. general_chat {"response":"..."} — greetings, farewells, casual chat
 
 CRITICAL RULES:
-- NEVER use open_app + search_web as separate steps for browser searches
-- "search for headphones on amazon" → {"tool": "browser_search", "args": {"site": "amazon", "query": "headphones"}}
-- "search youtube for rust tutorials" → {"tool": "browser_search", "args": {"site": "youtube", "query": "rust tutorials"}}
-- "search for cats" → {"tool": "open_website", "args": {"url": "https://www.google.com/search?q=cats"}}
-- "open chrome and search for cats" → {"tool": "open_website", "args": {"url": "https://www.google.com/search?q=cats", "browser": "chrome"}}
-- "search for weather in London" → {"tool": "open_website", "args": {"url": "https://www.google.com/search?q=weather+in+london"}}
-- "open safari and go to youtube" → {"tool": "open_website", "args": {"url": "https://youtube.com", "browser": "safari"}}
-- "compose an email to John about the meeting" → {"tool": "open_website", "args": {"url": "mailto:john@example.com?subject=Meeting&body=Hi%20John"}}
-- For weather queries → get_weather (NOT search_web)
-- For jokes → tell_joke (NOT general_chat)
-- For facts → tell_fact (NOT general_chat)
-- For greetings/goodbyes/thanks → general_chat
-- NEVER ask clarifying questions. Use your best judgment.
+- Use ONLY tool names from the list above; the model has no other tools.
+- Never combine open_app + search_web; use browser_control for browser searches.
+- For weather → general_chat with a helpful reply (no weather tool yet).
+- "search youtube for rust tutorials" → {"tool":"browser_control","args":{"action":"open_url","url":"https://www.youtube.com/results?search_query=rust+tutorials"}}
+- For jokes/facts/greetings → general_chat.
+- Never ask clarifying questions; use best judgment.
 - Output ONLY valid JSON. No markdown, no explanation, no extra text.
-- Single action: {"tool": "tool_name", "args": {...}}
-- Multiple actions: [{"tool": "tool_name", "args": {...}}, ...]"#;
+- Single action: {"tool":"tool_name","args":{...}}
+- Multiple actions: [{"tool":"tool_name","args":{...}}, ...]"#;
 
     prompt.to_string()
 }

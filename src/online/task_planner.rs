@@ -203,13 +203,17 @@ fn parse_single_tool_object(json: &str) -> Option<(String, String)> {
 fn parse_single_tool_step(json: &str) -> Option<TaskStep> {
     let tool = extract_json_string_field(json, "tool")?;
     let args = extract_args_field(json).unwrap_or_else(|| "{}".to_string());
-    let desc = extract_json_string_field(json, "description")
-        .unwrap_or_else(|| format!("{}", tool));
-    Some(TaskStep { tool, args, description: desc })
+    let desc = extract_json_string_field(json, "description").unwrap_or_else(|| tool.to_string());
+    Some(TaskStep {
+        tool,
+        args,
+        description: desc,
+    })
 }
 
 fn extract_args_field(json: &str) -> Option<String> {
-    let start = json.find("\"args\"")
+    let start = json
+        .find("\"args\"")
         .or_else(|| json.find("\"arguments\""))?;
     let after_field = &json[start..];
     let brace = after_field.find('{')? + start;

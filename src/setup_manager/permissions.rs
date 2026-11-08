@@ -1,9 +1,9 @@
 // src/setup_manager/permissions.rs - Runtime permissions system for IGRIS modules
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use anyhow::{anyhow, Result};
 
 /// Module permissions configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -39,7 +39,9 @@ impl PermissionsConfig {
             "sensevoice_stt".to_string(),
             ModulePermission {
                 name: "Speech Recognition (SenseVoice)".to_string(),
-                description: "Converts speech to text using SenseVoice f32 model via sherpa-onnx (~940MB)".to_string(),
+                description:
+                    "Converts speech to text using SenseVoice f32 model via sherpa-onnx (~940MB)"
+                        .to_string(),
                 status: PermissionStatus::Pending,
                 required: true,
                 download_size_mb: 940.0,
@@ -94,7 +96,8 @@ impl PermissionsConfig {
             "file_operations".to_string(),
             ModulePermission {
                 name: "File Operations".to_string(),
-                description: "Allows file creation, deletion, and management (no download)".to_string(),
+                description: "Allows file creation, deletion, and management (no download)"
+                    .to_string(),
                 status: PermissionStatus::Pending,
                 required: false,
                 download_size_mb: 0.0,
