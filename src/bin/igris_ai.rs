@@ -63,7 +63,9 @@ async fn main() {
     tool_names.sort();
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         print!("\n{} tools available.\n", tool_names.len());
-        println!("Persisted grants were loaded; use 'grant <tool>' to enable otherwise skipped tools.");
+        println!(
+            "Persisted grants were loaded; use 'grant <tool>' to enable otherwise skipped tools."
+        );
         println!("First-run permission setup (Enter = skip, y = grant once-and-persist except destructive tools):");
         for name in &tool_names {
             if tools.is_granted(name) {
@@ -72,8 +74,7 @@ async fn main() {
             print!("  grant '{name}'? [y/N] ");
             let _ = std::io::stdout().flush();
             let mut ans = String::new();
-            if std::io::stdin().read_line(&mut ans).is_ok()
-                && ans.trim().eq_ignore_ascii_case("y")
+            if std::io::stdin().read_line(&mut ans).is_ok() && ans.trim().eq_ignore_ascii_case("y")
             {
                 tools.grant(name);
             }
@@ -461,9 +462,19 @@ async fn run_text_command(
                                 }
                                 Err(e) => {
                                     eprintln!("reasoning error: {e}");
-                                    let _ = igris_ai::core::tts::speak(
-                                        "I had trouble thinking about that.",
-                                    );
+                                    let msg = {
+                                        let t = format!("{e}").to_lowercase();
+                                        if t.contains("timeout")
+                                            || t.contains("network")
+                                            || t.contains("connection")
+                                            || t.contains("timed out")
+                                        {
+                                            "I can't reach the network right now."
+                                        } else {
+                                            "I had trouble thinking about that."
+                                        }
+                                    };
+                                    let _ = igris_ai::core::tts::speak(msg);
                                 }
                             }
                         } else {

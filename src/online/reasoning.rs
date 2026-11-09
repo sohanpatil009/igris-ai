@@ -340,8 +340,20 @@ impl OnlineReasoning {
 
 impl Default for OnlineReasoning {
     fn default() -> Self {
-        Self::with_provider(LlmProvider::Nvidia)
-            .expect("Failed to create OnlineReasoning - check NVIDIA_API_KEY in .env")
+        // Never assume a cloud key exists: prefer the keyless local provider
+        // first so a missing NVIDIA_API_KEY does not panic at init time.
+        match Self::with_provider(LlmProvider::Local) {
+            Ok(v) => v,
+            Err(_) => match Self::with_provider(LlmProvider::Nvidia) {
+                Ok(v) => v,
+                Err(_) => Self {
+                    client: Client::new(),
+                    api_key: String::new(),
+                    base_url: "http://127.0.0.1:11434/v1".to_string(),
+                    model: "qwen2.5:3b-instruct".to_string(),
+                },
+            },
+        }
     }
 }
 
@@ -478,9 +490,25 @@ pub async fn reason_online_fast(
     system_prompt: &str,
     user_query: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut reasoning = OnlineReasoning::with_provider(LlmProvider::Nvidia)?;
-    reasoning.set_model(FAST_MODEL);
-    reasoning.reason(system_prompt, user_query).await
+    // Primary (Nvidia) + local fallback so a missing key/dead endpoint degrades
+    // gracefully instead of handing the REPL a hard error.
+    let primary = async {
+        let mut r = OnlineReasoning::with_provider(LlmProvider::Nvidia)?;
+        r.set_model(FAST_MODEL);
+        r.reason(system_prompt, user_query).await
+    };
+    match primary.await {
+        Ok(s) if !s.trim().is_empty() => return Ok(s),
+        Ok(_) => {}
+        Err(e) => eprintln!("reasoning error (primary): {e}"),
+    }
+
+    // Local fallback.
+    let local_model =
+        env::var("IGRIS_LOCAL_LLM_MODEL").unwrap_or_else(|_| "qwen2.5:3b-instruct".to_string());
+    let mut local = OnlineReasoning::with_provider(LlmProvider::Local)?;
+    local.set_model(&local_model);
+    local.reason(system_prompt, user_query).await
 }
 
 /// Run online reasoning with a specific model and provider (overrides SELECTED_MODEL and SELECTED_PROVIDER).

@@ -309,7 +309,7 @@ pub fn silero_vad_available() -> bool {
 }
 
 /// Capture audio with VAD-based endpoint detection
-pub fn capture_audio_vad(
+fn capture_audio_vad_impl(
     config: CaptureConfig,
 ) -> Result<CaptureResult, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
@@ -473,17 +473,17 @@ pub fn capture_audio_vad(
 
 /// Quick capture for wake word detection
 pub fn capture_wake_word() -> Result<CaptureResult, Box<dyn std::error::Error>> {
-    capture_audio_vad(CaptureConfig::wake_word())
+    capture_audio_vad_impl(CaptureConfig::wake_word())
 }
 
 /// Quick capture for voice commands
 pub fn capture_command() -> Result<CaptureResult, Box<dyn std::error::Error>> {
-    capture_audio_vad(CaptureConfig::command())
+    capture_audio_vad_impl(CaptureConfig::command())
 }
 
 /// Fixed duration capture (fallback to original behavior)
 pub fn capture_fixed(seconds: u64) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let result = capture_audio_vad(CaptureConfig::fixed(seconds))?;
+    let result = capture_audio_vad_impl(CaptureConfig::fixed(seconds))?;
     Ok(result.samples)
 }
 
@@ -652,5 +652,32 @@ mod tests {
             fixed.mode,
             CaptureMode::FixedDuration { seconds: 5 }
         ));
+    }
+}
+pub fn capture_audio_vad(
+    config: CaptureConfig,
+) -> Result<CaptureResult, Box<dyn std::error::Error>> {
+    // Mic busy / device-not-ready: retry once before surfacing a clear error.
+    match capture_audio_vad_impl(config.clone()) {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            let s = e.to_string().to_lowercase();
+            let busy = s.contains("busy")
+                || s.contains("device")
+                || s.contains("in use")
+                || s.contains("stream")
+                || s.contains("input device");
+            if busy {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                match capture_audio_vad_impl(config) {
+                    Ok(r) => Ok(r),
+                    Err(e) => {
+                        Err(format!("microphone busy or unavailable (retried once): {}", e).into())
+                    }
+                }
+            } else {
+                Err(e)
+            }
+        }
     }
 }

@@ -1239,23 +1239,24 @@ impl Tool for SetTimerTool {
         async move {
             #[cfg(target_os = "windows")]
             {
-                let msg = message.clone();
-                let spawned = std::process::Command::new("powershell")
-                    .args([
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-Command",
-                        &format!(
-                            "Start-Sleep -Seconds {secs}; Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('{}', 'IGRIS timer') | Out-Null",
-                            message.replace('\'', "''")
-                        ),
-                    ])
+                let script = format!(
+                    "Start-Sleep -Seconds {secs}; Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('{}', 'IGRIS timer') | Out-Null",
+                    message.replace('\'', "''")
+                );
+                let spawn_result = tokio::process::Command::new("powershell")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                    .kill_on_drop(true)
                     .spawn();
-                match spawned {
-                    Ok(_) => Ok(ToolOutcome::plain(format!(
-                        "timer set: {} seconds; notification when done",
-                        secs
-                    ))),
+                match spawn_result {
+                    Ok(mut child) => {
+                        tokio::spawn(async move {
+                            let _ = child.wait().await;
+                        });
+                        Ok(ToolOutcome::plain(format!(
+                            "timer set: {} seconds; notification when done",
+                            secs
+                        )))
+                    }
                     Err(e) => Err(ToolError::failed(format!("timer failed: {e}"))),
                 }
             }
@@ -1304,22 +1305,24 @@ impl Tool for SetReminderTool {
         async move {
             #[cfg(target_os = "windows")]
             {
-                let spawned = std::process::Command::new("powershell")
-                    .args([
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-Command",
-                        &format!(
-                            "Start-Sleep -Seconds {secs}; Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('{}', 'IGRIS reminder') | Out-Null",
-                            text.replace('\'', "''")
-                        ),
-                    ])
+                let script = format!(
+                    "Start-Sleep -Seconds {secs}; Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('{}', 'IGRIS reminder') | Out-Null",
+                    text.replace('\'', "''")
+                );
+                let spawn_result = tokio::process::Command::new("powershell")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                    .kill_on_drop(true)
                     .spawn();
-                match spawned {
-                    Ok(_) => Ok(ToolOutcome::plain(format!(
-                        "reminder set in {} seconds: {text}",
-                        secs
-                    ))),
+                match spawn_result {
+                    Ok(mut child) => {
+                        tokio::spawn(async move {
+                            let _ = child.wait().await;
+                        });
+                        Ok(ToolOutcome::plain(format!(
+                            "reminder set in {} seconds: {text}",
+                            secs
+                        )))
+                    }
                     Err(e) => Err(ToolError::failed(format!("reminder failed: {e}"))),
                 }
             }
@@ -1349,18 +1352,25 @@ fn open_url(url: &str) -> Result<(), ToolError> {
     // Use Start-Process via PowerShell (no cmd.exe re-parsing) so URL
     // metacharacters cannot be treated as command separators.
     let escaped = url.replace('\'', "''");
-    let spawned = std::process::Command::new("powershell")
+    let script = format!("Start-Process '{}'", escaped);
+    let spawn_result = tokio::process::Command::new("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            &format!("Start-Process '{}'", escaped),
+            &script,
         ])
+        .kill_on_drop(true)
         .spawn();
-    match spawned {
-        Ok(_) => Ok(()),
+    match spawn_result {
+        Ok(mut child) => {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            Ok(())
+        }
         Err(e) => Err(ToolError::failed(format!("open failed: {e}"))),
     }
 }
