@@ -1,0 +1,14 @@
+/target
+/tools
+/models
+/.tts-utt
+tts_dump*.raw
+speech.wav
+speech*.wav
+ref.wav
+reference.txt
+mic_transcribe.exe
+mic_transcribe.obj
+build_log.txt
+run_out.txt
+run_err.txt
