@@ -119,7 +119,7 @@ impl Asst {
 /* status row                                                       */
 /* ================================================================ */
 
-fn build_status(a: &Asst) -> String {
+fn build_status(a: &Asst, mic_open: Option<bool>) -> String {
     let state = if a.speaking { "SPEAK" } else { "idle" };
 
     let shown: String = a.partial.chars().take(34).collect();
@@ -135,14 +135,22 @@ fn build_status(a: &Asst) -> String {
 
     let cache = if a.last_cache_n > 0 { "warm" } else { "cold" };
 
+    /* open-mic mic state: muted while the assistant's voice plays */
+    let mic = match mic_open {
+        Some(true) => " | mic live",
+        Some(false) => " | MIKE OFF",
+        None => "",
+    };
+
     format!(
-        "[{:6.1}s] {:<5} {} {} backlog {:4.2}s | cache {}",
+        "[{:6.1}s] {:<5} {} {} backlog {:4.2}s | cache {}{}",
         a.t0.elapsed().as_secs_f64(),
         state,
         in_prog,
         meter,
         a.backlog(),
-        cache
+        cache,
+        mic
     )
 }
 
@@ -342,16 +350,20 @@ fn turn_reply<'k, 'd>(
     if cut {
         println!();
     }
-    /* the tail after the last terminator is spoken too, then the loop
-     * waits until the voice finishes before the next turn begins */
+    /* The tail after the last terminator is spoken too - unless the turn
+     * was cut (barge-in): a hold during the reply means "be quiet and
+     * listen", so nothing more is queued and the killed voice stays dead
+     * until the next speak(). Neither mode blocks here anymore: open-mic
+     * serializes via transcript_pass's busy-guard (its mic gate shows
+     * MIKE OFF meanwhile) and push-to-talk serializes via the hold flow -
+     * a new hold kills a still-playing voice at hold start. */
     if let Some(sp) = tts {
         let rest = tts::sanitize(&spoken_buf);
-        if !rest.is_empty() {
+        if !cut && !rest.is_empty() {
             if let Err(e) = sp.speak(&rest) {
                 eprintln!("\r[tts] {e}");
             }
         }
-        sp.wait_drain(Duration::from_secs(60));
     }
     if !reply.is_empty() {
         history.push(json!({"role": "assistant", "content": reply}));
@@ -391,6 +403,15 @@ fn transcript_pass(
             a.partial = line.text.clone();
             maybe_ping(a, history);
         }
+        return;
+    }
+
+    /* The voice is still speaking: hold the answer until it finishes.
+     * The line stays pending and is answered on a later pass - this is
+     * what serializes turns in open-mic mode now that turn_reply no
+     * longer blocks on wait_drain (the main loop's mic gate keeps the
+     * STT quiet while the voice plays). */
+    if tts.is_some_and(|sp| sp.busy()) {
         return;
     }
 
@@ -641,6 +662,10 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
      * synthesis gaps via its recency window; this latch covers the tail
      * of the drain and any mic samples still in flight. */
     let mut tts_busy_latch: Option<Instant> = None;
+    /* Hard capture-gate state, kept for the status row: Some(true) =
+     * collecting, Some(false) = muted (assistant speaking or the post-
+     * speech latch is running), None = no open-mic mic session. */
+    let mut mic_live: Option<bool> = None;
     let mut hold_start: Option<Instant> = None;
     let mut holds = 0usize;
     /* backoff after a failed hold attempt, so a broken/unplugged device
@@ -672,13 +697,17 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
         let active = key_held();
 
-        /* While the assistant is speaking (open-mic mode only), its own
-         * voice is arriving on the mic ring — the gate below drains it to
-         * junk instead of feeding the STT (half-duplex). The busy latch
-         * covers the samples recorded during the final drain moments. */
+        /* While the assistant is speaking (open-mic mode only) the mic
+         * goes hard OFF: the capture gate itself is disabled below, so
+         * the callback collects nothing at all, and the status row
+         * shows "MIKE OFF". The busy latch keeps the mute running
+         * through the drain tail (600 ms) so the STT never hears the
+         * assistant's own voice. */
         let tts_busy = !hotkey_mode
             && !file_mode
             && speaker.as_ref().is_some_and(|sp| sp.busy());
+        let mic_gated = tts_busy
+            || tts_busy_latch.is_some_and(|t| t.elapsed() < Duration::from_millis(600));
 
         /* ---------- hold starts: open the mic, fresh gated stream ----------
          * Level-triggered on purpose: the keys can go down again while a
@@ -694,6 +723,15 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .map(|t| t.elapsed() >= Duration::from_millis(500))
                 .unwrap_or(true);
         if can_start {
+            /* barge-in at hold start: if the voice is still playing,
+             * kill it here so the fresh recording never captures the
+             * assistant's own speech (mic stays clean while the key is
+             * held; a turn still streaming gets cut on its next token) */
+            if let Some(sp) = speaker.as_ref() {
+                if sp.busy() {
+                    sp.stop();
+                }
+            }
             let mut opened = true;
             if ptt_wav.is_none() {
                 match open_mic() {
@@ -755,9 +793,17 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             if recording
                 && let Some(s) = &mut stream
             {
-                if tts_busy
-                    || tts_busy_latch.is_some_and(|t| t.elapsed() < Duration::from_millis(600))
-                {
+                /* open-mic only: flip the hard capture gate to match the
+                 * mute state (disabled => the callback appends nothing
+                 * at all, not even junk) */
+                if !hotkey_mode {
+                    let want = !mic_gated;
+                    if mic_live != Some(want) {
+                        m.ring.set_enabled(want);
+                        mic_live = Some(want);
+                    }
+                }
+                if mic_gated {
                     /* the assistant's own voice: never let the STT hear it */
                     while m.ring.drain(6400, &mut chunk) {
                         chunk.clear();
@@ -931,7 +977,7 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let status = if hotkey_mode {
             build_status_ptt(&asst, active, hold_start)
         } else {
-            build_status(&asst)
+            build_status(&asst, mic_live)
         };
         if status != prev_status {
             row.show(&status);

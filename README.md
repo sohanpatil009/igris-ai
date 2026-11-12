@@ -156,8 +156,10 @@ so speech starts before the text finishes. Flags and hooks:
   point this at `main`: the current `main` voice configs carry multi-codepoint
   phoneme keys this piper build rejects.
 - `--no-tts` (or `MOON_NO_TTS=1`) runs `assist` text-only.
-- While the voice is speaking, the mic input is gated (half-duplex) so the
-  assistant does not hear itself; barge-in in push-to-talk mode kills the
+- While the voice is speaking, the mic is hard-muted: the capture gate is
+  disabled, so nothing is collected at all, and the status row shows
+  `MIKE OFF`. It reopens ~600 ms after the voice finishes so the STT never
+  hears the assistant's own voice; barge-in in push-to-talk mode kills the
   synthesizer instantly and the next utterance respawns it.
 
 Runtime: `models/piper/piper.exe` (piper 2023.11.14-2 Windows x64) with the

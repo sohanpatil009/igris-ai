@@ -259,6 +259,9 @@ struct Inner {
     /* MOON_TTS_DEBUG=1 turns on state-machine traces and keeps the
      * raw utterance WAVs in .tts-utt/ */
     debug: bool,
+    /* process start time; the MOON_TTS_DEBUG traces show queue ->
+     * consume latency against it */
+    t0: Instant,
 }
 
 impl Drop for Inner {
@@ -556,7 +559,8 @@ fn utterance_loop(inner: Arc<Inner>, dst_rate: u32) {
                     if let Some((rate, channels, bits, data)) = parse_wav(&b) {
                         if inner.debug {
                             eprintln!(
-                                "[tts] utterance {id}: rate={rate} ch={channels} bits={bits} bytes={}",
+                                "[tts] +{:>5} ms utterance {id}: rate={rate} ch={channels} bits={bits} bytes={}",
+                                inner.t0.elapsed().as_millis(),
                                 data.len()
                             );
                         }
@@ -774,6 +778,7 @@ impl Speaker {
             dead: AtomicBool::new(true),
             last_byte: Mutex::new(None),
             debug: std::env::var("MOON_TTS_DEBUG").is_ok(),
+            t0: Instant::now(),
         });
 
         let ring = Arc::clone(&inner.ring);
@@ -843,7 +848,10 @@ impl Speaker {
                     Ok(()) => {
                         let n = self.inner.pending.fetch_add(1, Ordering::SeqCst) + 1;
                         if self.inner.debug {
-                            eprintln!("[tts] speak queued (pending now {n})");
+                            eprintln!(
+                                "[tts] +{:>5} ms speak queued (pending now {n})",
+                                self.inner.t0.elapsed().as_millis()
+                            );
                         }
                         Ok(())
                     }
