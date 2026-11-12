@@ -25,10 +25,12 @@ Full details + evidence: `tool_calling_plan.md` · ZeroClaw graphs:
 - [ ] Append block to `VOICE_SYSTEM_PROMPT` once at history seed (assist.rs:658); + few-shot example kept
 - [ ] `--no-tools` flag / `MOON_NO_TOOLS=1` → block dropped, behavior = today
 
-### Phase 3 — tool registry (`src/tools.rs`, ~300 LOC)
-- [ ] `ToolDef { name, desc, schema, run: fn(&Value) -> Result<String,String> }` + `static TOOLS` (sorted)
-- [ ] `get_time` · `calculate` (port pattern of `zeroclaw-tools/src/calculator.rs`) · `open_app` (hard allowlist via `std::process::Command`, no shell)
-- [ ] Security: no arbitrary shell v1 · allowlist const · per-tool timeout → error result · sequential only
+### Phase 3 — dynamic tool registry (`src/tools.rs`, ~350 LOC)
+- [ ] `Registry { tools: Vec<ToolDef> }` — **runtime registry, not a hardcoded table**; `ToolDef { name, desc, schema, run: Box<dyn Fn> }`
+- [ ] `specs()` (sorted → prompt block) + `dispatch(name, args)`; unknown name → error result
+- [ ] Seed set v1 (registry tenants): `get_time` · `calculate` (port pattern of `zeroclaw-tools/src/calculator.rs`) · `open_app` (hard allowlist via `std::process::Command`, no shell)
+- [ ] Dynamism ladder: v1 code-registered → v1.1 **`tools.toml` config-defined tools** (name/desc/schema + allowlisted command template, `{arg}` substitution, no recompile) → v3 MCP/WASM (ZeroClaw plugins pattern)
+- [ ] Security: no arbitrary shell v1 · allowlist consts · per-tool timeout → error result · sequential only
 - [ ] Unit tests per tool
 
 ### Phase 4 — agent loop (`turn_reply`, assist.rs)
@@ -74,7 +76,7 @@ Full details + evidence: `tool_calling_plan.md` · ZeroClaw graphs:
 
 ### Open decisions (user)
 - [ ] 1. Vendored parser (recommended) vs ZeroClaw path-dep
-- [ ] 2. Starter tool set ok?
+- [ ] 2. Seed tool set ok? (registry is dynamic: v1 code → v1.1 `tools.toml` user tools → v3 MCP/WASM)
 - [ ] 3. `open_app` allowlist: notepad, calc, chrome, spotify, vscode?
 - [ ] 4. Tools always-on + `--no-tools` escape, or `--tools` opt-in?
 - [ ] 5. `rustup update` abhi?
@@ -86,6 +88,7 @@ Full details + evidence: `tool_calling_plan.md` · ZeroClaw graphs:
 - [ ] WASM/MCP plugin bridge (`zeroclaw-plugins`), if ever needed
 
 ## Pending (GPU/CPU backend — pre-tool-calling)
-- [ ] Test C result confirm (GPU exe renamed → CPU fallback → restored) — running
-- [ ] Commit llm.rs / assist.rs / main.rs / README (auto GPU→CPU backend)
-- [ ] Relaunch `assist --hotkey` for the user
+- [x] Test A (`--cpu` → CPU backend ready) — pass
+- [x] Test B (auto → GPU backend ready) — pass
+- [x] Test C (GPU exe renamed → auto CPU fallback → restored) — pass
+- [x] Commit: `c5b16e3` (backend) + `fbb9d34` (docs)

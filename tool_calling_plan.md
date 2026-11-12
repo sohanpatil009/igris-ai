@@ -133,19 +133,43 @@ one function and two warns. Recommended: **vendored**.
   fenced example in ZeroClaw's block already serves this — keep it).
 - `render_prompt` needs no changes: tool results are plain user messages.
 
-### 3.3 `src/tools.rs` — registry + starter tools (Phase 3)
+### 3.3 `src/tools.rs` — dynamic tool registry (Phase 3)
 
-No tokio, no traits ceremony — a simple table:
+No tokio, no traits ceremony — a **runtime registry**, not a hardcoded
+table. The registry is the product; individual tools are its tenants:
 
 ```rust
 pub struct ToolDef {
-    pub name: &'static str,
-    pub desc: &'static str,
+    pub name: String,
+    pub desc: String,
     pub schema: serde_json::Value,
-    pub run: fn(&serde_json::Value) -> Result<String, String>,
+    pub run: Box<dyn Fn(&serde_json::Value) -> Result<String, String> + Send>,
 }
-pub static TOOLS: &[ToolDef] = &[ /* sorted by name */ ];
+
+pub struct Registry { tools: Vec<ToolDef> }
+impl Registry {
+    fn register(&mut self, t: ToolDef);
+    fn specs(&self) -> Vec<ToolSpec>;   /* feeds the prompt block, sorted */
+    fn dispatch(&self, name: &str, args: &Value) -> Result<String, String>;
+}
 ```
+
+**Dynamism ladder** — tool calling stays dynamic at every level:
+
+| Level | Tool source | When |
+|---|---|---|
+| 1 | Built-in tools registered in code (seed set below) | v1 |
+| 2 | **Config-defined tools**: user adds entries to `tools.toml` — name, description, JSON schema, allowlisted command template with `{arg}` substitution. New tool without a recompile | v1.1 |
+| 3 | External tool servers (MCP) / WASM plugins — ZeroClaw's `zeroclaw-plugins` pattern | v3 |
+
+Because `tools_protocol_block` is **generated from the registry every
+session**, adding or removing a tool automatically changes what the LLM can
+call — and the LLM's tool selection + argument generation were dynamic from
+day one (one `open_app` tool covers "Open Chrome", "Open VS Code", "Open my
+coding project" purely through generated arguments; the goal.md tables are
+examples of reachable outcomes, not a fixed tool list).
+
+Seed set (v1 — the first tenants of the registry):
 
 | Tool | Behavior | Risk class |
 |---|---|---|
@@ -236,8 +260,8 @@ Each phase compiles and commits separately. Estimated new hand-written code:
 
 1. **Vendored parser** (recommended) vs path-dep on the ZeroClaw crate
    (upstream tracking, heavier binary).
-2. **Starter tool set** — time / calculate / open_app now; web_fetch and
-   create_note in v1.1?
+2. **Seed tool set** — `get_time` / `calculate` / `open_app` as the first
+   registry tenants; config-defined `tools.toml` tools in v1.1?
 3. **open_app allowlist** — which apps? (default suggestion: notepad, calc,
    chrome, spotify, vscode)
 4. Tools **always-on** with `--no-tools` escape, or opt-in `--tools` flag?

@@ -24,6 +24,14 @@ voice in → STT → LLM (intent + tool choice + args) → tool execution
 
 Every table below is that loop with a different tool behind it.
 
+> **The tables are examples, not a fixed scope.** Tool calling is
+> **dynamic**: the tool registry grows over time (code-registered seed set
+> → user-defined `tools.toml` tools → MCP/WASM plugin servers), and the
+> prompt the LLM sees is generated from whatever is registered right now.
+> One generic tool + generated arguments already covers many rows (e.g.
+> `open_app` covers every "Open …" command); new spoken abilities come from
+> adding tools to the registry, not from rewriting the core.
+
 ---
 
 ## 1. Desktop and application control
