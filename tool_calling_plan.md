@@ -49,6 +49,44 @@ edition 2024; local toolchain is 1.95).
 
 ---
 
+## 1.5 "Why not just merge the WHOLE ZeroClaw?"
+
+If the full runtime were linked, the generic machinery (registry, generic
+tools, loop policy, config) would come free — but three things would
+**still have to be written by us**, in every variant of this integration:
+
+1. **The voice glue** — streaming STT turns, 250 ms prefill pings,
+   sentence-by-sentence TTS, barge-in kill, mic-mute-during-playback,
+   llama-server KV-prefix reuse. None of that exists in ZeroClaw; it is
+   this app's core (`turn_reply` + `llm.rs`), and under a full merge it
+   would be rewritten as adapters *into* ZeroClaw's loop instead of *our*
+   loop — same LOC, less control.
+2. **A custom Provider** for llama-server :8081 (hand-rendered ChatML,
+   `/v1/completions`, KV-cache pings). ZeroClaw's OpenAI-compatible
+   provider does not do our latency tricks.
+3. **The goal.md tools themselves** — volume, screenshots, media keys,
+   cargo, memory, window control. ZeroClaw ships shell/file/web/browser
+   tools for *its* use cases, not ours. **The tools ARE the product**;
+   no amount of merging ZeroClaw gives us IGRIS's capabilities.
+
+What a full-runtime merge would additionally cost: tokio (our app is
+blocking/threads), `zeroclaw-config` + sqlite + crypto in the binary,
+~1.5 M LOC dependency tree, MSRV coupling, big compile times, and the risk
+of losing the streaming/KV-cache behavior inside a batch-oriented agent
+loop.
+
+| Strategy | Free machinery | Still ours | Weight |
+|---|---|---|---|
+| A (this plan): vendor parser + own registry | parser | voice glue + provider + registry (~350 LOC) + tools | minimal (regex) |
+| B: path-dep `api`+`parser`+`tools` | Tool trait + some generic tools | voice glue + provider + our tools | tokio + config + sqlite |
+| C: embed full runtime | registry + loop + security + plugins | voice glue + provider + **all our tools** | ~1.5 M LOC, tokio, config |
+
+A is the 80/20: we only write what we'd have to write anyway, and skip the
+weight. Option C stays open for later (e.g. when MCP/WASM plugins become
+desirable) — the vendored parser makes no assumption against it.
+
+---
+
 ## 2. Target architecture
 
 ```
