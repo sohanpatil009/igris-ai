@@ -1,4 +1,4 @@
-//! `moonshine-test assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID]`
+//! `moonshine-test assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID] [--cpu]`
 //!
 //! Live voice assistant: Moonshine streaming STT + the local LLM through
 //! llama.cpp. While the user is still speaking, every growth of the
@@ -448,6 +448,7 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut hotkey_mode = false;
     let mut no_tts = false;
     let mut voice: Option<String> = None;
+    let mut cpu_only = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -465,6 +466,9 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--no-tts" => {
                 no_tts = true;
             }
+            "--cpu" => {
+                cpu_only = true;
+            }
             "--voice" => {
                 i += 1;
                 voice = Some(
@@ -475,7 +479,7 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             opt if opt.starts_with("--") => {
                 return Err(format!(
-                    "unknown option '{opt}' (usage: assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID])"
+                    "unknown option '{opt}' (usage: assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID] [--cpu])"
                 )
                 .into());
             }
@@ -513,7 +517,7 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     install_console();
 
-    println!("Moonshine voice assistant (streaming {arch_label} STT + LFM3-1.7B via llama.cpp GPU)");
+    println!("Moonshine voice assistant (streaming {arch_label} STT + LFM3-1.7B via llama.cpp)");
     println!("  model dir : {model_dir}");
     match &file_path {
         None if hotkey_mode => {
@@ -533,7 +537,7 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let t_load = Instant::now();
     let transcriber = Transcriber::from_files(&model_dir, arch, None)?;
-    llm::ensure_server()?;
+    llm::ensure_server(cpu_only)?;
     println!("  models    : loaded ({:.0} s)", t_load.elapsed().as_secs_f64());
 
     /* ---------- voice: piper speaks the replies sentence-by-sentence.

@@ -69,10 +69,23 @@ cargo run --release -- chat "who are you"       # one-shot
 ```
 
 Backed by `models/llm/LFM3-1.7B-Q4_K_M.gguf` through the bundled llama.cpp.
-On first use the app starts `llama-server` detached (Vulkan GPU build in
-`models/llm-gpu/`) on `127.0.0.1:8081`; the process intentionally keeps running
-after the app exits so later runs skip the model load. Stop it manually with
-`taskkill /IM llama-server.exe /F`.
+On first use the app starts `llama-server` detached on `127.0.0.1:8081`; the
+process intentionally keeps running after the app exits so later runs skip
+the model load. Stop it manually with `taskkill /IM llama-server.exe /F`.
+
+Two llama.cpp builds ship with the repo, and the app picks between them
+automatically:
+
+- **GPU first** — the Vulkan build in `models/llm-gpu/` (fast: ~33 tok/s,
+  ~1.3 GB VRAM). Used whenever the machine can run it.
+- **CPU fallback** — the CPU build in `tools/llama-cpp/` (slower: ~16 tok/s,
+  0 VRAM). Takes over automatically when the GPU build cannot run: no
+  Vulkan driver, too little VRAM, early crash, or a startup timeout.
+  The console prints which backend came up, e.g.
+  `llm : llama.cpp gpu backend ready (NVIDIA GeForce MX350)`.
+
+Pass `--cpu` (or set `MOON_LLM_CPU=1`) to skip the GPU attempt entirely —
+useful on office laptops where you would rather keep the VRAM free.
 
 The server runs with `--no-webui` (API only) plus `--swa-full --cache-reuse 1` —
 LFM3 is a sliding-window-attention model, and these flags are what unlock
@@ -90,6 +103,7 @@ around them.
 cargo run --release -- assist                    # live microphone (ENTER to finish)
 cargo run --release -- assist speech16.wav       # same pipeline with a WAV in real time
 cargo run --release -- assist --model models/medium-streaming
+cargo run --release -- assist --cpu              # force the CPU llama.cpp build
 ```
 
 While you are still speaking, the partial Moonshine transcript is pushed into the

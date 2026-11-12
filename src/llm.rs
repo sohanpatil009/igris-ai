@@ -15,20 +15,26 @@
 //! chat endpoint re-tokenizes per request and defeats that reuse on LFM3.
 
 use serde_json::{json, Value};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/* Vulkan (GPU) build of llama.cpp, installed in models/llm-gpu. Swap this
- * back to "tools/llama-cpp/llama-server.exe" and drop --swa-full for pure
- * CPU. NOTE: if the flags below change, kill any leftover llama-server so
- * the next run starts one with the new configuration. */
-const LLAMA_SERVER_EXE: &str = "models/llm-gpu/llama-server.exe";
+/* Two llama.cpp builds ship with the repo: a Vulkan (GPU) build in
+ * models/llm-gpu and a pure-CPU build in tools/llama-cpp (both recent
+ * enough for every flag below). ensure_server() tries the GPU build
+ * first and falls back to the CPU build whenever it cannot run on this
+ * machine - no Vulkan driver, too little VRAM, early crash, startup
+ * timeout - so the same app runs on gaming rigs and office laptops
+ * alike. `--cpu` (or MOON_LLM_CPU=1) skips the GPU attempt. NOTE: if the
+ * flags below change, kill any leftover llama-server so the next run
+ * starts one with the new configuration. */
+const LLAMA_GPU_EXE: &str = "models/llm-gpu/llama-server.exe";
+const LLAMA_CPU_EXE: &str = "tools/llama-cpp/llama-server.exe";
 const LLM_MODEL: &str = "models/llm/LFM3-1.7B-Q4_K_M.gguf";
 const PORT: u16 = 8081;
 const CTX_TOKENS: i64 = 8000;
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 /// Liquid's recommended sampling defaults for general use.
 const TEMPERATURE: f64 = 0.1;
 const TOP_K: i64 = 50;
@@ -132,31 +138,116 @@ fn server_ready() -> bool {
     )
 }
 
-/// Start the bundled llama-server if none is running, then wait until the
-/// model is fully loaded (health endpoint returns 200).
-pub fn ensure_server() -> Result<(), Box<dyn std::error::Error>> {
+/// Which llama.cpp build to try. The GPU build is preferred; the CPU
+/// build runs on any Windows x64 machine.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Backend {
+    Gpu,
+    Cpu,
+}
+
+impl Backend {
+    fn exe(self) -> &'static str {
+        match self {
+            Backend::Gpu => LLAMA_GPU_EXE,
+            Backend::Cpu => LLAMA_CPU_EXE,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Backend::Gpu => "gpu",
+            Backend::Cpu => "cpu",
+        }
+    }
+    /* Generous on purpose: a slow-but-working load must never be killed.
+     * Real failures (no driver, no VRAM, crash) surface as a fast-fail
+     * hint or an early process exit, not as a timeout. Measured here:
+     * gpu 17 s with a cold disk cache, cpu 4 s. */
+    fn startup_timeout(self) -> Duration {
+        match self {
+            Backend::Gpu => Duration::from_secs(90),
+            Backend::Cpu => Duration::from_secs(150),
+        }
+    }
+}
+
+/* Lowercase fragments of llama-server stderr that mean "this machine
+ * cannot run the Vulkan build"; each one triggers an immediate fallback
+ * to the CPU build instead of waiting out the timeout. */
+const GPU_FAIL_HINTS: [&str; 5] = [
+    "0 vulkan devices",
+    "failed to create vulkan",
+    "vkcreateinstance",
+    "out_of_device_memory",
+    "device lost",
+];
+
+/// Records the backend preference from the first ensure_server call so
+/// later calls (prefill pings during a running session) reuse the same
+/// choice instead of re-deriving it.
+static FORCE_CPU: OnceLock<bool> = OnceLock::new();
+
+/// Start a llama-server (GPU build first, CPU build as the automatic
+/// fallback) unless one is already serving, then wait until the model is
+/// fully loaded (health endpoint returns 200). `force_cpu` skips the
+/// GPU attempt entirely.
+pub fn ensure_server(force_cpu: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let force_cpu = *FORCE_CPU.get_or_init(|| force_cpu || std::env::var("MOON_LLM_CPU").is_ok());
     if server_ready() {
+        println!("  llm       : reusing already-running llama-server (:{PORT})");
         return Ok(());
     }
-    if !std::path::Path::new(LLAMA_SERVER_EXE).exists() {
-        return Err(format!(
-            "llama-server not found at {LLAMA_SERVER_EXE} (run from the repo root)"
-        )
-        .into());
+    let order: &[Backend] = if force_cpu {
+        &[Backend::Cpu]
+    } else {
+        &[Backend::Gpu, Backend::Cpu]
+    };
+    let mut last_err = String::new();
+    for (attempt, &backend) in order.iter().enumerate() {
+        match try_start(backend) {
+            Ok(device) => {
+                let dev = device.map(|d| format!(" ({d})")).unwrap_or_default();
+                println!(
+                    "  llm       : llama.cpp {} backend ready{}",
+                    backend.label(),
+                    dev
+                );
+                return Ok(());
+            }
+            Err(reason) => {
+                eprintln!("  llm       : {} build failed: {reason}", backend.label());
+                last_err = reason;
+                if attempt + 1 < order.len() {
+                    eprintln!("  llm       : falling back to the cpu build");
+                }
+            }
+        }
     }
-    Command::new(LLAMA_SERVER_EXE)
-        .arg("-m")
+    Err(format!("no llama-server could be started: {last_err}").into())
+}
+
+/// Spawn one backend and poll it until healthy. Ok carries the GPU device
+/// name when one shows up in the startup log. The child is deliberately
+/// not killed on success: it outlives this process and keeps serving for
+/// later runs of the app.
+fn try_start(backend: Backend) -> Result<Option<String>, String> {
+    if !std::path::Path::new(backend.exe()).exists() {
+        return Err(format!(
+            "{} not found (run from the repo root)",
+            backend.exe()
+        ));
+    }
+    let mut cmd = Command::new(backend.exe());
+    cmd.arg("-m")
         .arg(LLM_MODEL)
         .arg("-c")
         .arg(CTX_TOKENS.to_string())
-        .arg("-ngl")
-        .arg("99") /* offload every layer to the GPU (Vulkan backend) */
         .arg("-fa")
         .arg("on") /* flash attention: ~2x decode speed on this GPU */
         /* LFM3 mixes sliding-window attention layers; the default SWA
          * cache rejects KV-shift reuse ("cache_reuse is not supported by
          * this context"). --swa-full stores the full window and unlocks
-         * prompt-prefix reuse. */
+         * prompt-prefix reuse. Both builds support it. */
         .arg("--swa-full")
         /* KV-shifting chunk reuse: a new request may also reuse interior
          * cache chunks, not just the leading prefix. */
@@ -170,20 +261,82 @@ pub fn ensure_server() -> Result<(), Box<dyn std::error::Error>> {
         .arg("--port")
         .arg(PORT.to_string())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    /* The child outlives this handle on purpose; std does not kill it on
-     * drop, so the server keeps serving for the next run of the app. */
+        .stderr(Stdio::piped());
+    if backend == Backend::Gpu {
+        cmd.arg("-ngl").arg("99"); /* offload every layer (Vulkan) */
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let stderr = child.stderr.take().expect("stderr was piped");
+    /* Keep draining the server's stderr in the background: an unread
+     * pipe would eventually block the server, and the Vulkan build's
+     * failure reasons (no device, no VRAM) only appear there. */
+    let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+    let failed = Arc::new(AtomicBool::new(false));
+    let fail_reason: Arc<Mutex<Option<String>>> = Arc::default();
+    let reader_lines = Arc::clone(&lines);
+    let reader_failed = Arc::clone(&failed);
+    let reader_reason = Arc::clone(&fail_reason);
+    let is_gpu = backend == Backend::Gpu;
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if is_gpu {
+                let low = line.to_lowercase();
+                if !reader_failed.load(Ordering::Relaxed)
+                    && GPU_FAIL_HINTS.iter().any(|h| low.contains(h))
+                {
+                    *reader_reason.lock().expect("fail log") = Some(line.clone());
+                    reader_failed.store(true, Ordering::Relaxed);
+                }
+            }
+            reader_lines.lock().expect("stderr log").push(line);
+        }
+    });
+
     let started = Instant::now();
     loop {
-        if server_ready() {
-            return Ok(());
+        if failed.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let reason = fail_reason
+                .lock()
+                .expect("fail log")
+                .clone()
+                .unwrap_or_else(|| "vulkan unavailable".into());
+            return Err(reason);
         }
-        if started.elapsed() > STARTUP_TIMEOUT {
-            return Err("llama-server did not become healthy in time".into());
+        if let Ok(Some(_)) = child.try_wait() {
+            let _ = child.kill(); /* reap the exited child */
+            let reason = lines
+                .lock()
+                .expect("stderr log")
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "no stderr output".into());
+            return Err(format!("exited before becoming healthy: {reason}"));
+        }
+        if server_ready() {
+            return Ok(device_name(&lines));
+        }
+        if started.elapsed() > backend.startup_timeout() {
+            let _ = child.kill();
+            return Err(format!("{} did not become healthy in time", backend.exe()));
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+/// Best-effort GPU name from the startup log, e.g. a line like
+/// "ggml_vulkan: 0 = NVIDIA GeForce MX350 (NVIDIA) | ..." yields
+/// "NVIDIA GeForce MX350".
+fn device_name(lines: &Mutex<Vec<String>>) -> Option<String> {
+    let v = lines.lock().ok()?;
+    v.iter().find_map(|line| {
+        let rest = line.trim().strip_prefix("ggml_vulkan:")?;
+        let idx = rest.find(" = ")?;
+        let after = &rest[idx + 3..];
+        let end = after.find(" (").unwrap_or(after.len());
+        let name = after[..end].trim();
+        (!name.is_empty()).then(|| name.to_string())
+    })
 }
 
 /* ================================================================ */
@@ -223,7 +376,7 @@ fn complete(body: Value) -> Result<Value, Box<dyn std::error::Error>> {
 ///
 /// Returns the number of prompt tokens served from cache (0 = cold start).
 pub fn prefill(messages: &[Value]) -> Result<u64, Box<dyn std::error::Error>> {
-    ensure_server()?;
+    ensure_server(false)?;
     let body = json!({
         "prompt": render_prompt(messages, false),
         "max_tokens": 1,
@@ -344,8 +497,17 @@ fn stream_persona(prompt: &str, max_tokens: i64) -> Result<(), Box<dyn std::erro
 /// `chat` subcommand: one-shot with arguments, or an interactive loop when
 /// called without arguments. Replies stream token-by-token.
 pub fn cmd_chat(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let prompt = args.join(" ");
-    ensure_server()?;
+    let mut force_cpu = false;
+    let mut rest: Vec<&str> = Vec::new();
+    for a in args {
+        if a == "--cpu" {
+            force_cpu = true;
+        } else {
+            rest.push(a.as_str());
+        }
+    }
+    let prompt = rest.join(" ");
+    ensure_server(force_cpu)?;
 
     if !prompt.is_empty() {
         return stream_persona(&prompt, 512);
