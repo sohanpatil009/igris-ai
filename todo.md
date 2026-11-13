@@ -51,14 +51,29 @@ untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
       result · sequential only
 - [x] Unit tests per tool (17 new)
 
-### Phase 4 — agent loop (`turn_reply`, assist.rs)
-- [ ] Iteration loop, max 10 (ZeroClaw `DEFAULT_MAX_TOOL_ITERATIONS`)
-- [ ] Stream hold-back in `on_tok`: `looks_like_incomplete_tool_protocol_json` + tool-tag detection; terminal markers stripped cross-chunk → envelope never reaches TTS
-- [ ] Tool turn: speak filler "ek seconds…" once; final prose streams as today
-- [ ] `parse_tool_calls` on full text → filter calls against registry (unknown → error result)
-- [ ] Malformed protocol → `detect_tool_call_parse_issue` corrective user msg, max 2 retries
-- [ ] History: assistant msg keeps raw envelopes; user msg `[Tool results]` + tool_result blocks (`name`, `status="ok|error"`) — prefix stability for `cache_prompt` + `--cache-reuse 1`
-- [ ] Barge-in (`stop_when`) cuts whole loop as today
+### Phase 4 — agent loop — DONE 2026-11-13
+- [x] Iteration loop, max 10 (ZeroClaw `DEFAULT_MAX_TOOL_ITERATIONS`) — lives in
+      `llm.rs::agent_turn` (shared core), driven by voice `turn_reply` **and** the `chat`
+      path's `stream_persona`; `AgentLoopState` keeps the caps pure and unit-tested
+- [x] Stream hold-back: `toolparse::StreamFilter` (stream_guard concept, chunk-boundary
+      safe) — tool-call envelopes, tool_result blocks, think spans (standard + LFM3) and
+      terminal markers are withheld as spans and dropped; partial-opener tails held across
+      chunks; `finish()` releases leftover text verbatim (never lose text) → envelope never
+      reaches TTS or the terminal. Parsing still runs on the full raw text
+- [x] Tool turn: filler "ek seconds…" spoken once per turn while the tools run; final prose
+      streams as today
+- [x] `parse_tool_calls` on full text → every call dispatched against the registry
+      (unknown name → `status="error"` result fed back, never a crash)
+- [x] Malformed protocol → `detect_tool_call_parse_issue` → corrective user msg,
+      max 2 retries (`MAX_MALFORMED_RETRIES`), then plain-text handling; budget resets on a
+      reply that parses
+- [x] History: assistant msg keeps raw envelopes (minus leaked trailing terminal markers);
+      results in a user message with the `[Tool results]` carrier + `tool_result` blocks
+      (`name`, `status="ok|error"`, `result`) — history only ever appends, so each round is
+      a strict prompt-prefix of the next for `cache_prompt`
+- [x] Barge-in (`stop_when`) cuts the whole loop: `on_released` returns false → stream
+      stops → `AgentTurnEnd::Cut`, in-flight TTS killed, partial reply still stored (parity
+      with the plain path)
 
 ### Phase 5 — tests + regression
 - [ ] CLI e2e: `chat "what time is it"` → tool call → answer with time
@@ -87,11 +102,16 @@ untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
         install-path candidates asserted (**real GUI launch deferred to Phase 5 e2e** —
         unit tests never spawn an allowed app)
   - [x] timeout wrapper: hung tool → error result within budget; panicking tool → "crashed" error
-- [ ] **assist.rs (loop glue)** — test the pure pieces:
-  - [ ] call filtering against registry (unknown name → error result, not crash)
-  - [ ] tool_result user-message carrier shape (`[Tool results]` + `status="ok|error"` blocks)
-  - [ ] stream hold-back detector: tool-tag start / incomplete JSON held; normal sentence passes
-  - [ ] malformed-retry counter caps at 2, iteration counter caps at 10
+- [x] **assist.rs (loop glue)** — the loop is `llm.rs::agent_turn` with `turn_reply` as a
+      thin surface; its pure pieces are all unit-tested:
+  - [x] call filtering against registry (unknown name → `status="error"`, not crash) —
+        registry `dispatch` tests + error-outcome case in the carrier test
+  - [x] tool_result user-message carrier shape (`[Tool results]` + `status="ok|error"` blocks)
+        — llm.rs `tool_results_user_message_carrier_shape`
+  - [x] stream hold-back detector: envelope/think-span/marker spans held cross-chunk;
+        plain prose passes immediately — toolparse.rs `stream_filter_*` (8 tests)
+  - [x] malformed-retry counter caps at 2, iteration counter caps at 10 —
+        llm.rs `AgentLoopState` tests
   - [ ] history after a tool turn: assistant msg keeps raw envelope + results msg appended in order
 - [ ] `cargo test` gate before every phase commit (Phase 1–5)
 
