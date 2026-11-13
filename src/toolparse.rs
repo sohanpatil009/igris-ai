@@ -169,15 +169,19 @@ fn earliest_stream_opener(text: &str) -> Option<(usize, usize, StreamOpener)> {
 }
 
 /// Length of the longest suffix of `text` that is a strict prefix of any
-/// opener tag or terminal marker — the bytes held back across chunk
-/// boundaries. All candidates are ASCII, so matched byte offsets are
+/// opener tag, close tag, or terminal marker — the bytes held back across
+/// chunk boundaries. All candidates are ASCII, so matched byte offsets are
 /// always on char boundaries.
 fn stream_holdback_len(text: &str) -> usize {
-    let candidates: [&str; 7] = [
+    let candidates: [&str; 11] = [
         THINK_OPEN,
         LFM3_THINK_OPEN,
         TOOL_CALL_OPEN,
         TOOL_RESULT_OPEN,
+        THINK_CLOSE,
+        LFM3_THINK_CLOSE,
+        TOOL_CALL_CLOSE,
+        TOOL_RESULT_CLOSE,
         TERMINAL_MARKERS[0],
         TERMINAL_MARKERS[1],
         TERMINAL_MARKERS[2],
@@ -191,6 +195,32 @@ fn stream_holdback_len(text: &str) -> usize {
         }
     }
     max_hold
+}
+
+/// Earliest known close tag in `text` while not inside a span:
+/// `(byte index, close-tag length, which close)`. A close without its
+/// opener is protocol noise (the opener was in an earlier round whose
+/// filter already dropped the unclosed span) — the stream filter skips it.
+fn earliest_stream_closer(text: &str) -> Option<(usize, usize)> {
+    let closes: [&str; 4] = [
+        THINK_CLOSE,
+        LFM3_THINK_CLOSE,
+        TOOL_CALL_CLOSE,
+        TOOL_RESULT_CLOSE,
+    ];
+    let mut best: Option<(usize, usize)> = None;
+    for close in closes {
+        if let Some(i) = text.find(close) {
+            let better = match &best {
+                Some((bi, _)) => i < *bi,
+                None => true,
+            };
+            if better {
+                best = Some((i, close.len()));
+            }
+        }
+    }
+    best
 }
 
 /// Token-in / clean-text-out filter for streamed LLM replies.
@@ -243,6 +273,16 @@ impl StreamFilter {
             }
             match earliest_stream_opener(&self.pending) {
                 Some((i, open_len, opener)) => {
+                    /* a stray close without an opener comes first: drop
+                     * it as protocol noise (its span was closed in an
+                     * earlier round and already suppressed) */
+                    if let Some((ci, cl_len)) = earliest_stream_closer(&self.pending)
+                        && ci <= i
+                    {
+                        out.push_str(&self.pending[..ci]);
+                        self.pending.drain(..ci + cl_len);
+                        continue;
+                    }
                     out.push_str(&self.pending[..i]);
                     if let StreamOpener::Span(close) = opener {
                         self.span_close = Some(close);
@@ -250,6 +290,11 @@ impl StreamFilter {
                     self.pending.drain(..i + open_len);
                 }
                 None => {
+                    if let Some((ci, cl_len)) = earliest_stream_closer(&self.pending) {
+                        out.push_str(&self.pending[..ci]);
+                        self.pending.drain(..ci + cl_len);
+                        continue;
+                    }
                     let hold = if at_end {
                         0
                     } else {
@@ -6068,5 +6113,38 @@ Let me check the result."#;
         for c in &calls {
             assert_eq!(c.name, "get_time");
         }
+    }
+
+    #[test]
+    fn stream_filter_drops_stray_close_tags_outside_any_span() {
+        // A think span opened in an earlier round was already dropped by
+        // that round's finish(); its close tag still shows up later and
+        // must not reach the voice or the terminal.
+        let mut f = StreamFilter::new();
+        assert_eq!(f.feed("Time is 3 PM"), "Time is 3 PM");
+        let mut released = String::new();
+        released.push_str(&f.feed(&format!(" now{}", THINK_CLOSE)));
+        released.push_str(&f.feed(" more"));
+        released.push_str(&f.finish());
+        assert_eq!(released, " now more");
+    }
+
+    #[test]
+    fn stream_filter_drops_stray_close_split_across_chunks() {
+        let mut f = StreamFilter::new();
+        // The partial close tail is held across the boundary, then the
+        // completed close is dropped, not released.
+        assert_eq!(f.feed(&format!("ok\x3c/thi")), "ok");
+        let mut released = String::new();
+        released.push_str(&f.feed(&format!("nk\x3e done{}", TOOL_CALL_CLOSE)));
+        released.push_str(&f.finish());
+        assert_eq!(released, " done");
+    }
+
+    #[test]
+    fn stream_filter_finish_releases_partial_close_tail_verbatim() {
+        let mut f = StreamFilter::new();
+        assert_eq!(f.feed("bye\x3c/th"), "bye");
+        assert_eq!(f.finish(), "\x3c/th");
     }
 }
