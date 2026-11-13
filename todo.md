@@ -75,11 +75,31 @@ untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
       stops → `AgentTurnEnd::Cut`, in-flight TTS killed, partial reply still stored (parity
       with the plain path)
 
-### Phase 5 — tests + regression
-- [ ] CLI e2e: `chat "what time is it"` → tool call → answer with time
-- [ ] CLI e2e: `chat "2 plus 2"` → calculate → "4"
-- [ ] Voice e2e: `assist --hotkey` spoken time question
-- [ ] Regression: plain chat unchanged; prefill ping latency unchanged
+### Phase 5 — tests + regression — CLI items DONE 2026-11-13
+- [x] CLI e2e: `chat "what time is it"` → tool call → answer with time — first run exposed
+      the model's real shape: the tool-call wrapper with an XML-attr body (`function=NAME`
+      open + immediate close / `parameter=K` children), uncovered by the stock JSON/XML/GLM
+      fallbacks → vendored parser extended with OUR `parse_function_attr_calls` (JSON takes
+      precedence); second run: get_time round → real time
+- [x] CLI e2e: `chat "2 plus 2"` → calculate → "4" — the tenant speaks upstream's
+      `{function, values}` schema and the model follows it exactly; the catch: parameter
+      children arrive as TEXT, so `parameter=values>[2, 2]` was a string and
+      `extract_values` rejected it → param children are now JSON-decoded (real arrays /
+      numbers, non-JSON stays string). Model threw in a bonus get_time round — loop fed
+      the result back and the final answer was correct
+- [ ] Voice e2e: `assist --hotkey` spoken time question (user run: needs mic + hotkey)
+- [x] Regression: `chat --no-tools "hello"` → plain reply, no `[tools]` line (the
+      `--no-tools` path is the untouched pre-tools code); prefill ping latency: the
+      protocol block sits in the stable system prefix, KV-cached after the first turn —
+      confirm live in the voice session
+- [x] e2e findings fixed in-loop: model repeats its envelope / emits identical calls
+      several times per reply → `dedup_tool_calls` (name + upstream-canonicalized args
+      signature) before dispatch, so an app is never opened twice; gated
+      `MOON_DEBUG_RAW=1` raw-round dump in `agent_turn` for diagnosis; `chat "open
+      notepad"` → real GUI launch verified (closes the Phase 3 deferred item)
+- Note (operational): raw tag text in prompts/logs is live protocol for the vendored
+      parser — keep it escaped (`\x3c`) in any dump meant for reading; the
+      MOON_DEBUG_RAW dump does this
 
 ### Unit testing (repo pattern: inline `#[cfg(test)] mod tests`, like hotkey.rs/live.rs)
 - [x] **toolparse.rs** — vendored parser subset:
@@ -99,8 +119,8 @@ untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
   - [x] `get_time`: output format stable + parseable (regex-pinned)
   - [x] `calculate`: correct results; div-by-zero / garbage input → `Err`, not panic
   - [x] `open_app`: non-allowlisted → Err; empty args → Err; allowlist coverage +
-        install-path candidates asserted (**real GUI launch deferred to Phase 5 e2e** —
-        unit tests never spawn an allowed app)
+        install-path candidates asserted (**real GUI launch verified in Phase 5 e2e**:
+        `chat "open notepad"` opened the window — unit tests never spawn an allowed app)
   - [x] timeout wrapper: hung tool → error result within budget; panicking tool → "crashed" error
 - [x] **assist.rs (loop glue)** — the loop is `llm.rs::agent_turn` with `turn_reply` as a
       thin surface; its pure pieces are all unit-tested:
