@@ -1,4 +1,4 @@
-//! `moonshine-test assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID] [--cpu]`
+//! `moonshine-test assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID] [--cpu] [--no-tools]`
 //!
 //! Live voice assistant: Moonshine streaming STT + the local LLM through
 //! llama.cpp. While the user is still speaking, every growth of the
@@ -449,6 +449,7 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut no_tts = false;
     let mut voice: Option<String> = None;
     let mut cpu_only = false;
+    let mut no_tools = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -469,6 +470,9 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--cpu" => {
                 cpu_only = true;
             }
+            "--no-tools" => {
+                no_tools = true;
+            }
             "--voice" => {
                 i += 1;
                 voice = Some(
@@ -479,7 +483,7 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             opt if opt.starts_with("--") => {
                 return Err(format!(
-                    "unknown option '{opt}' (usage: assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID] [--cpu])"
+                    "unknown option '{opt}' (usage: assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID] [--cpu] [--no-tools])"
                 )
                 .into());
             }
@@ -500,6 +504,8 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     /* `MOON_NO_TTS=1` does the same as --no-tts (env test hooks style) */
     let use_tts = !no_tts && std::env::var("MOON_NO_TTS").is_err();
+    /* Tools are always on; --no-tools / MOON_NO_TOOLS=1 is the escape hatch */
+    let tools_on = llm::tools_enabled(no_tools);
     /* `MOON_VOICE=en_US-amy-low` does the same as --voice */
     let voice = voice.or_else(|| std::env::var("MOON_VOICE").ok());
 
@@ -655,7 +661,10 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     /* ---------- live loop ---------- */
     let mut row = LiveRow::new();
     let mut asst = Asst::new();
-    let mut history: Vec<Value> = vec![json!({"role": "system", "content": llm::VOICE_SYSTEM_PROMPT})];
+    let mut history: Vec<Value> = vec![json!({
+        "role": "system",
+        "content": llm::system_prompt_with_tools(llm::VOICE_SYSTEM_PROMPT, tools_on)
+    })];
     let mut prev_status = String::new();
     let mut last_pass = Instant::now();
     let mut chunk: Vec<f32> = Vec::with_capacity(6400);

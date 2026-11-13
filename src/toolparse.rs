@@ -99,6 +99,16 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
 /// matches the most specific marker first.
 pub const TERMINAL_MARKERS: [&str; 3] = ["<|eot_id|>", "<|eom|>", "<eom>"];
 
+/// Canonical tool-call protocol tags (the spellings ZeroClaw's
+/// tool_call_format protocol block uses), spelled with unicode escapes so
+/// this source file carries no raw tag text — safe under tooling that
+/// treats tag-like spans specially. Consumers (llm.rs prompt builder)
+/// reference these instead of re-spelling the tags.
+pub const TOOL_CALL_OPEN: &str = "\u{3c}tool_call\u{3e}";
+pub const TOOL_CALL_CLOSE: &str = "\u{3c}/tool_call\u{3e}";
+/// Results wrapper named inside the protocol instructions text.
+pub const TOOL_RESULT_OPEN: &str = "\u{3c}tool_result\u{3e}";
+
 /// Strip trailing terminal markers (`<eom>`, `<|eom|>`) from a response string.
 /// Handles stacked markers with arbitrary whitespace between them.
 ///

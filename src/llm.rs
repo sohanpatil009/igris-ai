@@ -14,6 +14,7 @@
 //! request only processes the few tokens spoken since the last ping. The
 //! chat endpoint re-tokenizes per request and defeats that reuse on LFM3.
 
+use crate::toolparse;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
@@ -100,6 +101,127 @@ fn render_prompt(messages: &[Value], final_request: bool) -> String {
         s.push_str("assistant\n");
         s.push_str(GEN_PROMPT);
         s.push('\n');
+    }
+    s
+}
+
+/* ================================================================ */
+/* tool-calling prompt protocol (Phase 2)                           */
+/* ================================================================ */
+
+/// A tool as advertised to the model in the system prompt.
+#[derive(Clone, Debug)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters_schema: Value,
+}
+
+/// Verbatim port of ZeroClaw's `TOOL_CALL_PROTOCOL_INSTRUCTIONS`
+/// (zeroclaw-runtime/src/agent/tool_call_format.rs:39-58), including the
+/// trailing blank line. Tag literals are referenced from the vendored
+/// parser's constants so no raw tag text lives in this source file; the
+/// pinned test asserts the exact bytes.
+fn tool_call_protocol_instructions() -> String {
+    format!(
+        "## Tool Use Protocol\n\n\
+         To use a tool, wrap a JSON object in {open}{close} tags:\n\n\
+         ```\n{open}\n\
+         {{\"name\": \"tool_name\", \"arguments\": {{\"param\": \"value\"}}}}\n\
+         {close}\n\
+         ```\n\n\
+         CRITICAL: Output actual {open} tags\u{2014}never describe steps or give examples.\n\n\
+         Example: User says something that needs a tool. You MUST respond with a real call naming one of your available tools:\n\
+         {open}\n\
+         {{\"name\": \"tool_name\", \"arguments\": {{\"param\": \"value\"}}}}\n\
+         {close}\n\n\
+         You may use multiple tool calls in a single response. After tool execution, results appear in {result} tags. Continue reasoning with the results until you can give a final answer.\n\n",
+        open = toolparse::TOOL_CALL_OPEN,
+        close = toolparse::TOOL_CALL_CLOSE,
+        result = toolparse::TOOL_RESULT_OPEN,
+    )
+}
+
+/// The tool-calling prompt block: the verbatim protocol instructions plus
+/// the `### Available Tools` listing (ZeroClaw's `build_tool_instructions`
+/// shape, zeroclaw-runtime/src/agent/loop_.rs:1358-1383), with specs sorted
+/// by name so the system prompt is byte-stable for the KV cache.
+pub fn tools_protocol_block(specs: &[ToolSpec]) -> String {
+    use std::fmt::Write as _; // String takes fmt::Write, not the io::Write in scope above
+    if specs.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<&ToolSpec> = specs.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut s = String::from("\n");
+    s.push_str(&tool_call_protocol_instructions());
+    s.push_str("### Available Tools\n\n");
+    for spec in sorted {
+        let _ = writeln!(
+            s,
+            "**{}**: {}\nParameters: `{}`\n",
+            spec.name, spec.description, spec.parameters_schema
+        );
+    }
+    s
+}
+
+/// Seed v1 tool schemas (Phase 2 interim: llm.rs owns this list; Phase 3
+/// moves ownership into the src/tools.rs registry, which adds the `run`
+/// implementations and feeds the block from `Registry::specs()`).
+pub fn seed_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec {
+            name: "calculate".to_string(),
+            description: "Evaluate an arithmetic expression and return the result.".to_string(),
+            parameters_schema: json!({
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "Arithmetic expression, e.g. 12*7+3"
+                    }
+                },
+                "required": ["expression"]
+            }),
+        },
+        ToolSpec {
+            name: "get_time".to_string(),
+            description: "Get the current local date and time.".to_string(),
+            parameters_schema: json!({"type": "object", "properties": {}, "required": []}),
+        },
+        ToolSpec {
+            name: "open_app".to_string(),
+            description: "Open one of the allowed desktop applications.".to_string(),
+            parameters_schema: json!({
+                "type": "object",
+                "properties": {
+                    "app": {
+                        "type": "string",
+                        "enum": ["notepad", "calc", "chrome", "spotify", "vscode"],
+                        "description": "Which app to open"
+                    }
+                },
+                "required": ["app"]
+            }),
+        },
+    ]
+}
+
+/// Tools are always on (open decision 4, resolved 2026-11-13); the
+/// `--no-tools` flag or `MOON_NO_TOOLS=1` drops the protocol block so the
+/// assistant behaves exactly as before tool calling existed.
+pub fn tools_enabled(no_tools_flag: bool) -> bool {
+    !no_tools_flag && std::env::var("MOON_NO_TOOLS").is_err()
+}
+
+/// System prompt for a history seed: the `base` persona plus the tool
+/// protocol block when tools are on. Called once at seed time — the system
+/// turn never changes mid-session, keeping the KV-cache prefix stable.
+pub fn system_prompt_with_tools(base: &str, tools_on: bool) -> String {
+    let mut s = String::from(base);
+    if tools_on {
+        s.push_str(&tools_protocol_block(&seed_specs()));
     }
     s
 }
@@ -477,9 +599,16 @@ pub fn chat_stream(
 
 /// One persona turn streamed to the terminal under the minimal `ai:-`
 /// label; tokens print the moment they arrive.
-fn stream_persona(prompt: &str, max_tokens: i64) -> Result<(), Box<dyn std::error::Error>> {
+fn stream_persona(
+    prompt: &str,
+    max_tokens: i64,
+    tools_on: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let messages = [
-        json!({"role": "system", "content": SYSTEM_PROMPT}),
+        json!({
+            "role": "system",
+            "content": system_prompt_with_tools(SYSTEM_PROMPT, tools_on)
+        }),
         json!({"role": "user", "content": prompt}),
     ];
     print!("ai:- ");
@@ -498,19 +627,23 @@ fn stream_persona(prompt: &str, max_tokens: i64) -> Result<(), Box<dyn std::erro
 /// called without arguments. Replies stream token-by-token.
 pub fn cmd_chat(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut force_cpu = false;
+    let mut no_tools = false;
     let mut rest: Vec<&str> = Vec::new();
     for a in args {
         if a == "--cpu" {
             force_cpu = true;
+        } else if a == "--no-tools" {
+            no_tools = true;
         } else {
             rest.push(a.as_str());
         }
     }
+    let tools_on = tools_enabled(no_tools);
     let prompt = rest.join(" ");
     ensure_server(force_cpu)?;
 
     if !prompt.is_empty() {
-        return stream_persona(&prompt, 512);
+        return stream_persona(&prompt, 512, tools_on);
     }
 
     println!("Type a prompt (empty line or 'exit' to quit):");
@@ -525,9 +658,96 @@ pub fn cmd_chat(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if q.is_empty() || q.eq_ignore_ascii_case("exit") || q.eq_ignore_ascii_case("quit") {
             break;
         }
-        if let Err(e) = stream_persona(q, 512) {
+        if let Err(e) = stream_persona(q, 512, tools_on) {
             println!("  error: {e}");
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The upstream protocol block, transcribed independently through
+    /// unicode escapes, pinned byte-for-byte against our runtime
+    /// construction so the "verbatim port" claim stays true.
+    #[test]
+    fn tool_call_protocol_instructions_is_upstream_verbatim() {
+        let open = "\u{3c}tool_call\u{3e}";
+        let close = "\u{3c}/tool_call\u{3e}";
+        let result = "\u{3c}tool_result\u{3e}";
+        let expected = "## Tool Use Protocol\n\n\
+To use a tool, wrap a JSON object in "
+            .to_string()
+            + open
+            + close
+            + " tags:\n\n```\n"
+            + open
+            + "\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n"
+            + close
+            + "\n```\n\nCRITICAL: Output actual "
+            + open
+            + " tags\u{2014}never describe steps or give examples.\n\n\
+Example: User says something that needs a tool. You MUST respond with a real call naming one of your available tools:\n"
+            + open
+            + "\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n"
+            + close
+            + "\n\nYou may use multiple tool calls in a single response. After tool execution, results appear in "
+            + result
+            + " tags. Continue reasoning with the results until you can give a final answer.\n\n";
+        assert_eq!(tool_call_protocol_instructions(), expected);
+    }
+
+    #[test]
+    fn tools_protocol_block_lists_specs_sorted_by_name() {
+        let block = tools_protocol_block(&seed_specs());
+        assert!(block.starts_with("\n## Tool Use Protocol"));
+        assert!(block.contains("### Available Tools"));
+        assert!(block.ends_with("\n\n"));
+        let c = block.find("**calculate**").unwrap();
+        let g = block.find("**get_time**").unwrap();
+        let o = block.find("**open_app**").unwrap();
+        assert!(c < g && g < o);
+        // Every entry carries its schema on a Parameters line.
+        assert_eq!(block.matches("Parameters: `").count(), 3);
+        assert!(block.contains("\"required\":[\"expression\"]"));
+    }
+
+    #[test]
+    fn tools_protocol_block_empty_specs_is_empty() {
+        assert_eq!(tools_protocol_block(&[]), "");
+    }
+
+    #[test]
+    fn system_prompt_with_tools_disabled_is_exactly_base() {
+        assert_eq!(
+            system_prompt_with_tools(VOICE_SYSTEM_PROMPT, false),
+            VOICE_SYSTEM_PROMPT
+        );
+    }
+
+    #[test]
+    fn system_prompt_with_tools_is_deterministic() {
+        let a = system_prompt_with_tools(VOICE_SYSTEM_PROMPT, true);
+        let b = system_prompt_with_tools(VOICE_SYSTEM_PROMPT, true);
+        assert_eq!(a, b);
+        assert!(a.starts_with(VOICE_SYSTEM_PROMPT));
+        assert!(a.contains("## Tool Use Protocol"));
+    }
+
+    #[test]
+    fn seed_schemas_round_trip_through_serde_json() {
+        for spec in seed_specs() {
+            let rendered = spec.parameters_schema.to_string();
+            let back: Value = serde_json::from_str(&rendered)
+                .unwrap_or_else(|e| panic!("schema for {} is not valid JSON: {e}", spec.name));
+            assert_eq!(back, spec.parameters_schema, "schema of {}", spec.name);
+        }
+    }
+
+    #[test]
+    fn tools_enabled_flag_composition() {
+        assert!(!tools_enabled(true));
+    }
 }

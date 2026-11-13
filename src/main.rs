@@ -200,7 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("       {} live [WAV] [--model DIR]", args[0]);
         eprintln!("       {} hotkey [--model DIR]", args[0]);
         eprintln!("       {} chat [PROMPT]", args[0]);
-        eprintln!("       {} assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID] [--cpu]", args[0]);
+        eprintln!("       {} assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID] [--cpu] [--no-tools]", args[0]);
         eprintln!("       {} speak \"TEXT\" [--voice ID]", args[0]);
         eprintln!();
         eprintln!("  live             live microphone transcription");
