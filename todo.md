@@ -22,11 +22,16 @@ untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
 - [x] `cargo test` (parser subset green) → **198 passed / 0 failed / 1 ignored** (the
       ignored one is the pre-existing upstream scanner boundary case), 0.07s
 
-### Phase 2 — prompt protocol (`llm.rs`)
-- [ ] `ToolSpec { name, description, parameters_schema }`
-- [ ] `tools_protocol_block(specs)`: ZeroClaw `TOOL_CALL_PROTOCOL_INSTRUCTIONS` verbatim (`tool_call_format.rs:39-58`) + `### Available Tools`, specs **sorted by name** (byte-stable KV prefix)
-- [ ] Append block to `VOICE_SYSTEM_PROMPT` once at history seed (assist.rs:658); + few-shot example kept
-- [ ] `--no-tools` flag / `MOON_NO_TOOLS=1` → block dropped, behavior = today
+### Phase 2 — prompt protocol (`llm.rs`) — DONE 2026-11-13
+- [x] `ToolSpec { name, description, parameters_schema: serde_json::Value }`
+- [x] `tools_protocol_block(specs)`: ZeroClaw `TOOL_CALL_PROTOCOL_INSTRUCTIONS` verbatim
+      (`tool_call_format.rs:39-58`, byte-pinned by a test that transcribes the block
+      independently) + `### Available Tools`, specs **sorted by name** (byte-stable KV prefix);
+      tag literals come from `toolparse::TOOL_CALL_*` constants so no source file carries raw tags
+- [x] Block appended once at history seed — voice (assist.rs:658) **and** the `chat` path
+      (llm.rs `stream_persona`, which Phase 5's e2e drives); few-shot example kept (the
+      block's fenced example); `render_prompt` unchanged per plan §3.2
+- [x] `--no-tools` flag / `MOON_NO_TOOLS=1` → block dropped, behavior = today (both paths)
 
 ### Phase 3 — dynamic tool registry (`src/tools.rs`, ~350 LOC)
 - [ ] `Registry { tools: Vec<ToolDef> }` — **runtime registry, not a hardcoded table**; `ToolDef { name, desc, schema, run: Box<dyn Fn> }`
@@ -61,10 +66,10 @@ untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
   - [x] terminal markers (`<|eom|>`, `<eom>`, `<|eot_id|>`) stripped trailing (+ stacked);
         mid-text preserved — upstream policy, whitespace-before-marker kept
   - [x] unknown/empty arguments → `{}` not a panic; non-UTF8 safe
-- [ ] **llm.rs (protocol)** — pure functions only (no server):
-  - [ ] `tools_protocol_block`: specs rendered **sorted by name** (byte-stable output for KV prefix)
-  - [ ] block omitted when tools disabled (`--no-tools` / `MOON_NO_TOOLS=1`)
-  - [ ] schema serialization round-trips serde_json
+- [x] **llm.rs (protocol)** — pure functions only (no server):
+  - [x] `tools_protocol_block`: specs rendered **sorted by name** (byte-stable output for KV prefix)
+  - [x] block omitted when tools disabled (`--no-tools` / `MOON_NO_TOOLS=1`)
+  - [x] schema serialization round-trips serde_json (+ byte-verbatim protocol pin)
 - [ ] **tools.rs** — per tool:
   - [ ] `get_time`: output format stable + parseable
   - [ ] `calculate`: correct results; div-by-zero / garbage input → `Err`, not panic
