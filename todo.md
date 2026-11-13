@@ -145,16 +145,51 @@ untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
 
 ### Open decisions (user) — RESOLVED 2026-11-13
 - [x] 1. **Vendored parser** (chosen; nested zeroclaw clone is untracked so vendoring also preserves the source)
-- [x] 2. Seed tool set: **get_time + calculate + open_app** (registry stays dynamic: v1 code → v1.1 `tools.toml` user tools → v3 MCP/WASM)
+- [x] 2. Seed tool set: **get_time + calculate + open_app** (registry stays dynamic: v1 code → v1.1 `tools.toml` user tools → v3 MCP/WASM — MCP/WASM rung superseded 2026-11-13 by the no-MCP decision, see "Roadmap to goal.md" below)
 - [x] 3. `open_app` allowlist: **notepad, calc, chrome, spotify, vscode**
 - [x] 4. **Always-on + `--no-tools` escape** (`MOON_NO_TOOLS=1` too)
 - [x] 5. **rustup update now** → 1.100.0 minimal profile (satisfies workspace `rust-version = 1.96.0`; full `stable` channel update was too slow due to cross-compile std targets)
 
-### Later (v1.1+)
-- [ ] `web_fetch` (ureq, size-capped) · `create_note` (workspace-scoped)
-- [ ] Grammar-constrained tool JSON via llama.cpp `json_schema` param
-- [ ] Spoken confirmation for destructive ops · parallel tools
-- [ ] WASM/MCP plugin bridge (`zeroclaw-plugins`), if ever needed
+### Roadmap to goal.md (no-MCP) — set 2026-11-13
+Decision: goal.md is achieved WITHOUT MCP, external or local (user decision).
+The registry already is an in-process dynamic tool surface — runtime
+register/replace, specs generated into the prompt, timeout-guarded dispatch —
+and `tools.toml` (v1.1) covers extension without recompiling. The old
+"v3 MCP/WASM" rung is replaced by this roadmap; an MCP client becomes a
+someday-optional `mcp_tool` tenant type if a community integration is ever
+preferred over writing it. mem0-rs was evaluated for persistent memory and
+REJECTED (see v1.2).
+
+- [ ] **v1.1 — system & files** (goal.md §1/§3/§5): `file_search`,
+      `read_file`, `create_folder`, `open_url`, `sys_stats`, `media_key`
+      (std + Win32) · `set_volume`, `screenshot` (needs the `windows`-crate
+      decision) · `tools.toml` config-defined tools (commands/URLs, incl.
+      `play_song` → YouTube search URL) — no core change per new tool
+- [ ] **v1.2 — memory** (goal.md §7): own ~150-LOC JSON store (mem0-rs
+      rejected 2026-11-13: single-version crates with double-digit lifetime
+      downloads, stale; mem0-style LLM extraction adds write-time latency +
+      nondeterminism this doesn't need) · `memory_save`, `memory_recall`,
+      `create_note` (workspace-scoped), `activity_log`, `reminder_set` ·
+      must survive restart
+- [ ] **v2 — dev & browser** (goal.md §4/§6): allowlisted `run_command` ·
+      `list_dir`, `content_search` · `web_fetch` (ureq, size-capped) ·
+      `download_file` · `web_search` (one backend decision: DDG HTML vs
+      API key)
+- [ ] **v2.5 — gated actions** (goal.md §1/§3 safety rows): two-step spoken
+      confirm UX in the agent loop (state intent → wait for spoken yes →
+      execute; barge-in interplay) · `close_app` (live-learned 2026-11-13:
+      graceful WM_CLOSE can silently no-op across session/elevation
+      boundaries, force-kill is the fallback, NEVER force unsaved-data apps
+      like Notepad blind) · `delete_file`, `shutdown` · activity log wired
+      into gated actions
+- [ ] **v3 — integrations & agentic** (goal.md §2/§8/§9): `spotify_play`
+      (OAuth + token refresh over ureq) · window control (`focus_window`,
+      `list_windows`) · planner-model decision (bigger GGUF vs cloud
+      fallback; grammar-constrained tool JSON via llama.cpp `json_schema`
+      evaluated here) · parallel tool execution · WhatsApp/email LAST,
+      behind explicit consent (external-approval-bound)
+- [ ] Optional someday: WASM/MCP plugin bridge (`zeroclaw-plugins`) — only
+      as an `mcp_tool` client tenant type, never a dependency of the core
 
 ## Pending (GPU/CPU backend — pre-tool-calling)
 - [x] Test A (`--cpu` → CPU backend ready) — pass
