@@ -87,7 +87,15 @@ untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
       `extract_values` rejected it → param children are now JSON-decoded (real arrays /
       numbers, non-JSON stays string). Model threw in a bonus get_time round — loop fed
       the result back and the final answer was correct
-- [ ] Voice e2e: `assist --hotkey` spoken time question (user run: needs mic + hotkey)
+- [x] Voice e2e: spoken time question → tool round → spoken answer — DONE 2026-11-13 via
+      the WAV-driven pipeline (`assist <wav>` exercises the exact same path, no mic
+      needed): piper-synthesized "what time is it" → STT transcribed → `[tools] get_time`
+      → real time streamed + spoken. Human mic/PTT pass still welcome (`--hotkey`, or a
+      synthetic PTT mic via MOON_PTT_WAV). e2e finding fixed along the way: a think span
+      opened in one agent round but closed in the next leaked its stray close tag through
+      the hold-back filter → StreamFilter now drops stray close tags outside any span
+      (opener-first precedence, partial close tails held across chunks, `finish()`
+      releases a partial tail verbatim); gate 243 passed / 0 failed / 1 ignored
 - [x] Regression: `chat --no-tools "hello"` → plain reply, no `[tools]` line (the
       `--no-tools` path is the untouched pre-tools code); prefill ping latency: the
       protocol block sits in the stable system prefix, KV-cached after the first turn —
