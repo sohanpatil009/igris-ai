@@ -188,6 +188,201 @@ pub fn system_prompt_with_tools(base: &str, tools_on: bool) -> String {
 }
 
 /* ================================================================ */
+/* agent loop (Phase 4): stream -> parse -> dispatch -> results      */
+/* ================================================================ */
+
+/// Tool-round budget per turn (ZeroClaw's `DEFAULT_MAX_TOOL_ITERATIONS`).
+pub const MAX_TOOL_ITERATIONS: usize = 10;
+/// Malformed tool-call retries per turn (ZeroClaw's number).
+pub const MAX_MALFORMED_RETRIES: usize = 2;
+
+/// Loop bookkeeping for one agent turn: the iteration budget and the
+/// malformed-retry budget, kept pure so the caps are unit-testable
+/// without a live server.
+pub struct AgentLoopState {
+    pub rounds: usize,
+    pub retries: usize,
+}
+
+impl AgentLoopState {
+    pub fn new() -> Self {
+        AgentLoopState {
+            rounds: 0,
+            retries: 0,
+        }
+    }
+
+    /// Start the next streamed round; `false` once the iteration budget
+    /// is exhausted.
+    pub fn next_round(&mut self) -> bool {
+        if self.rounds >= MAX_TOOL_ITERATIONS {
+            return false;
+        }
+        self.rounds += 1;
+        true
+    }
+
+    /// Verdict for a streamed reply that parsed to zero tool calls.
+    /// `Some(corrective_user_message)` = append it to history and retry;
+    /// `None` = treat the reply as the final plain answer. A reply WITH
+    /// calls resets the retry budget (the model found the format again).
+    pub fn malformed_verdict(
+        &mut self,
+        raw: &str,
+        calls: &[toolparse::ParsedToolCall],
+    ) -> Option<String> {
+        if !calls.is_empty() {
+            self.retries = 0;
+            return None;
+        }
+        let issue = toolparse::detect_tool_call_parse_issue(raw, calls)?;
+        if self.retries >= MAX_MALFORMED_RETRIES {
+            return None;
+        }
+        self.retries += 1;
+        Some(format!(
+            "Your last response tried to use a tool but was malformed ({issue}). \
+             Reply with exactly one JSON object inside one tool-call tag pair, \
+             naming one of your available tools, or answer in plain words."
+        ))
+    }
+}
+
+/// One executed tool call, as it flows into the results message.
+pub struct ToolOutcome {
+    pub name: String,
+    pub status: String, // "ok" | "error"
+    pub output: String,
+}
+
+/// One tool_result block inside the results user message (the shape the
+/// protocol block promises: results appear in tool_result tags).
+pub fn tool_result_block(name: &str, status: &str, output: &str) -> String {
+    format!(
+        "{}\n{}\n{}\n",
+        toolparse::TOOL_RESULT_OPEN,
+        json!({"name": name, "status": status, "result": output}),
+        toolparse::TOOL_RESULT_CLOSE
+    )
+}
+
+/// The user message that carries tool results back to the model: a
+/// stable `[Tool results]` carrier prefix plus one tool_result block per
+/// executed call. Plain appended text — `render_prompt` needs no change
+/// and the KV-cache prefix stays stable.
+pub fn tool_results_user_message(outcomes: &[ToolOutcome]) -> String {
+    let mut s = String::from("[Tool results]\n");
+    for o in outcomes {
+        s.push_str(&tool_result_block(&o.name, &o.status, &o.output));
+    }
+    s
+}
+
+/// Surface callbacks for [`agent_turn`].
+pub struct StreamSink<'a> {
+    /// Receives only released text (never a tool envelope, think span, or
+    /// terminal marker). Return `false` to cut the stream (barge-in).
+    pub on_released: &'a mut dyn FnMut(&str) -> bool,
+    /// Called before a tool round's calls execute, with the tool names.
+    pub on_tool_round: &'a mut dyn FnMut(&[String]),
+}
+
+/// How an agent turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTurnEnd {
+    /// A plain (tool-free) final reply completed the turn.
+    Final,
+    /// Barge-in cut the stream.
+    Cut,
+    /// The iteration budget ran out while the model kept calling tools.
+    Exhausted,
+}
+
+/// One agent turn on `history` (which already holds the system seed and
+/// the user message): stream a reply with protocol hold-back, parse it,
+/// execute any tool calls against the registry, feed the results back as
+/// a user message, and repeat — until a plain final reply, a barge-in, or
+/// the iteration budget. History only ever grows (each round appends its
+/// raw assistant envelopes and the results message), so every round is a
+/// strict prompt-prefix of the next and `cache_prompt` stays effective.
+pub fn agent_turn(
+    history: &mut Vec<Value>,
+    max_tokens: i64,
+    sink: &mut StreamSink,
+) -> Result<AgentTurnEnd, Box<dyn std::error::Error>> {
+    let registry = tools::registry();
+    let mut state = AgentLoopState::new();
+    while state.next_round() {
+        let msgs = history.clone();
+        let mut filter = toolparse::StreamFilter::new();
+        let mut cut = false;
+        let mut on_tok = |tok: &str| -> bool {
+            let released = filter.feed(tok);
+            if released.is_empty() {
+                return true;
+            }
+            if (sink.on_released)(&released) {
+                true
+            } else {
+                cut = true;
+                false
+            }
+        };
+        let (raw, _first_ms) = chat_stream(&msgs, max_tokens, &mut on_tok)?;
+        if cut {
+            /* parity with the plain path: an interrupted reply still
+             * lands in history (the model sees its own partial output) */
+            let stored = toolparse::strip_trailing_terminal_markers(&raw);
+            if !stored.is_empty() {
+                history.push(json!({"role": "assistant", "content": stored}));
+            }
+            return Ok(AgentTurnEnd::Cut);
+        }
+        let tail = filter.finish();
+        if !tail.is_empty() && !(sink.on_released)(&tail) {
+            return Ok(AgentTurnEnd::Cut);
+        }
+
+        let (_cleaned, calls) = toolparse::parse_tool_calls(&raw);
+        if calls.is_empty() {
+            if let Some(corrective) = state.malformed_verdict(&raw, &calls) {
+                history.push(json!({"role": "assistant", "content": raw}));
+                history.push(json!({"role": "user", "content": corrective}));
+                continue;
+            }
+            let stored = toolparse::strip_trailing_terminal_markers(&raw);
+            if !stored.is_empty() {
+                history.push(json!({"role": "assistant", "content": stored}));
+            }
+            return Ok(AgentTurnEnd::Final);
+        }
+
+        state.retries = 0;
+        let stored = toolparse::strip_trailing_terminal_markers(&raw);
+        history.push(json!({"role": "assistant", "content": stored}));
+        let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
+        (sink.on_tool_round)(&names);
+        let mut outcomes: Vec<ToolOutcome> = Vec::new();
+        for call in &calls {
+            let (status, output) = match registry.dispatch(&call.name, &call.arguments) {
+                Ok(out) => ("ok", out),
+                Err(e) => ("error", e),
+            };
+            outcomes.push(ToolOutcome {
+                name: call.name.clone(),
+                status: status.to_string(),
+                output,
+            });
+        }
+        history.push(json!({
+            "role": "user",
+            "content": tool_results_user_message(&outcomes)
+        }));
+    }
+    Ok(AgentTurnEnd::Exhausted)
+}
+
+/* ================================================================ */
 /* server lifecycle                                                 */
 /* ================================================================ */
 
@@ -565,7 +760,7 @@ fn stream_persona(
     max_tokens: i64,
     tools_on: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let messages = [
+    let mut history: Vec<Value> = vec![
         json!({
             "role": "system",
             "content": system_prompt_with_tools(SYSTEM_PROMPT, tools_on)
@@ -574,13 +769,36 @@ fn stream_persona(
     ];
     print!("ai:- ");
     std::io::stdout().flush()?;
-    let mut on_tok = |tok: &str| -> bool {
-        print!("{tok}");
+    if !tools_on {
+        /* escape hatch: exactly the pre-tools behavior */
+        let mut on_tok = |tok: &str| -> bool {
+            print!("{tok}");
+            let _ = std::io::stdout().flush();
+            true
+        };
+        chat_stream(&history, max_tokens, &mut on_tok)?;
+        println!();
+        return Ok(());
+    }
+
+    let mut on_released = |released: &str| -> bool {
+        print!("{released}");
         let _ = std::io::stdout().flush();
         true
     };
-    let (_reply, _first_ms) = chat_stream(&messages, max_tokens, &mut on_tok)?;
-    println!();
+    let mut on_tool_round = |names: &[String]| {
+        println!("\n[tools] {}", names.join(", "));
+    };
+    let mut sink = StreamSink {
+        on_released: &mut on_released,
+        on_tool_round: &mut on_tool_round,
+    };
+    let end = agent_turn(&mut history, max_tokens, &mut sink)?;
+    if matches!(end, AgentTurnEnd::Exhausted) {
+        println!("\n(gave up after {MAX_TOOL_ITERATIONS} tool rounds)");
+    } else {
+        println!();
+    }
     Ok(())
 }
 
@@ -711,5 +929,72 @@ Example: User says something that needs a tool. You MUST respond with a real cal
     #[test]
     fn tools_enabled_flag_composition() {
         assert!(!tools_enabled(true));
+    }
+
+    /* ---- agent loop glue (Phase 4) ---- */
+
+    #[test]
+    fn agent_loop_iteration_budget_caps_at_ten() {
+        let mut s = AgentLoopState::new();
+        for _ in 0..MAX_TOOL_ITERATIONS {
+            assert!(s.next_round());
+        }
+        assert!(!s.next_round());
+        assert_eq!(s.rounds, MAX_TOOL_ITERATIONS);
+    }
+
+    #[test]
+    fn malformed_retry_budget_caps_at_two() {
+        let mut s = AgentLoopState::new();
+        // Internal envelope-shaped JSON, no tags: deterministically flagged
+        // by detect_tool_call_parse_issue, with nothing recoverable.
+        let raw = "{\"tool_calls\": [{\"name\": \"get_time\", \"arguments\": {}}]}";
+        assert!(s.malformed_verdict(raw, &[]).is_some());
+        assert!(s.malformed_verdict(raw, &[]).is_some());
+        assert!(
+            s.malformed_verdict(raw, &[]).is_none(),
+            "retry budget caps at {MAX_MALFORMED_RETRIES}"
+        );
+        assert_eq!(s.retries, MAX_MALFORMED_RETRIES);
+    }
+
+    #[test]
+    fn a_reply_with_tool_calls_resets_the_retry_budget() {
+        let mut s = AgentLoopState::new();
+        let raw = "{\"tool_calls\": [{\"name\": \"get_time\", \"arguments\": {}}]}";
+        assert!(s.malformed_verdict(raw, &[]).is_some());
+        let call = toolparse::ParsedToolCall {
+            name: "get_time".to_string(),
+            arguments: json!({}),
+            tool_call_id: None,
+        };
+        assert!(s.malformed_verdict(raw, &[call]).is_none());
+        assert_eq!(s.retries, 0);
+        // The budget is spendable again after the reset.
+        assert!(s.malformed_verdict(raw, &[]).is_some());
+    }
+
+    #[test]
+    fn tool_results_user_message_carrier_shape() {
+        let outcomes = vec![
+            ToolOutcome {
+                name: "get_time".to_string(),
+                status: "ok".to_string(),
+                output: "2026-11-13 14:00:00 on Friday".to_string(),
+            },
+            ToolOutcome {
+                name: "nope".to_string(),
+                status: "error".to_string(),
+                output: "unknown tool: nope".to_string(),
+            },
+        ];
+        let msg = tool_results_user_message(&outcomes);
+        assert!(msg.starts_with("[Tool results]\n"));
+        let open_line = format!("\n{}\n", toolparse::TOOL_RESULT_OPEN);
+        assert_eq!(msg.matches(&open_line).count(), 2);
+        assert!(msg.contains("\"name\":\"get_time\""));
+        assert!(msg.contains("\"status\":\"ok\""));
+        assert!(msg.contains("\"status\":\"error\""));
+        assert!(msg.trim_end().ends_with(toolparse::TOOL_RESULT_CLOSE));
     }
 }

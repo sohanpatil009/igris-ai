@@ -71,6 +71,7 @@ struct Asst {
     committed: usize, /* transcript lines already handled            */
     turns: usize,     /* completed user<->llm exchanges              */
     ever_spoken: bool,
+    tools_on: bool,   /* tool-calling protocol active (Phase 4)      */
 }
 
 impl Asst {
@@ -89,6 +90,7 @@ impl Asst {
             committed: 0,
             turns: 0,
             ever_spoken: false,
+            tools_on: false,
         }
     }
 
@@ -312,43 +314,106 @@ fn turn_reply<'k, 'd>(
 
     println!("you :- {text}");
     history.push(json!({"role": "user", "content": text}));
-    let msgs = history.clone();
     print!("ai:- ");
     let _ = io::stdout().flush();
 
     let mut cut = false;
     let mut spoken_buf = String::new();
-    let mut on_tok = |tok: &str| -> bool {
-        let stop = match stop_when.as_mut() {
-            Some(f) => (*f)(),
-            None => false,
-        };
-        if stop {
-            cut = true;
-            /* barge-in kills the in-flight voice as well */
-            if let Some(sp) = tts {
-                sp.stop();
+    if a.tools_on {
+        /* Agent loop (Phase 4): the model may answer with tool calls.
+         * llm::agent_turn streams with protocol hold-back (envelopes,
+         * think spans and terminal markers never reach the voice or the
+         * terminal), executes the calls against the registry, feeds the
+         * results back and re-streams until a plain final reply. */
+        let mut filler_done = false;
+        let mut on_released = |released: &str| -> bool {
+            let stop = match stop_when.as_mut() {
+                Some(f) => (*f)(),
+                None => false,
+            };
+            if stop {
+                cut = true;
+                /* barge-in kills the in-flight voice as well */
+                if let Some(sp) = tts {
+                    sp.stop();
+                }
+                return false;
             }
-            return false;
-        }
-        /* stream complete sentences to the voice while the LLM keeps
-         * generating */
-        if let Some(sp) = tts {
-            spoken_buf.push_str(tok);
-            while let Some(sentence) = tts::take_sentence(&mut spoken_buf) {
-                if let Err(e) = sp.speak(&sentence) {
-                    eprintln!("\r[tts] {e}");
+            /* stream complete sentences to the voice while the LLM keeps
+             * generating */
+            if let Some(sp) = tts {
+                spoken_buf.push_str(released);
+                while let Some(sentence) = tts::take_sentence(&mut spoken_buf) {
+                    if let Err(e) = sp.speak(&sentence) {
+                        eprintln!("\r[tts] {e}");
+                    }
                 }
             }
-        }
-        print!("{tok}");
-        let _ = io::stdout().flush();
-        true
-    };
-    let (reply, _first_ms) = llm::chat_stream(&msgs, 512, &mut on_tok)?;
-    println!();
-    if cut {
+            print!("{released}");
+            let _ = io::stdout().flush();
+            true
+        };
+        let mut on_tool_round = |names: &[String]| {
+            if !filler_done {
+                filler_done = true;
+                /* one short filler per turn, spoken while the tools run */
+                if let Some(sp) = tts {
+                    let _ = sp.speak("ek seconds…");
+                }
+            }
+            println!("\n[tools] {}", names.join(", "));
+        };
+        let mut sink = llm::StreamSink {
+            on_released: &mut on_released,
+            on_tool_round: &mut on_tool_round,
+        };
+        let end = llm::agent_turn(history, 512, &mut sink)?;
         println!();
+        if cut {
+            println!();
+        }
+        if matches!(end, llm::AgentTurnEnd::Exhausted) {
+            if let Some(sp) = tts {
+                let _ = sp.speak("I could not finish that one.");
+            }
+        }
+    } else {
+        let msgs = history.clone();
+        let mut on_tok = |tok: &str| -> bool {
+            let stop = match stop_when.as_mut() {
+                Some(f) => (*f)(),
+                None => false,
+            };
+            if stop {
+                cut = true;
+                /* barge-in kills the in-flight voice as well */
+                if let Some(sp) = tts {
+                    sp.stop();
+                }
+                return false;
+            }
+            /* stream complete sentences to the voice while the LLM keeps
+             * generating */
+            if let Some(sp) = tts {
+                spoken_buf.push_str(tok);
+                while let Some(sentence) = tts::take_sentence(&mut spoken_buf) {
+                    if let Err(e) = sp.speak(&sentence) {
+                        eprintln!("\r[tts] {e}");
+                    }
+                }
+            }
+            print!("{tok}");
+            let _ = io::stdout().flush();
+            true
+        };
+        let (reply, _first_ms) = llm::chat_stream(&msgs, 512, &mut on_tok)?;
+        println!();
+        if cut {
+            println!();
+        }
+        if !reply.is_empty() {
+            history.push(json!({"role": "assistant", "content": reply}));
+        }
     }
     /* The tail after the last terminator is spoken too - unless the turn
      * was cut (barge-in): a hold during the reply means "be quiet and
@@ -364,9 +429,6 @@ fn turn_reply<'k, 'd>(
                 eprintln!("\r[tts] {e}");
             }
         }
-    }
-    if !reply.is_empty() {
-        history.push(json!({"role": "assistant", "content": reply}));
     }
 
     a.partial.clear();
@@ -661,6 +723,7 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     /* ---------- live loop ---------- */
     let mut row = LiveRow::new();
     let mut asst = Asst::new();
+    asst.tools_on = tools_on;
     let mut history: Vec<Value> = vec![json!({
         "role": "system",
         "content": llm::system_prompt_with_tools(llm::VOICE_SYSTEM_PROMPT, tools_on)

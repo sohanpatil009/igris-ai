@@ -108,6 +108,163 @@ pub const TOOL_CALL_OPEN: &str = "\u{3c}tool_call\u{3e}";
 pub const TOOL_CALL_CLOSE: &str = "\u{3c}/tool_call\u{3e}";
 /// Results wrapper named inside the protocol instructions text.
 pub const TOOL_RESULT_OPEN: &str = "\u{3c}tool_result\u{3e}";
+/// Close of the results wrapper (stream filter + carrier blocks).
+pub const TOOL_RESULT_CLOSE: &str = "\u{3c}/tool_result\u{3e}";
+
+/* ================================================================ */
+/* streaming hold-back filter — OUR ADDITION (not vendored)          */
+/*                                                                   */
+/* ZeroClaw's stream_guard concept: tokens go in, only text that can  */
+/* never be part of a tool-call envelope, a think span, or a terminal */
+/* marker comes back out. Protocol-shaped spans are withheld until    */
+/* complete and then dropped, so an envelope is never spoken aloud or */
+/* printed. Parsing still runs on the full raw text, so suppression   */
+/* here can never affect execution. False positives cost a little     */
+/* latency (text releases a chunk late); false negatives would leak   */
+/* protocol text to the voice — the filter is conservative.           */
+/* ================================================================ */
+
+/// A protocol opener found on the stream.
+#[derive(Clone, Copy)]
+enum StreamOpener {
+    /// Open a dropped span that ends at this closer.
+    Span(&'static str),
+    /// Bare drop (terminal marker): only the marker bytes vanish.
+    Marker,
+}
+
+/// Earliest protocol opener in `text`:
+/// `(byte index, opener length, opener)`.
+fn earliest_stream_opener(text: &str) -> Option<(usize, usize, StreamOpener)> {
+    let span_pairs: [(&str, &'static str); 4] = [
+        (THINK_OPEN, THINK_CLOSE),
+        (LFM3_THINK_OPEN, LFM3_THINK_CLOSE),
+        (TOOL_CALL_OPEN, TOOL_CALL_CLOSE),
+        (TOOL_RESULT_OPEN, TOOL_RESULT_CLOSE),
+    ];
+    let mut best: Option<(usize, usize, StreamOpener)> = None;
+    for (open, close) in span_pairs {
+        if let Some(i) = text.find(open) {
+            let better = match &best {
+                Some((bi, _, _)) => i < *bi,
+                None => true,
+            };
+            if better {
+                best = Some((i, open.len(), StreamOpener::Span(close)));
+            }
+        }
+    }
+    for marker in TERMINAL_MARKERS {
+        if let Some(i) = text.find(marker) {
+            let better = match &best {
+                Some((bi, _, _)) => i < *bi,
+                None => true,
+            };
+            if better {
+                best = Some((i, marker.len(), StreamOpener::Marker));
+            }
+        }
+    }
+    best
+}
+
+/// Length of the longest suffix of `text` that is a strict prefix of any
+/// opener tag or terminal marker — the bytes held back across chunk
+/// boundaries. All candidates are ASCII, so matched byte offsets are
+/// always on char boundaries.
+fn stream_holdback_len(text: &str) -> usize {
+    let candidates: [&str; 7] = [
+        THINK_OPEN,
+        LFM3_THINK_OPEN,
+        TOOL_CALL_OPEN,
+        TOOL_RESULT_OPEN,
+        TERMINAL_MARKERS[0],
+        TERMINAL_MARKERS[1],
+        TERMINAL_MARKERS[2],
+    ];
+    let mut max_hold = 0;
+    for tag in candidates {
+        for k in 1..tag.len() {
+            if text.ends_with(&tag[..k]) {
+                max_hold = max_hold.max(k);
+            }
+        }
+    }
+    max_hold
+}
+
+/// Token-in / clean-text-out filter for streamed LLM replies.
+pub struct StreamFilter {
+    pending: String,
+    /// While inside a dropped span: the closer we are waiting for.
+    span_close: Option<&'static str>,
+}
+
+impl Default for StreamFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamFilter {
+    pub fn new() -> Self {
+        StreamFilter {
+            pending: String::new(),
+            span_close: None,
+        }
+    }
+
+    /// Feed one streamed token; returns the text now safe to emit.
+    pub fn feed(&mut self, tok: &str) -> String {
+        self.pending.push_str(tok);
+        self.drain(false)
+    }
+
+    /// End of stream: release anything still releasable. A partial
+    /// opener/marker tail is released verbatim (never lose text); the
+    /// remainder of an unclosed span is dropped (suppression policy).
+    pub fn finish(&mut self) -> String {
+        let out = self.drain(true);
+        self.pending.clear();
+        out
+    }
+
+    fn drain(&mut self, at_end: bool) -> String {
+        let mut out = String::new();
+        loop {
+            if let Some(close) = self.span_close {
+                if let Some(j) = self.pending.find(close) {
+                    self.pending.drain(..j + close.len());
+                    self.span_close = None;
+                    continue;
+                }
+                /* span continues in later tokens; dropped at finish */
+                break;
+            }
+            match earliest_stream_opener(&self.pending) {
+                Some((i, open_len, opener)) => {
+                    out.push_str(&self.pending[..i]);
+                    if let StreamOpener::Span(close) = opener {
+                        self.span_close = Some(close);
+                    }
+                    self.pending.drain(..i + open_len);
+                }
+                None => {
+                    let hold = if at_end {
+                        0
+                    } else {
+                        stream_holdback_len(&self.pending)
+                    };
+                    let release = self.pending.len() - hold;
+                    out.push_str(&self.pending[..release]);
+                    self.pending.drain(..release);
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
 
 /// Strip trailing terminal markers (`<eom>`, `<|eom|>`) from a response string.
 /// Handles stacked markers with arbitrary whitespace between them.
@@ -5661,5 +5818,92 @@ Let me check the result."#;
             strip_trailing_terminal_markers("a <|eot_id|> b"),
             "a <|eot_id|> b"
         );
+    }
+
+    /* ---- streaming hold-back filter (our addition) ---- */
+
+    #[test]
+    fn stream_filter_passes_plain_prose_immediately() {
+        let mut f = StreamFilter::new();
+        assert_eq!(f.feed("Hello there, "), "Hello there, ");
+        assert_eq!(f.feed("friend."), "friend.");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn stream_filter_suppresses_a_complete_tool_call_envelope() {
+        let mut f = StreamFilter::new();
+        assert_eq!(f.feed("Sure. "), "Sure. ");
+        assert_eq!(f.feed(&format!("{}{{\"name\"", TOOL_CALL_OPEN)), "");
+        assert_eq!(f.feed(":\"get_time\",\"arguments\":{}}}"), "");
+        assert_eq!(f.feed(&format!("{} done", TOOL_CALL_CLOSE)), " done");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn stream_filter_suppresses_think_spans_on_the_stream() {
+        let mut f = StreamFilter::new();
+        assert_eq!(
+            f.feed(&format!("{}reasoning{}", THINK_OPEN, THINK_CLOSE)),
+            ""
+        );
+        assert_eq!(f.feed("answer"), "answer");
+        assert_eq!(f.feed(&format!("{}hidden", LFM3_THINK_OPEN)), "");
+        assert_eq!(f.feed(&format!("{}shown", LFM3_THINK_CLOSE)), "shown");
+    }
+
+    #[test]
+    fn stream_filter_drops_terminal_markers_across_chunks() {
+        let mut f = StreamFilter::new();
+        assert_eq!(f.feed("Bye\x3c|eo"), "Bye");
+        assert_eq!(f.feed("t_id|>"), "");
+        assert_eq!(f.feed(" next"), " next");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn stream_filter_holds_partial_opener_then_completes_span() {
+        let mut f = StreamFilter::new();
+        assert_eq!(f.feed("wait for it\x3ctoo"), "wait for it");
+        assert_eq!(f.feed("l_call>x"), "");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn stream_filter_finish_releases_partial_tail_and_drops_open_span() {
+        let mut f = StreamFilter::new();
+        assert_eq!(f.feed("text\x3ctoo"), "text");
+        assert_eq!(f.finish(), "\x3ctoo");
+        let mut g = StreamFilter::new();
+        assert_eq!(g.feed(&format!("{}{{\"a\"", TOOL_CALL_OPEN)), "");
+        assert_eq!(g.finish(), "");
+    }
+
+    #[test]
+    fn stream_filter_suppresses_stray_tool_result_blocks() {
+        let mut f = StreamFilter::new();
+        let block = format!(
+            "{}{}{}",
+            TOOL_RESULT_OPEN,
+            "{\"name\": \"get_time\", \"status\": \"ok\", \"result\": \"now\"}",
+            TOOL_RESULT_CLOSE
+        );
+        let mut released = String::new();
+        released.push_str(&f.feed(&format!("ok {block} bye")));
+        released.push_str(&f.finish());
+        assert_eq!(released, "ok  bye");
+    }
+
+    #[test]
+    fn stream_filter_envelope_spanning_char_by_char_never_leaks() {
+        let mut f = StreamFilter::new();
+        let args = "{\"name\":\"get_time\",\"arguments\":{\"x\":1}}";
+        let full = format!("A: {}{}{} well done", TOOL_CALL_OPEN, args, TOOL_CALL_CLOSE);
+        let mut released = String::new();
+        for c in full.chars() {
+            released.push_str(&f.feed(&c.to_string()));
+        }
+        released.push_str(&f.finish());
+        assert_eq!(released, "A:  well done");
     }
 }
