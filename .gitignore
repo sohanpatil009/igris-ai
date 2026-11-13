@@ -12,3 +12,4 @@ mic_transcribe.obj
 build_log.txt
 run_out.txt
 run_err.txt
+/zeroclaw/

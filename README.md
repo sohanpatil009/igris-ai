@@ -1,4 +1,4 @@
-# moonshine-test
+# igris-ai
 
 Rust test harness for checking **Moonshine Small (streaming)** and **Moonshine Medium (streaming)** speech-to-text speed and accuracy on your own machine.
 
@@ -36,7 +36,7 @@ Output for each model:
 cargo run --release -- live
 ```
 
-(or run the built binary directly from the repo root: `target\release\moonshine-test.exe live`)
+(or run the built binary directly from the repo root: `target\release\igris-ai.exe live`)
 
 Add `--model models/medium-streaming` to run the medium streaming model instead
 of small (the architecture is inferred from the directory name); e.g.

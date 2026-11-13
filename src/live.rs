@@ -1,4 +1,4 @@
-//! `moonshine-test live [WAV] [--model DIR]`
+//! `igris-ai live [WAV] [--model DIR]`
 //!
 //! Live streaming transcription in pure Rust on top of `moonshine-rs` +
 //! `cpal` — a port of the C tool `mic_transcribe.c`. The status row shows

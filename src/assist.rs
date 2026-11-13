@@ -1,4 +1,4 @@
-//! `moonshine-test assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID] [--cpu] [--no-tools]`
+//! `igris-ai assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID] [--cpu] [--no-tools]`
 //!
 //! Live voice assistant: Moonshine streaming STT + the local LLM through
 //! llama.cpp. While the user is still speaking, every growth of the

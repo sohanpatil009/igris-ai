@@ -1,4 +1,4 @@
-# Problem Log — moonshine-test
+# Problem Log — igris-ai
 
 Dated log of problems hit during development, with root cause and fix, so
 they can be recognised quickly if they ever come back. Newest entries on top.
@@ -11,7 +11,7 @@ they can be recognised quickly if they ever come back. Newest entries on top.
 
 ```
 The requested API version [23] is not available, only API versions [1, 17] are supported in this build. Current ORT Version is: 1.17.1
-error: process didn't exit successfully: `target\release\moonshine-test.exe assist --hotkey` (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)
+error: process didn't exit successfully: `target\release\igris-ai.exe assist --hotkey` (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)
 ```
 
 - Happened right after `cargo clean` + a fresh 3m12s rebuild.

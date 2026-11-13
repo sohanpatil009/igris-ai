@@ -613,6 +613,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "igris-ai"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cpal",
+ "moonshine-rs",
+ "regex",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -806,18 +818,6 @@ dependencies = [
  "cmake",
  "flate2",
  "tar",
- "ureq",
-]
-
-[[package]]
-name = "moonshine-test"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "cpal",
- "moonshine-rs",
- "regex",
- "serde_json",
  "ureq",
 ]
 

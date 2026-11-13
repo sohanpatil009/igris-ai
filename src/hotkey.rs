@@ -1,4 +1,4 @@
-//! `moonshine-test hotkey [--model DIR]`
+//! `igris-ai hotkey [--model DIR]`
 //!
 //! Push-to-talk driven by a global keyboard hook: hold CTRL+SPACE on any
 //! application — audio is captured and fed to Moonshine. Release the keys

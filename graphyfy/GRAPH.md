@@ -1,4 +1,4 @@
-# GRAPH — moonshine-test
+# GRAPH — igris-ai
 Generated: 2026-11-12 | 7 source files | 4,259 LOC | mode: full
 
 Terminal voice assistant: streaming Moonshine STT → LFM3-1.7B LLM (llama.cpp,

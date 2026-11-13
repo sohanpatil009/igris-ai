@@ -1,4 +1,4 @@
-# Tool-Calling Integration Plan — moonshine-test × ZeroClaw
+# Tool-Calling Integration Plan — igris-ai × ZeroClaw
 
 Date: 2026-11-12 · Status: **PROPOSAL (awaiting review)** · Sources: two
 verified deep-dives of `E:\major_project\igris\zeroclaw` (v0.9.0) + this
@@ -21,7 +21,7 @@ small, high-value parts:
 
 **We do NOT link** `zeroclaw-runtime` (424k LOC), `zeroclaw-channels`,
 `zeroclaw-gateway`, `zeroclaw-memory`, or `zeroclaw-providers`. The final
-artifact stays **one binary** (`moonshine-test.exe`); llama-server and piper
+artifact stays **one binary** (`igris-ai.exe`); llama-server and piper
 remain the only child processes. No tokio — everything stays on the
 current blocking/threads architecture.
 

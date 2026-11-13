@@ -1952,7 +1952,7 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
 /// Parse GLM-style tool calls from response text.
 /// Vendored: alias table trimmed to identity. ZeroClaw's tool vocabulary
-/// (shell/file/memory aliases) does not apply to moonshine-test's registry —
+/// (shell/file/memory aliases) does not apply to igris-ai's registry —
 /// unknown tool names are filtered against the registry at dispatch time.
 /// Only the dotted-prefix strip (`provider.name` -> `name`) is kept.
 fn map_tool_name_alias(tool_name: &str) -> &str {

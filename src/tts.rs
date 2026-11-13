@@ -1,7 +1,7 @@
 //! TTS through the piper.exe runtime bundled in `models/piper/`.
 //!
 //! Exposes two things:
-//! - the `speak` subcommand (`moonshine-test speak "some text"`), and
+//! - the `speak` subcommand (`igris-ai speak "some text"`), and
 //! - `Speaker`, the streaming voice backend `assist` uses to read replies
 //!   aloud sentence-by-sentence while the LLM is still generating.
 //!
@@ -1035,7 +1035,7 @@ pub fn cmd_speak(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let text = words.join(" ");
     if text.trim().is_empty() {
-        eprintln!("Usage: moonshine-test speak \"TEXT\" [--voice ID]");
+        eprintln!("Usage: igris-ai speak \"TEXT\" [--voice ID]");
         eprintln!();
         eprintln!("  Synthesizes TEXT through a piper voice from {VOICE_DIR}");
         eprintln!("  (auto-downloaded on first run) and plays it.");
