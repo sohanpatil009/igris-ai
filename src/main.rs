@@ -12,6 +12,7 @@ mod assist;
 mod hotkey;
 mod llm;
 mod live;
+mod toolparse;
 mod tts;
 
 const MODELS: &[(&str, ModelArch, &str)] = &[

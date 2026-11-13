@@ -477,7 +477,7 @@ fn push_silence(inner: &Inner, dst_rate: u32, secs: f32) {
 fn dec_pending(inner: &Inner) {
     let _ = inner
         .pending
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1)));
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1)));
 }
 
 /* MOON_TTS_DEBUG: ring-bound audio lands here (f32le, device rate) so
