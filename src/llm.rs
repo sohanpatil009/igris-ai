@@ -15,6 +15,7 @@
 //! chat endpoint re-tokenizes per request and defeats that reuse on LFM3.
 
 use crate::toolparse;
+use crate::tools;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
@@ -166,48 +167,6 @@ pub fn tools_protocol_block(specs: &[ToolSpec]) -> String {
     s
 }
 
-/// Seed v1 tool schemas (Phase 2 interim: llm.rs owns this list; Phase 3
-/// moves ownership into the src/tools.rs registry, which adds the `run`
-/// implementations and feeds the block from `Registry::specs()`).
-pub fn seed_specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec {
-            name: "calculate".to_string(),
-            description: "Evaluate an arithmetic expression and return the result.".to_string(),
-            parameters_schema: json!({
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "Arithmetic expression, e.g. 12*7+3"
-                    }
-                },
-                "required": ["expression"]
-            }),
-        },
-        ToolSpec {
-            name: "get_time".to_string(),
-            description: "Get the current local date and time.".to_string(),
-            parameters_schema: json!({"type": "object", "properties": {}, "required": []}),
-        },
-        ToolSpec {
-            name: "open_app".to_string(),
-            description: "Open one of the allowed desktop applications.".to_string(),
-            parameters_schema: json!({
-                "type": "object",
-                "properties": {
-                    "app": {
-                        "type": "string",
-                        "enum": ["notepad", "calc", "chrome", "spotify", "vscode"],
-                        "description": "Which app to open"
-                    }
-                },
-                "required": ["app"]
-            }),
-        },
-    ]
-}
-
 /// Tools are always on (open decision 4, resolved 2026-11-13); the
 /// `--no-tools` flag or `MOON_NO_TOOLS=1` drops the protocol block so the
 /// assistant behaves exactly as before tool calling existed.
@@ -218,10 +177,12 @@ pub fn tools_enabled(no_tools_flag: bool) -> bool {
 /// System prompt for a history seed: the `base` persona plus the tool
 /// protocol block when tools are on. Called once at seed time — the system
 /// turn never changes mid-session, keeping the KV-cache prefix stable.
+/// Specs come from the tool registry (src/tools.rs), the single owner of
+/// the tool list.
 pub fn system_prompt_with_tools(base: &str, tools_on: bool) -> String {
     let mut s = String::from(base);
     if tools_on {
-        s.push_str(&tools_protocol_block(&seed_specs()));
+        s.push_str(&tools_protocol_block(&tools::registry().specs()));
     }
     s
 }
@@ -701,7 +662,7 @@ Example: User says something that needs a tool. You MUST respond with a real cal
 
     #[test]
     fn tools_protocol_block_lists_specs_sorted_by_name() {
-        let block = tools_protocol_block(&seed_specs());
+        let block = tools_protocol_block(&tools::registry().specs());
         assert!(block.starts_with("\n## Tool Use Protocol"));
         assert!(block.contains("### Available Tools"));
         assert!(block.ends_with("\n\n"));
@@ -711,7 +672,8 @@ Example: User says something that needs a tool. You MUST respond with a real cal
         assert!(c < g && g < o);
         // Every entry carries its schema on a Parameters line.
         assert_eq!(block.matches("Parameters: `").count(), 3);
-        assert!(block.contains("\"required\":[\"expression\"]"));
+        // The calculate tenant's structured schema is advertised.
+        assert!(block.contains("\"required\":[\"function\"]"));
     }
 
     #[test]
@@ -737,8 +699,8 @@ Example: User says something that needs a tool. You MUST respond with a real cal
     }
 
     #[test]
-    fn seed_schemas_round_trip_through_serde_json() {
-        for spec in seed_specs() {
+    fn registry_schemas_round_trip_through_serde_json() {
+        for spec in tools::registry().specs() {
             let rendered = spec.parameters_schema.to_string();
             let back: Value = serde_json::from_str(&rendered)
                 .unwrap_or_else(|e| panic!("schema for {} is not valid JSON: {e}", spec.name));

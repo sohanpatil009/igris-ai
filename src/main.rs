@@ -13,6 +13,7 @@ mod hotkey;
 mod llm;
 mod live;
 mod toolparse;
+mod tools;
 mod tts;
 
 const MODELS: &[(&str, ModelArch, &str)] = &[
