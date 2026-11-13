@@ -278,6 +278,25 @@ pub fn tool_results_user_message(outcomes: &[ToolOutcome]) -> String {
     s
 }
 
+/// Collapse a parsed call list down to unique calls: a degenerate model
+/// reply can loop its envelope several times, and executing the same
+/// call twice would, e.g., open the app twice. Signature = name +
+/// canonicalized (key-sorted) arguments, using upstream's canonicalizer.
+pub fn dedup_tool_calls(calls: Vec<toolparse::ParsedToolCall>) -> Vec<toolparse::ParsedToolCall> {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut unique = Vec::with_capacity(calls.len());
+    for call in calls {
+        let sig = (
+            call.name.clone(),
+            toolparse::canonicalize_json_for_tool_signature(&call.arguments).to_string(),
+        );
+        if seen.insert(sig) {
+            unique.push(call);
+        }
+    }
+    unique
+}
+
 /// Surface callbacks for [`agent_turn`].
 pub struct StreamSink<'a> {
     /// Receives only released text (never a tool envelope, think span, or
@@ -329,6 +348,12 @@ pub fn agent_turn(
             }
         };
         let (raw, _first_ms) = chat_stream(&msgs, max_tokens, &mut on_tok)?;
+        if std::env::var_os("MOON_DEBUG_RAW").is_some() {
+            /* angle brackets escaped so the dump can be read safely in
+             * logs/terminals where tag-like text is a parsing hazard */
+            let escaped = raw.replace('\u{3c}', "\\x3c");
+            eprintln!("[debug] round {} raw: {escaped}", state.rounds);
+        }
         if cut {
             /* parity with the plain path: an interrupted reply still
              * lands in history (the model sees its own partial output) */
@@ -357,6 +382,9 @@ pub fn agent_turn(
             return Ok(AgentTurnEnd::Final);
         }
 
+        // De-duplicate repeated identical calls before dispatch: a
+        // degenerate reply can loop its envelope several times.
+        let calls = dedup_tool_calls(calls);
         state.retries = 0;
         let stored = toolparse::strip_trailing_terminal_markers(&raw);
         history.push(json!({"role": "assistant", "content": stored}));
@@ -972,6 +1000,30 @@ Example: User says something that needs a tool. You MUST respond with a real cal
         assert_eq!(s.retries, 0);
         // The budget is spendable again after the reset.
         assert!(s.malformed_verdict(raw, &[]).is_some());
+    }
+
+    #[test]
+    fn dedup_tool_calls_collapses_repeated_identical_calls() {
+        let g = || toolparse::ParsedToolCall {
+            name: "get_time".to_string(),
+            arguments: json!({}),
+            tool_call_id: None,
+        };
+        let c = toolparse::ParsedToolCall {
+            name: "calculate".to_string(),
+            arguments: json!({"expression": "2+2"}),
+            tool_call_id: None,
+        };
+        let mut c2 = c.clone();
+        c2.arguments = json!({"expression": "7*6"});
+        let out = dedup_tool_calls(vec![g(), c, g(), c2, g()]);
+        // Two duplicate get_time calls collapse; the distinct calculate
+        // calls (different args = different signature) both survive.
+        assert_eq!(out.len(), 3, "out: {out:?}");
+        assert_eq!(out[0].name, "get_time");
+        assert_eq!(out[1].name, "calculate");
+        assert_eq!(out[1].arguments["expression"], "2+2");
+        assert_eq!(out[2].arguments["expression"], "7*6");
     }
 
     #[test]

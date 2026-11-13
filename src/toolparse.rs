@@ -1166,6 +1166,80 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
     if calls.is_empty() { None } else { Some(calls) }
 }
 
+/* OUR ADDITION (not vendored): LFM3-1.7B prompt-guided mode. The model
+ * reliably wraps calls in the tool-call tag pair but writes the body in
+ * an XML-attribute style the stock JSON/XML/GLM parsers do not cover:
+ *   O: `function=NAME` open + immediate close (parameterless call)
+ *   O: `function=NAME` open + `parameter=KEY` children + close
+ * Accept it so such a call is not dropped; JSON bodies still take
+ * precedence because the stock fallbacks run first. */
+static FUNCTION_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)\x3cfunction\s*=\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*>(.*?)\x3c/\s*function\s*>"#)
+        .expect("FUNCTION_ATTR_RE regex must compile")
+});
+
+static PARAM_ATTR_EQ_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)\x3cparameter\s*=\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*>(.*?)\x3c/\s*parameter\s*>"#)
+        .expect("PARAM_ATTR_EQ_RE regex must compile")
+});
+
+/// Parse `function=NAME` attribute-style bodies (see block above).
+/// Parameter children are accepted in both `parameter=KEY` and
+/// MiniMax `parameter name="KEY"` spellings; values are strings.
+fn parse_function_attr_calls(body: &str) -> Option<Vec<ParsedToolCall>> {
+    let mut calls = Vec::new();
+    for cap in FUNCTION_ATTR_RE.captures_iter(body) {
+        let Some(name) = cap.get(1) else {
+            continue;
+        };
+        let name = name.as_str().trim();
+        if name.is_empty() {
+            continue;
+        }
+        let inner = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        let mut args = serde_json::Map::new();
+        for p in PARAM_ATTR_EQ_RE.captures_iter(inner) {
+            let (Some(k), Some(v)) = (p.get(1), p.get(2)) else {
+                continue;
+            };
+            let key = k.as_str().trim();
+            let value = v.as_str().trim();
+            if !key.is_empty() && !value.is_empty() {
+                /* child text that is itself JSON (numbers, arrays,
+                 * objects) becomes a real JSON value; anything else
+                 * stays a string */
+                let val = serde_json::from_str::<serde_json::Value>(value)
+                    .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+                args.insert(key.to_string(), val);
+            }
+        }
+        for p in MINIMAX_PARAMETER_RE.captures_iter(inner) {
+            let key = p
+                .get(1)
+                .or_else(|| p.get(2))
+                .map(|m| m.as_str().trim().to_string());
+            let value = p.get(3).map(|m| m.as_str().trim().to_string());
+            if let (Some(k), Some(v)) = (key, value) {
+                if !k.is_empty() && !v.is_empty() {
+                    let val = serde_json::from_str::<serde_json::Value>(&v)
+                        .unwrap_or_else(|_| serde_json::Value::String(v));
+                    args.insert(k, val);
+                }
+            }
+        }
+        calls.push(ParsedToolCall {
+            name: map_tool_name_alias(name).to_string(),
+            arguments: serde_json::Value::Object(args),
+            tool_call_id: None,
+        });
+    }
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
 /// Parse MiniMax-style XML tool calls with attributed invoke/parameter tags.
 fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolCall>)> {
     let mut calls = Vec::new();
@@ -2425,6 +2499,15 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 // GLM-style shortened body: `shell>uname -a` or `shell\ncommand: date`
                 if let Some(glm_call) = parse_glm_shortened_body(inner) {
                     calls.push(glm_call);
+                    parsed_any = true;
+                }
+            }
+
+            if !parsed_any {
+                // OUR ADDITION: LFM3 function-attribute bodies
+                // (parse_function_attr_calls, see block above).
+                if let Some(attr_calls) = parse_function_attr_calls(inner) {
+                    calls.extend(attr_calls);
                     parsed_any = true;
                 }
             }
@@ -5905,5 +5988,85 @@ Let me check the result."#;
         }
         released.push_str(&f.finish());
         assert_eq!(released, "A:  well done");
+    }
+
+    /* ---- LFM3 function-attribute bodies (our addition) ---- */
+
+    #[test]
+    fn parse_tool_calls_accepts_lfm3_parameterless_function_attr_body() {
+        // The exact shape LFM3-1.7B emitted in the Phase 5 e2e dump: the
+        // tool-call wrapper with an attribute-style, body-less function
+        // element.
+        let raw = format!(
+            "{}\n{}\n{}\n{}\n",
+            TOOL_CALL_OPEN,
+            "\u{3c}function=get_time\u{3e}",
+            "\u{3c}/function\u{3e}",
+            TOOL_CALL_CLOSE
+        );
+        let (_cleaned, calls) = parse_tool_calls(&raw);
+        assert_eq!(calls.len(), 1, "calls: {calls:?}");
+        assert_eq!(calls[0].name, "get_time");
+        assert_eq!(calls[0].arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn parse_tool_calls_accepts_lfm3_attributed_function_body_with_params() {
+        let raw = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            TOOL_CALL_OPEN,
+            "\u{3c}function=calculate\u{3e}",
+            "\u{3c}parameter=expression\u{3e}2+2\u{3c}/parameter\u{3e}",
+            "\u{3c}/function\u{3e}",
+            TOOL_CALL_CLOSE
+        );
+        let (_cleaned, calls) = parse_tool_calls(&raw);
+        assert_eq!(calls.len(), 1, "calls: {calls:?}");
+        assert_eq!(calls[0].name, "calculate");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"expression": "2+2"})
+        );
+    }
+
+    #[test]
+    fn parse_function_attr_calls_accepts_minimax_parameter_children() {
+        let body = format!(
+            "\u{3c}function=open_app\u{3e}\n\u{3c}parameter name=\"app\"\u{3e}notepad\u{3c}/parameter\u{3e}\n\u{3c}/function\u{3e}"
+        );
+        let calls = parse_function_attr_calls(&body).expect("attributed call must parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "open_app");
+        assert_eq!(calls[0].arguments, serde_json::json!({"app": "notepad"}));
+    }
+
+    #[test]
+    fn parse_function_attr_params_decode_json_children() {
+        // calculate speaks upstream's {function, values} schema; the
+        // parameter children arrive as text and must become real JSON
+        // (an array for values, a string for the function name).
+        let body = format!(
+            "\u{3c}function=calculate\u{3e}\n\u{3c}parameter=function\u{3e}add\u{3c}/parameter\u{3e}\n\u{3c}parameter=values\u{3e}[2, 2]\u{3c}/parameter\u{3e}\n\u{3c}/function\u{3e}"
+        );
+        let calls = parse_function_attr_calls(&body).expect("call must parse");
+        assert_eq!(calls[0].arguments,
+            serde_json::json!({"function": "add", "values": [2, 2]}));
+    }
+
+    #[test]
+    fn parse_tool_calls_returns_every_lfm3_envelope_for_loop_dedup() {
+        let one = format!(
+            "{}\n{}\n{}\n{}\n",
+            TOOL_CALL_OPEN,
+            "\u{3c}function=get_time\u{3e}",
+            "\u{3c}/function\u{3e}",
+            TOOL_CALL_CLOSE
+        );
+        let raw = format!("{one}{one}{one}");
+        let (_cleaned, calls) = parse_tool_calls(&raw);
+        assert_eq!(calls.len(), 3, "calls: {calls:?}");
+        for c in &calls {
+            assert_eq!(c.name, "get_time");
+        }
     }
 }
