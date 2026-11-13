@@ -33,13 +33,23 @@ untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
       block's fenced example); `render_prompt` unchanged per plan §3.2
 - [x] `--no-tools` flag / `MOON_NO_TOOLS=1` → block dropped, behavior = today (both paths)
 
-### Phase 3 — dynamic tool registry (`src/tools.rs`, ~350 LOC)
-- [ ] `Registry { tools: Vec<ToolDef> }` — **runtime registry, not a hardcoded table**; `ToolDef { name, desc, schema, run: Box<dyn Fn> }`
-- [ ] `specs()` (sorted → prompt block) + `dispatch(name, args)`; unknown name → error result
-- [ ] Seed set v1 (registry tenants): `get_time` · `calculate` (port pattern of `zeroclaw-tools/src/calculator.rs`) · `open_app` (hard allowlist via `std::process::Command`, no shell)
-- [ ] Dynamism ladder: v1 code-registered → v1.1 **`tools.toml` config-defined tools** (name/desc/schema + allowlisted command template, `{arg}` substitution, no recompile) → v3 MCP/WASM (ZeroClaw plugins pattern)
-- [ ] Security: no arbitrary shell v1 · allowlist consts · per-tool timeout → error result · sequential only
-- [ ] Unit tests per tool
+### Phase 3 — dynamic tool registry (`src/tools.rs`) — DONE 2026-11-13
+- [x] `Registry { tools: Vec<ToolDef> }` — **runtime registry, not a hardcoded table**;
+      `ToolDef { name, desc, schema, run: Arc<dyn Fn + Send + Sync> }` (**Arc not Box** — the
+      timeout dispatch moves the closure onto a worker thread, which needs Send+Sync)
+- [x] `specs()` (sorted → prompt block) + `dispatch(name, args)`; unknown name → error result;
+      `register()` replaces a same-name tenant (overrides groundwork)
+- [x] Seed set v1 (registry tenants): `get_time` · `calculate` (port pattern of
+      `zeroclaw-tools/src/calculator.rs`, 13-function voice subset) · `open_app` (hard
+      allowlist via `std::process::Command`, no shell); `registry()` LazyLock singleton feeds
+      both prompt surfaces — llm.rs Phase-2 interim `seed_specs()` removed, one owner
+- [x] Dynamism ladder designed: v1 code-registered (done) → v1.1 **`tools.toml`
+      config-defined tools** (name/desc/schema + allowlisted command template, `{arg}`
+      substitution, no recompile) → v3 MCP/WASM (ZeroClaw plugins pattern) — documented in
+      the tools.rs module header; v1.1/v3 are future phases
+- [x] Security: no arbitrary shell v1 · allowlist consts · per-tool 5s timeout → error
+      result · sequential only
+- [x] Unit tests per tool (17 new)
 
 ### Phase 4 — agent loop (`turn_reply`, assist.rs)
 - [ ] Iteration loop, max 10 (ZeroClaw `DEFAULT_MAX_TOOL_ITERATIONS`)
@@ -70,11 +80,13 @@ untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
   - [x] `tools_protocol_block`: specs rendered **sorted by name** (byte-stable output for KV prefix)
   - [x] block omitted when tools disabled (`--no-tools` / `MOON_NO_TOOLS=1`)
   - [x] schema serialization round-trips serde_json (+ byte-verbatim protocol pin)
-- [ ] **tools.rs** — per tool:
-  - [ ] `get_time`: output format stable + parseable
-  - [ ] `calculate`: correct results; div-by-zero / garbage input → `Err`, not panic
-  - [ ] `open_app`: allowlisted name launches; **non-allowlisted → Err**; empty args → Err
-  - [ ] timeout wrapper: hung tool → error result within budget
+- [x] **tools.rs** — per tool:
+  - [x] `get_time`: output format stable + parseable (regex-pinned)
+  - [x] `calculate`: correct results; div-by-zero / garbage input → `Err`, not panic
+  - [x] `open_app`: non-allowlisted → Err; empty args → Err; allowlist coverage +
+        install-path candidates asserted (**real GUI launch deferred to Phase 5 e2e** —
+        unit tests never spawn an allowed app)
+  - [x] timeout wrapper: hung tool → error result within budget; panicking tool → "crashed" error
 - [ ] **assist.rs (loop glue)** — test the pure pieces:
   - [ ] call filtering against registry (unknown name → error result, not crash)
   - [ ] tool_result user-message carrier shape (`[Tool results]` + `status="ok|error"` blocks)
