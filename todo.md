@@ -3,21 +3,24 @@
 ## Tool Calling (ZeroClaw integration)
 
 Full details + evidence: `tool_calling_plan.md` · ZeroClaw graphs:
-`E:\major_project\igris\zeroclaw\graphyfy\GRAPH.md` · this repo's graph:
-`graphyfy/GRAPH.md`
+`E:\major_project\igris\moonshine-test\zeroclaw\graphyfy\GRAPH.md` (nested clone,
+untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
 
-### Phase 0 — toolchain
-- [ ] `rustup update` → rustc 1.96 (parser is edition 2024; local is 1.95)
-- [ ] Sanity: `cargo check -p zeroclaw-tool-call-parser` inside `E:\major_project\igris\zeroclaw`
+### Phase 0 — toolchain — DONE 2026-11-13
+- [x] rustup update → rustc **1.100.0** default (minimal profile; parser needs ≥1.96, workspace pins 1.96.0)
+- [x] Sanity: `cargo check -p zeroclaw-tool-call-parser` inside
+      `E:\major_project\igris\moonshine-test\zeroclaw` (nested clone — parser
+      lives there, NOT the old sibling path) → **pass** (2m04s)
 
-### Phase 1 — vendored parser (`src/toolparse.rs`)
-- [ ] Copy `zeroclaw/crates/zeroclaw-tool-call-parser/src/lib.rs` (~2.7k LOC) → `src/toolparse.rs`; keep trimmed test subset
-- [ ] Header: upstream path + commit + `MIT OR Apache-2.0` notice
-- [ ] Own `strip_think_tags` (port of `api/src/model_provider.rs:237-254`) **+ LFM3 think spans** (`<Token 1437>` … `<Token 9550>`)
-- [ ] Stub the 2 `zeroclaw_log` warns (lib.rs 2230 / 2426, helper 1870)
-- [ ] Trim `map_tool_name_alias` → identity + our names
-- [ ] Add `regex = "1"` dep; extend `TERMINAL_MARKERS` with `<|eot_id|>`
-- [ ] `cargo test` (parser subset green)
+### Phase 1 — vendored parser (`src/toolparse.rs`) — DONE 2026-11-13
+- [x] Copy `zeroclaw/crates/zeroclaw-tool-call-parser/src/lib.rs` (~2.7k LOC) → `src/toolparse.rs`; keep trimmed test subset
+- [x] Header: upstream path + commit + `MIT OR Apache-2.0` notice
+- [x] Own `strip_think_tags` (port of `api/src/model_provider.rs:237-254`) **+ LFM3 think spans** (`<Token 1437>` … `<Token 9550>`)
+- [x] Stub the 2 `zeroclaw_log` warns (lib.rs 2230 / 2426, helper 1870)
+- [x] Trim `map_tool_name_alias` → identity + our names
+- [x] Add `regex = "1"` dep; extend `TERMINAL_MARKERS` with `<|eot_id|>`
+- [x] `cargo test` (parser subset green) → **198 passed / 0 failed / 1 ignored** (the
+      ignored one is the pre-existing upstream scanner boundary case), 0.07s
 
 ### Phase 2 — prompt protocol (`llm.rs`)
 - [ ] `ToolSpec { name, description, parameters_schema }`
@@ -49,14 +52,15 @@ Full details + evidence: `tool_calling_plan.md` · ZeroClaw graphs:
 - [ ] Regression: plain chat unchanged; prefill ping latency unchanged
 
 ### Unit testing (repo pattern: inline `#[cfg(test)] mod tests`, like hotkey.rs/live.rs)
-- [ ] **toolparse.rs** — vendored parser subset:
-  - [ ] single tool_call tag → 1 call, name + arguments parsed
-  - [ ] multiple calls in one response
-  - [ ] plain prose → 0 calls, cleaned text == input (no false positive)
-  - [ ] malformed JSON recovery (file_write case) still returns a call
-  - [ ] `strip_think_tags`: standard `<think>` + **LFM3 `<Token 1437>`…`<Token 9550>`** spans removed
-  - [ ] terminal markers (`<|eom|>`, `<eom>`, `<|eot_id|>`) stripped trailing + mid-text
-  - [ ] unknown/empty arguments → `{}` not a panic; non-UTF8 safe
+- [x] **toolparse.rs** — vendored parser subset:
+  - [x] single tool_call tag → 1 call, name + arguments parsed
+  - [x] multiple calls in one response
+  - [x] plain prose → 0 calls, cleaned text == input (no false positive)
+  - [x] malformed JSON recovery (file_write case) still returns a call
+  - [x] `strip_think_tags``<think>` + **LFM3 `<Token 1437>`…`<Token 9550>`** spans removed
+  - [x] terminal markers (`<|eom|>`, `<eom>`, `<|eot_id|>`) stripped trailing (+ stacked);
+        mid-text preserved — upstream policy, whitespace-before-marker kept
+  - [x] unknown/empty arguments → `{}` not a panic; non-UTF8 safe
 - [ ] **llm.rs (protocol)** — pure functions only (no server):
   - [ ] `tools_protocol_block`: specs rendered **sorted by name** (byte-stable output for KV prefix)
   - [ ] block omitted when tools disabled (`--no-tools` / `MOON_NO_TOOLS=1`)
@@ -74,12 +78,12 @@ Full details + evidence: `tool_calling_plan.md` · ZeroClaw graphs:
   - [ ] history after a tool turn: assistant msg keeps raw envelope + results msg appended in order
 - [ ] `cargo test` gate before every phase commit (Phase 1–5)
 
-### Open decisions (user)
-- [ ] 1. Vendored parser (recommended) vs ZeroClaw path-dep
-- [ ] 2. Seed tool set ok? (registry is dynamic: v1 code → v1.1 `tools.toml` user tools → v3 MCP/WASM)
-- [ ] 3. `open_app` allowlist: notepad, calc, chrome, spotify, vscode?
-- [ ] 4. Tools always-on + `--no-tools` escape, or `--tools` opt-in?
-- [ ] 5. `rustup update` abhi?
+### Open decisions (user) — RESOLVED 2026-11-13
+- [x] 1. **Vendored parser** (chosen; nested zeroclaw clone is untracked so vendoring also preserves the source)
+- [x] 2. Seed tool set: **get_time + calculate + open_app** (registry stays dynamic: v1 code → v1.1 `tools.toml` user tools → v3 MCP/WASM)
+- [x] 3. `open_app` allowlist: **notepad, calc, chrome, spotify, vscode**
+- [x] 4. **Always-on + `--no-tools` escape** (`MOON_NO_TOOLS=1` too)
+- [x] 5. **rustup update now** → 1.100.0 minimal profile (satisfies workspace `rust-version = 1.96.0`; full `stable` channel update was too slow due to cross-compile std targets)
 
 ### Later (v1.1+)
 - [ ] `web_fetch` (ureq, size-capped) · `create_note` (workspace-scoped)
