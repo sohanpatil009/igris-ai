@@ -4,7 +4,8 @@
 
 Full details + evidence: `tool_calling_plan.md` · ZeroClaw graphs:
 `E:\major_project\igris\igris-ai\zeroclaw\graphyfy\GRAPH.md` (nested clone,
-untracked in git) · this repo's graph: `graphyfy/GRAPH.md`
+untracked in git) · this repo's graph: `graphyfy/GRAPH.md` ·
+open bugs & suspicions: `bug.md`
 
 ### Phase 0 — toolchain — DONE 2026-11-13
 - [x] rustup update → rustc **1.100.0** default (minimal profile; parser needs ≥1.96, workspace pins 1.96.0)
