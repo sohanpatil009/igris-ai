@@ -102,6 +102,27 @@ scaffolding writes where the user points it".
 Decision needed: document as-is, or gate new/init behind the same
 two-step confirmation v2.5 will bring.
 
+### BUG-009 — lib test binary intermittently exits 101 with all suites green — LOW (flaky) — SUSPECTED
+Twice during the toolparse modularization the workspace gate
+(`cargo test --workspace | Out-Null; $LASTEXITCODE`) returned 101 with
+cargo's stderr "error: test failed, to rerun pass
+`-p igris-core --lib`"; every run where stdout was actually captured or
+displayed showed all suites green (lib 319/0/1, doctests 1/0/0) —
+including a full `| Out-File` capture immediately after. The failure
+detail was suppressed by Out-Null both times, so the offending test is
+not yet identified. Hypotheses: (a) a timing-sensitive test failing
+under machine load (candidates: `tools::registry` hung-tool budget
+test, `content_search` 3.5 s budget test, screenshot smoke) — note
+llama-server holds :8018/:8081 during these runs; (b) the lib test
+binary crashing AFTER `test result: ok` during native teardown (the
+same binary initializes ORT/moonshine and the screenshot test touches
+GDI), which cargo reports identically with no `failures:` block.
+Next step when it reproduces: capture full stdout
+(`| Out-File D:\Temp\opencode\gate_ws.txt -Encoding utf8`) and check
+for a `failures:` block vs. a clean tail; run the lib test binary
+directly for its raw exit code (an 0xC0000005-class code confirms a
+crash, not a test failure).
+
 ---
 
 ## Known limitations (documented trade-offs, not bugs)
