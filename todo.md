@@ -160,11 +160,32 @@ someday-optional `mcp_tool` tenant type if a community integration is ever
 preferred over writing it. mem0-rs was evaluated for persistent memory and
 REJECTED (see v1.2).
 
-- [ ] **v1.1 — system & files** (goal.md §1/§3/§5): `file_search`,
-      `read_file`, `create_folder`, `open_url`, `sys_stats`, `media_key`
-      (std + Win32) · `set_volume`, `screenshot` (needs the `windows`-crate
-      decision) · `tools.toml` config-defined tools (commands/URLs, incl.
-      `play_song` → YouTube search URL) — no core change per new tool
+- [ ] **v1.1 — system & files** (goal.md §1/§3/§5):
+      - [x] **batch 1 DONE 2026-11-14**: `file_search` (bounded
+            case-insensitive name walk over the common user folders or an
+            explicit root; skip-list + depth/entry/3.5 s budget caps so
+            partial results beat the 5 s dispatch timeout) · `read_file`
+            (~-expansion, 10 MB cap, max_chars truncation 2000/8000, binary
+            sniff refuses non-text files) · `create_folder` (mkdir -p;
+            file-collision + idempotence handled) · `open_url` (ShellExecuteW,
+            http/https scheme allowlist, no shell) · `media_key` (keybd_event
+            of VK_MEDIA_* 0xB0-0xB3; `windows` crate 0.62.2 — decision YES).
+            Note: 0.62.2's VK_MEDIA consts match the official Winuser.h table
+            (media keys 0xB0-0xB3, volume keys sit at 0xAD-0xAF). Gate
+            260 passed / 0 failed / 1 ignored (+15 tests). e2e: chat-driven
+            file_search + read_file (found both WAVs, refused binary garbage),
+            create_folder verified on disk, open_url opened example.com,
+            media_key real press (exactly one — dedup held). e2e finding:
+            LFM3 sometimes appends its NATIVE DSML-shaped tool envelope
+            (a fullwidth-bar wrapper the vendored parser does not know) after
+            a proper call — StreamFilter can only hold back known envelopes,
+            so it leaks into the reply text (cosmetic; never dispatched).
+            Robust scrubbing belongs in the malformed-protocol machinery —
+            separate item before v2.5.
+      - [ ] remaining: `sys_stats` · `set_volume`, `screenshot`
+            (windows-crate decision: YES 2026-11-13) · `tools.toml`
+            config-defined tools (commands/URLs, incl. `play_song` →
+            YouTube search URL) — no core change per new tool
 - [ ] **v1.2 — memory** (goal.md §7): own ~150-LOC JSON store (mem0-rs
       rejected 2026-11-13: single-version crates with double-digit lifetime
       downloads, stale; mem0-style LLM extraction adds write-time latency +

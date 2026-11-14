@@ -922,11 +922,16 @@ Example: User says something that needs a tool. You MUST respond with a real cal
         assert!(block.contains("### Available Tools"));
         assert!(block.ends_with("\n\n"));
         let c = block.find("**calculate**").unwrap();
+        let cf = block.find("**create_folder**").unwrap();
+        let fs = block.find("**file_search**").unwrap();
         let g = block.find("**get_time**").unwrap();
+        let mk = block.find("**media_key**").unwrap();
         let o = block.find("**open_app**").unwrap();
-        assert!(c < g && g < o);
+        let ou = block.find("**open_url**").unwrap();
+        let rf = block.find("**read_file**").unwrap();
+        assert!(c < cf && cf < fs && fs < g && g < mk && mk < o && o < ou && ou < rf);
         // Every entry carries its schema on a Parameters line.
-        assert_eq!(block.matches("Parameters: `").count(), 3);
+        assert_eq!(block.matches("Parameters: `").count(), 8);
         // The calculate tenant's structured schema is advertised.
         assert!(block.contains("\"required\":[\"function\"]"));
     }
