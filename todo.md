@@ -178,10 +178,23 @@ REJECTED (see v1.2).
             media_key real press (exactly one — dedup held). e2e finding:
             LFM3 sometimes appends its NATIVE DSML-shaped tool envelope
             (a fullwidth-bar wrapper the vendored parser does not know) after
-            a proper call — StreamFilter can only hold back known envelopes,
-            so it leaks into the reply text (cosmetic; never dispatched).
-            Robust scrubbing belongs in the malformed-protocol machinery —
-            separate item before v2.5.
+            a proper call — FIXED 2026-11-14 in toolparse.rs: the
+            StreamFilter now holds the DSML span so it never reaches
+            display/TTS; detect_tool_call_parse_issue issues a corrective
+            verdict only when the reply OPENS with the envelope (pure
+            native-format drift), while prose-wrapped echoes are ignored
+            (no wasted round). DSML is deliberately NOT a parse family:
+            MOON_DEBUG_RAW e2e showed every DSML body is schema-confused
+            (the JSON schema echoed as the arguments value), so parsing +
+            dispatching it produced "missing parameter" errors that sent
+            the model into a hallucination loop (fake inline tool results,
+            nested garbled spans, repeat presses); also added a guard so
+            the GLM shortened-body fallback can no longer turn the
+            envelope's label into a bogus call, and a char-boundary fix in
+            stream holdback (multibyte tag prefixes would panic). Gate
+            269 passed / 0 failed / 1 ignored (+8 DSML tests). e2e re-run
+            clean: play/pause, next track, get_time — no envelope text in
+            display, no haywire rounds.
       - [ ] remaining: `sys_stats` · `set_volume`, `screenshot`
             (windows-crate decision: YES 2026-11-13) · `tools.toml`
             config-defined tools (commands/URLs, incl. `play_song` →

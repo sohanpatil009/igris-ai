@@ -111,6 +111,26 @@ pub const TOOL_RESULT_OPEN: &str = "\u{3c}tool_result\u{3e}";
 /// Close of the results wrapper (stream filter + carrier blocks).
 pub const TOOL_RESULT_CLOSE: &str = "\u{3c}/tool_result\u{3e}";
 
+/// LFM3's native DSML tool-call envelope, observed live 2026-11-14: opener
+/// token, then a `function_calls>` label, then a JSON object with
+/// `name`/`arguments`, then the closer. The fullwidth bars (U+FF5C) are
+/// part of the model's special-token spelling. Spelled with unicode escapes
+/// like the other tag consts so this file carries no raw tag text.
+///
+/// Policy (evidence-based, 2026-11-14 debug e2e): this envelope is NOT a
+/// parse family — every DSML body the model emitted was schema-confused
+/// (the JSON schema echoed as the arguments value), so parsing it would
+/// dispatch garbage and the resulting "missing parameter" error reliably
+/// sent the model into a hallucination loop (fake inline tool results,
+/// nested garbled spans, repeat presses). The envelope is instead:
+/// (1) held back by the StreamFilter so it never reaches TTS/terminal, and
+/// (2) flagged by `detect_tool_call_parse_issue` so the agent loop issues
+/// a corrective verdict that re-anchors the model to the protocol-block
+/// format, whose argument shapes actually dispatch.
+pub const DSML_OPEN: &str = "\u{3c}\u{FF5C}DSML\u{FF5C}\u{3e}";
+/// Close of the LFM3 native DSML tool-call envelope.
+pub const DSML_CLOSE: &str = "\u{3c}/\u{FF5C}DSML\u{FF5C}\u{3e}";
+
 /* ================================================================ */
 /* streaming hold-back filter — OUR ADDITION (not vendored)          */
 /*                                                                   */
@@ -136,11 +156,12 @@ enum StreamOpener {
 /// Earliest protocol opener in `text`:
 /// `(byte index, opener length, opener)`.
 fn earliest_stream_opener(text: &str) -> Option<(usize, usize, StreamOpener)> {
-    let span_pairs: [(&str, &'static str); 4] = [
+    let span_pairs: [(&str, &'static str); 5] = [
         (THINK_OPEN, THINK_CLOSE),
         (LFM3_THINK_OPEN, LFM3_THINK_CLOSE),
         (TOOL_CALL_OPEN, TOOL_CALL_CLOSE),
         (TOOL_RESULT_OPEN, TOOL_RESULT_CLOSE),
+        (DSML_OPEN, DSML_CLOSE),
     ];
     let mut best: Option<(usize, usize, StreamOpener)> = None;
     for (open, close) in span_pairs {
@@ -170,10 +191,11 @@ fn earliest_stream_opener(text: &str) -> Option<(usize, usize, StreamOpener)> {
 
 /// Length of the longest suffix of `text` that is a strict prefix of any
 /// opener tag, close tag, or terminal marker — the bytes held back across
-/// chunk boundaries. All candidates are ASCII, so matched byte offsets are
-/// always on char boundaries.
+/// chunk boundaries. Every candidate is ASCII except the DSML spellings
+/// (their fullwidth bars are multibyte), so only char-boundary prefixes
+/// are considered.
 fn stream_holdback_len(text: &str) -> usize {
-    let candidates: [&str; 11] = [
+    let candidates: [&str; 13] = [
         THINK_OPEN,
         LFM3_THINK_OPEN,
         TOOL_CALL_OPEN,
@@ -182,6 +204,8 @@ fn stream_holdback_len(text: &str) -> usize {
         LFM3_THINK_CLOSE,
         TOOL_CALL_CLOSE,
         TOOL_RESULT_CLOSE,
+        DSML_OPEN,
+        DSML_CLOSE,
         TERMINAL_MARKERS[0],
         TERMINAL_MARKERS[1],
         TERMINAL_MARKERS[2],
@@ -189,6 +213,11 @@ fn stream_holdback_len(text: &str) -> usize {
     let mut max_hold = 0;
     for tag in candidates {
         for k in 1..tag.len() {
+            /* the DSML spellings are multibyte, so skip offsets that are
+             * not char boundaries — slicing there would panic */
+            if !tag.is_char_boundary(k) {
+                continue;
+            }
             if text.ends_with(&tag[..k]) {
                 max_hold = max_hold.max(k);
             }
@@ -202,11 +231,12 @@ fn stream_holdback_len(text: &str) -> usize {
 /// opener is protocol noise (the opener was in an earlier round whose
 /// filter already dropped the unclosed span) — the stream filter skips it.
 fn earliest_stream_closer(text: &str) -> Option<(usize, usize)> {
-    let closes: [&str; 4] = [
+    let closes: [&str; 5] = [
         THINK_CLOSE,
         LFM3_THINK_CLOSE,
         TOOL_CALL_CLOSE,
         TOOL_RESULT_CLOSE,
+        DSML_CLOSE,
     ];
     let mut best: Option<(usize, usize)> = None;
     for close in closes {
@@ -2099,6 +2129,14 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     if tool_raw.is_empty() || !tool_raw.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return None;
     }
+    // The LFM3 DSML envelope's `function_calls` section label is not a tool
+    // name: a malformed DSML body would otherwise become a bogus call to a
+    // nonexistent tool (observed live 2026-11-14). The envelope's own tag
+    // family parses real bodies; garbage ones fall through so the
+    // malformed-protocol detector can issue a corrective verdict instead.
+    if tool_raw == "function_calls" {
+        return None;
+    }
 
     let tool_name = map_tool_name_alias(tool_raw);
 
@@ -2933,6 +2971,19 @@ pub fn detect_tool_call_parse_issue(
     let trimmed = response.trim();
     if trimmed.is_empty() {
         return None;
+    }
+
+    // LFM3 native DSML envelope: never a parse family (policy note on
+    // DSML_OPEN). A response that OPENS with the envelope is the model
+    // drifting to its native call format — issue the corrective verdict so
+    // it re-anchors to the protocol-block format. A prose-wrapped echo
+    // after a successful round is noise: the prose is the answer, the
+    // echo is held by the stream filter, and no corrective round is spent.
+    if trimmed.starts_with(DSML_OPEN) && !looks_like_tool_protocol_example(trimmed) {
+        return Some(
+            "response resembled an internal tool protocol envelope but no valid tool call could be parsed"
+                .into(),
+        );
     }
 
     if looks_like_tool_protocol_envelope(trimmed) {
@@ -6146,5 +6197,183 @@ Let me check the result."#;
         let mut f = StreamFilter::new();
         assert_eq!(f.feed("bye\x3c/th"), "bye");
         assert_eq!(f.finish(), "\x3c/th");
+    }
+
+    /* ================================================================ */
+    /* LFM3 native DSML envelope: parser + stream filter + detect        */
+    /* ================================================================ */
+
+    /// The e2e-observed DSML body (2026-11-14): JSON with a schema-shaped
+    /// "properties" wrapper around the real arguments. The parser stays
+    /// honest — the wrapper passes through as-is, dispatch's error result
+    /// lets the model self-heal.
+    fn dsml_e2e_body() -> String {
+        serde_json::json!({
+            "name": "media_key",
+            "arguments": {"properties": {"key": "play_pause"}}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn dsml_e2e_echo_is_ignored_by_parser_and_held_by_filter() {
+        /* the exact post-success echo shape observed live 2026-11-14:
+         * schema-confused body after a successful round. Policy: never
+         * dispatched, held from the voice, no corrective round spent. */
+        let raw = format!(
+            "Play/pause has been pressed.\n\n{}function_calls>\n{}\n{}Play/pause was pressed. What would you like to do next?",
+            DSML_OPEN,
+            dsml_e2e_body(),
+            DSML_CLOSE
+        );
+        let (_text, calls) = parse_tool_calls(&raw);
+        assert!(calls.is_empty(), "calls: {calls:?}");
+        assert!(detect_tool_call_parse_issue(&raw, &calls).is_none());
+
+        /* the filter must hold the envelope while releasing the prose */
+        let mut f = StreamFilter::new();
+        let mut released = String::new();
+        let mut start = 0;
+        for (n, (idx, _)) in raw.char_indices().enumerate() {
+            if n % 3 == 0 && idx > start {
+                released.push_str(&f.feed(&raw[start..idx]));
+                start = idx;
+            }
+        }
+        released.push_str(&f.feed(&raw[start..]));
+        released.push_str(&f.finish());
+        assert!(
+            released.contains("Play/pause has been pressed."),
+            "{released}"
+        );
+        assert!(
+            released.contains("What would you like to do next?"),
+            "{released}"
+        );
+        assert!(!released.contains("DSML"), "{released}");
+        assert!(!released.contains("properties"), "{released}");
+        assert!(!released.contains("function_calls"), "{released}");
+    }
+
+    #[test]
+    fn dsml_envelope_is_never_a_parse_family() {
+        /* policy pin: the DSML envelope (closed or not) never produces a
+         * dispatch — see the policy note on DSML_OPEN */
+        let closed = format!(
+            "{}function_calls>\n{}\n{}",
+            DSML_OPEN,
+            dsml_e2e_body(),
+            DSML_CLOSE
+        );
+        let (_t, calls) = parse_tool_calls(&closed);
+        assert!(calls.is_empty(), "calls: {calls:?}");
+        let unclosed = format!("Sure. {}function_calls>\n{}", DSML_OPEN, dsml_e2e_body());
+        let (_t, calls) = parse_tool_calls(&unclosed);
+        assert!(calls.is_empty(), "calls: {calls:?}");
+    }
+
+    #[test]
+    fn stream_filter_holds_dsml_span_across_chunks() {
+        let raw = format!(
+            "One moment. {}function_calls>\n{}\n{} All done.",
+            DSML_OPEN,
+            dsml_e2e_body(),
+            DSML_CLOSE
+        );
+        /* feed in ~3-char chunks so tag bytes split across boundaries */
+        let mut chunks: Vec<&str> = Vec::new();
+        let mut start = 0;
+        for (n, (idx, _)) in raw.char_indices().enumerate() {
+            if n % 3 == 0 && idx > start {
+                chunks.push(&raw[start..idx]);
+                start = idx;
+            }
+        }
+        chunks.push(&raw[start..]);
+        let mut f = StreamFilter::new();
+        let mut released = String::new();
+        for c in &chunks {
+            released.push_str(&f.feed(c));
+        }
+        released.push_str(&f.finish());
+        assert_eq!(released, "One moment.  All done.");
+        assert!(!released.contains("function_calls"), "{released}");
+        assert!(!released.contains("media_key"), "{released}");
+    }
+
+    #[test]
+    fn stream_filter_holdback_survives_multibyte_dsml_prefixes() {
+        /* every byte-prefix of the opener must hold back cleanly; prefixes
+         * that cut inside the 3-byte fullwidth bar must neither panic nor
+         * partially match (they release verbatim — never lose text) */
+        let mut ends: Vec<usize> = DSML_OPEN.char_indices().map(|(i, _)| i).collect();
+        ends.push(DSML_OPEN.len());
+        for e in ends {
+            let mut f = StreamFilter::new();
+            let input = format!("text {}", &DSML_OPEN[..e]);
+            let released = f.feed(&input);
+            let expected = if DSML_OPEN.is_char_boundary(e) {
+                "text "
+            } else {
+                input.as_str()
+            };
+            assert_eq!(released, expected, "e={e}");
+        }
+    }
+
+    #[test]
+    fn stream_filter_finish_drops_unclosed_dsml_span() {
+        let mut f = StreamFilter::new();
+        let released = f.feed(&format!(
+            "Working. {}function_calls>\n{}",
+            DSML_OPEN,
+            dsml_e2e_body()
+        ));
+        assert_eq!(released, "Working. ");
+        /* an unclosed span's remainder is suppressed at finish */
+        let tail = f.finish();
+        assert_eq!(tail, "", "tail: {tail}");
+    }
+
+    #[test]
+    fn detect_flags_dsml_envelope_with_unparsable_body() {
+        let raw = format!(
+            "{}function_calls>\nnot json at all\n{}",
+            DSML_OPEN, DSML_CLOSE
+        );
+        let (_text, calls) = parse_tool_calls(&raw);
+        assert!(calls.is_empty(), "calls: {calls:?}");
+        assert!(detect_tool_call_parse_issue(&raw, &calls).is_some());
+    }
+
+    #[test]
+    fn detect_fires_for_pure_dsml_drift_response() {
+        /* the model's whole reply is a native DSML envelope: it meant a
+         * call, but the format is not trusted to dispatch — the corrective
+         * verdict re-anchors it to the protocol-block format */
+        let raw = format!(
+            "{}function_calls>\n{}\n{}",
+            DSML_OPEN,
+            dsml_e2e_body(),
+            DSML_CLOSE
+        );
+        let (_text, calls) = parse_tool_calls(&raw);
+        assert!(calls.is_empty(), "calls: {calls:?}");
+        assert!(detect_tool_call_parse_issue(&raw, &calls).is_some());
+    }
+
+    #[test]
+    fn detect_stays_silent_for_prose_wrapped_dsml_echo() {
+        /* post-success echo wrapped in an actual answer: the prose is the
+         * reply, the echo is filter-held noise — no corrective round */
+        let raw = format!(
+            "Play/pause has been pressed.\n\n{}function_calls>\n{}\n{}Play/pause was pressed. What would you like to do next?",
+            DSML_OPEN,
+            dsml_e2e_body(),
+            DSML_CLOSE
+        );
+        let (_text, calls) = parse_tool_calls(&raw);
+        assert!(calls.is_empty(), "calls: {calls:?}");
+        assert!(detect_tool_call_parse_issue(&raw, &calls).is_none());
     }
 }
