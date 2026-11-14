@@ -506,7 +506,7 @@ fn transcript_pass(
 
 pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut file_path: Option<String> = None;
-    let mut model_dir = "models/small-streaming".to_string();
+    let mut model_dir = crate::paths::asset("stt/small-streaming").to_string_lossy().into_owned();
     let mut hotkey_mode = false;
     let mut no_tts = false;
     let mut voice: Option<String> = None;
@@ -601,7 +601,7 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let _ = io::stdout().flush();
 
     /* ---------- models ---------- */
-    crate::ensure_model(&model_dir, arch)?;
+    let model_dir = crate::models::ensure_model(&model_dir, arch)?;
 
     let t_load = Instant::now();
     let transcriber = Transcriber::from_files(&model_dir, arch, None)?;

@@ -1,7 +1,8 @@
 //! Local LLM inference through llama.cpp (no Ollama).
 //!
-//! The GGUF in `models/llm/` is served by the bundled `llama-server`
-//! (Vulkan GPU build in `models/llm-gpu/`), which exposes an HTTP API on
+//! The GGUF in `assets/llama-cpp/model/` is served by the bundled
+//! `llama-server` (Vulkan GPU build in `assets/llama-cpp/vulkan/`), which
+//! exposes an HTTP API on
 //! localhost. This module either reuses an already-running server or starts
 //! one as a detached child process; the process intentionally keeps running
 //! after this app exits so later runs skip the model load cost.
@@ -14,6 +15,7 @@
 //! request only processes the few tokens spoken since the last ping. The
 //! chat endpoint re-tokenizes per request and defeats that reuse on LFM3.
 
+use crate::paths;
 use crate::toolparse;
 use crate::tools;
 use serde_json::{json, Value};
@@ -23,8 +25,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/* Two llama.cpp builds ship with the repo: a Vulkan (GPU) build in
- * models/llm-gpu and a pure-CPU build in tools/llama-cpp (both recent
+/* Two llama.cpp builds ship in the assets tree: a Vulkan (GPU) build in
+ * assets/llama-cpp/vulkan and a pure-CPU build in assets/llama-cpp/cpu
+ * (both recent
  * enough for every flag below). ensure_server() tries the GPU build
  * first and falls back to the CPU build whenever it cannot run on this
  * machine - no Vulkan driver, too little VRAM, early crash, startup
@@ -32,9 +35,11 @@ use std::time::{Duration, Instant};
  * alike. `--cpu` (or MOON_LLM_CPU=1) skips the GPU attempt. NOTE: if the
  * flags below change, kill any leftover llama-server so the next run
  * starts one with the new configuration. */
-const LLAMA_GPU_EXE: &str = "models/llm-gpu/llama-server.exe";
-const LLAMA_CPU_EXE: &str = "tools/llama-cpp/llama-server.exe";
-const LLM_MODEL: &str = "models/llm/LFM3-1.7B-Q4_K_M.gguf";
+/* Fragments under the resolved asset root (crate::paths) — resolved at
+ * use time so every front-end finds them regardless of its CWD. */
+const LLAMA_GPU_EXE: &str = "llama-cpp/vulkan/llama-server.exe";
+const LLAMA_CPU_EXE: &str = "llama-cpp/cpu/llama-server.exe";
+const LLM_MODEL: &str = "llama-cpp/model/LFM3-1.7B-Q4_K_M.gguf";
 const PORT: u16 = 8081;
 const CTX_TOKENS: i64 = 8000;
 /// Liquid's recommended sampling defaults for general use.
@@ -453,10 +458,10 @@ enum Backend {
 }
 
 impl Backend {
-    fn exe(self) -> &'static str {
+    fn exe(self) -> std::path::PathBuf {
         match self {
-            Backend::Gpu => LLAMA_GPU_EXE,
-            Backend::Cpu => LLAMA_CPU_EXE,
+            Backend::Gpu => paths::asset(LLAMA_GPU_EXE),
+            Backend::Cpu => paths::asset(LLAMA_CPU_EXE),
         }
     }
     fn label(self) -> &'static str {
@@ -537,15 +542,16 @@ pub fn ensure_server(force_cpu: bool) -> Result<(), Box<dyn std::error::Error>> 
 /// not killed on success: it outlives this process and keeps serving for
 /// later runs of the app.
 fn try_start(backend: Backend) -> Result<Option<String>, String> {
-    if !std::path::Path::new(backend.exe()).exists() {
+    let exe = backend.exe();
+    if !exe.exists() {
         return Err(format!(
-            "{} not found (run from the repo root)",
-            backend.exe()
+            "{} not found (provision the assets tree, see README)",
+            exe.display()
         ));
     }
-    let mut cmd = Command::new(backend.exe());
+    let mut cmd = Command::new(&exe);
     cmd.arg("-m")
-        .arg(LLM_MODEL)
+        .arg(paths::asset(LLM_MODEL))
         .arg("-c")
         .arg(CTX_TOKENS.to_string())
         .arg("-fa")
@@ -624,7 +630,10 @@ fn try_start(backend: Backend) -> Result<Option<String>, String> {
         }
         if started.elapsed() > backend.startup_timeout() {
             let _ = child.kill();
-            return Err(format!("{} did not become healthy in time", backend.exe()));
+            return Err(format!(
+                "{} did not become healthy in time",
+                backend.exe().display()
+            ));
         }
         std::thread::sleep(Duration::from_millis(300));
     }

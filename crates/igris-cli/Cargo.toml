@@ -1,0 +1,15 @@
+# Reference terminal front-end. The binary keeps the `igris-ai` name the
+# docs and scripts use; a future GUI front-end (dioxus / tauri crate) would
+# sit beside this one and link the same igris-core.
+[package]
+name = "igris-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "igris-ai"
+path = "src/main.rs"
+
+[dependencies]
+igris-core = { path = "../igris-core" }
+moonshine-rs = "0.2.9"

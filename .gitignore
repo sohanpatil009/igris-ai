@@ -1,6 +1,5 @@
 /target
-/tools
-/models
+/assets
 /.tts-utt
 tts_dump*.raw
 speech.wav

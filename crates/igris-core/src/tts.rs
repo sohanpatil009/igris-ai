@@ -1,4 +1,4 @@
-//! TTS through the piper.exe runtime bundled in `models/piper/`.
+//! TTS through the piper.exe runtime bundled in `assets/piper/`.
 //!
 //! Exposes two things:
 //! - the `speak` subcommand (`igris-ai speak "some text"`), and
@@ -6,7 +6,7 @@
 //!   aloud sentence-by-sentence while the LLM is still generating.
 //!
 //! Runtime: piper 2023.11.14-2 (Windows x64) with its matching
-//! `espeak-ng-data`. The voice lives in `models/tts/` and is fetched on
+//! `espeak-ng-data`. The voice lives in `assets/tts/` and is fetched on
 //! first use from the pinned `v1.0.0` tag of rhasspy/piper-voices (the
 //! current `main`-branch voice configs carry multi-codepoint phoneme
 //! keys this piper build rejects, so the tag is load-bearing).
@@ -52,6 +52,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use crate::paths;
 use std::process::{Child, ChildStdin, Command, Stdio};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -66,9 +67,9 @@ use serde_json::Value;
 /* constants                                                        */
 /* ================================================================ */
 
-const PIPER_EXE: &str = "models/piper/piper.exe";
-const ESPEAK_DATA: &str = "models/piper/espeak-ng-data";
-const VOICE_DIR: &str = "models/tts";
+const PIPER_EXE: &str = "piper/piper.exe";
+const ESPEAK_DATA: &str = "piper/espeak-ng-data";
+const VOICE_DIR: &str = "tts";
 const DEFAULT_VOICE: &str = "en_US-libritts_r-medium#051";
 /* Pinned tag: main-branch voice configs break this piper build (see the
  * module docs). Do not bump to `main` without re-probing piper. */
@@ -119,9 +120,9 @@ struct VoiceSpec {
 }
 
 impl VoiceSpec {
-    /* Resolve `<id>.onnx` + `<id>.onnx.json` under models/tts, downloading
+    /* Resolve `<id>.onnx` + `<id>.onnx.json` under assets/tts, downloading
      * from the pinned voices tag when missing or truncated. Same
-     * size-check + redownload approach as crate::ensure_model. */
+     * size-check + redownload approach as crate::models::ensure_model. */
     fn ensure(id: &str) -> Result<Self, Box<dyn std::error::Error>> {
         /* A "#NNN" suffix picks a speaker from a multi-speaker model:
          * en_US-libritts_r-medium#051 = voice en_US-libritts_r-medium,
@@ -157,8 +158,8 @@ impl VoiceSpec {
         let (name, quality) = rest
             .rsplit_once('-')
             .ok_or("voice id must look like en_US-amy-medium")?;
-        let dir = Path::new(VOICE_DIR);
-        fs::create_dir_all(dir)?;
+        let dir = paths::asset(VOICE_DIR);
+        fs::create_dir_all(&dir)?;
         let onnx = dir.join(format!("{voice_id}.onnx"));
         let json = dir.join(format!("{voice_id}.onnx.json"));
         /* repo layout: {lang}/{lang}_{region}/{name}/{quality}/{id} */
@@ -200,7 +201,7 @@ impl VoiceSpec {
     }
 }
 
-/* Voice ids end up inside `models/tts/<id>.onnx` paths and download
+/* Voice ids end up inside `assets/tts/<id>.onnx` paths and download
  * URLs, so accept only a safe charset: letters, digits, `_`, `-`, not
  * starting with `-`, reasonably short. */
 fn is_valid_voice_id(id: &str) -> bool {
@@ -299,11 +300,11 @@ fn spawn_child(inner: &Arc<Inner>) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let mut cmd = Command::new(PIPER_EXE);
+    let mut cmd = Command::new(paths::asset(PIPER_EXE));
     cmd.arg("-m")
         .arg(&inner.voice.onnx)
         .arg("--espeak_data")
-        .arg(ESPEAK_DATA);
+        .arg(paths::asset(ESPEAK_DATA));
     /* Multi-speaker model: the "#NNN" suffix of the voice id selects
      * the speaker inside it. */
     if let Some(sp) = &inner.voice.speaker {
@@ -751,14 +752,17 @@ impl Speaker {
      * `en_US-libritts_r-medium#051`. */
     pub fn start_with(voice_id: &str) -> Result<Speaker, Box<dyn std::error::Error>> {
         let voice = VoiceSpec::ensure(voice_id)?;
-        if !Path::new(PIPER_EXE).exists() {
+        let piper_exe = paths::asset(PIPER_EXE);
+        let espeak_data = paths::asset(ESPEAK_DATA);
+        if !piper_exe.exists() {
             return Err(format!(
-                "piper runtime not found at {PIPER_EXE} (expected piper.exe + espeak-ng-data)"
+                "piper runtime not found at {} (expected piper.exe + espeak-ng-data)",
+                piper_exe.display()
             )
             .into());
         }
-        if !Path::new(ESPEAK_DATA).is_dir() {
-            return Err(format!("espeak-ng data not found at {ESPEAK_DATA}").into());
+        if !espeak_data.is_dir() {
+            return Err(format!("espeak-ng data not found at {}", espeak_data.display()).into());
         }
 
         let host = cpal::default_host();
@@ -1037,7 +1041,7 @@ pub fn cmd_speak(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if text.trim().is_empty() {
         eprintln!("Usage: igris-ai speak \"TEXT\" [--voice ID]");
         eprintln!();
-        eprintln!("  Synthesizes TEXT through a piper voice from {VOICE_DIR}");
+        eprintln!("  Synthesizes TEXT through a piper voice from assets/{VOICE_DIR}");
         eprintln!("  (auto-downloaded on first run) and plays it.");
         eprintln!("  Voices: en_US-libritts_r-medium#051 (default; '#NNN' = speaker index");
         eprintln!("  inside a multi-speaker model), en_US-amy-medium, en_US-amy-low.");

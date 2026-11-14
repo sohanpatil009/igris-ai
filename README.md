@@ -1,6 +1,26 @@
 # igris-ai
 
-Rust test harness for checking **Moonshine Small (streaming)** and **Moonshine Medium (streaming)** speech-to-text speed and accuracy on your own machine.
+Rust test harness for checking **Moonshine Small (streaming)** and **Moonshine Medium (streaming)** speech-to-text speed and accuracy on your own machine — and the foundation of **IGRIS**, a voice-first Windows desktop agent (roadmap in `todo.md`).
+
+## Workspace layout
+
+```
+igris-ai/
+├── crates/
+│   ├── igris-core/   # agent core lib: STT, LLM, TTS, toolparse, tools, assist, live, hotkey
+│   └── igris-cli/    # reference terminal front-end (binary keeps the name igris-ai)
+├── assets/           # gitignored runtime assets (provisioned once, reused forever)
+│   ├── llama-cpp/    # vulkan/ + cpu/ llama-server builds, model/ LFM3 GGUF
+│   ├── piper/        # piper.exe + espeak-ng-data
+│   ├── tts/          # piper voice files (downloaded on first use)
+│   └── stt/          # small-streaming/, medium-streaming/ Moonshine models
+└── zeroclaw/         # vendored reference code (read-only, not part of the build)
+```
+
+Asset paths resolve through `igris-core::paths::asset` — CWD-independent
+(`MOON_ASSETS` env override → walk up from the running exe → walk up from
+the CWD → bare `assets/` fallback), so the CLI and any future GUI crate
+find the binaries no matter where they are launched from.
 
 ## Build
 
@@ -20,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File .\gen_tts.ps1
 ## Run
 
 ```bash
-# (first run checks/downloads both models into ./models/; ~570 MB total, needs internet)
+# (first run checks/downloads both models into assets/stt/; ~570 MB total, needs internet)
 cargo run --release -- speech16.wav reference.txt
 ```
 
@@ -38,14 +58,14 @@ cargo run --release -- live
 
 (or run the built binary directly from the repo root: `target\release\igris-ai.exe live`)
 
-Add `--model models/medium-streaming` to run the medium streaming model instead
+Add `--model assets/stt/medium-streaming` to run the medium streaming model instead
 of small (the architecture is inferred from the directory name); e.g.
 
 ```bash
-cargo run --release -- live --model models/medium-streaming
+cargo run --release -- live --model assets/stt/medium-streaming
 ```
 
-Streams your **default microphone** straight into `models/small-streaming` and prints
+Streams your **default microphone** straight into `assets/stt/small-streaming` and prints
 transcript lines the moment each sentence is finished. While you are speaking it shows
 a live status row with the input meter (bar + RMS), speaking state, raw un-analyzed
 backlog and the model's measured speed (Nx real-time). When a sentence completes it
@@ -68,7 +88,7 @@ cargo run --release -- chat                     # interactive loop, replies stre
 cargo run --release -- chat "who are you"       # one-shot
 ```
 
-Backed by `models/llm/LFM3-1.7B-Q4_K_M.gguf` through the bundled llama.cpp.
+Backed by `assets/llama-cpp/model/LFM3-1.7B-Q4_K_M.gguf` through the bundled llama.cpp.
 On first use the app starts `llama-server` detached on `127.0.0.1:8081`; the
 process intentionally keeps running after the app exits so later runs skip
 the model load. Stop it manually with `taskkill /IM llama-server.exe /F`.
@@ -76,9 +96,9 @@ the model load. Stop it manually with `taskkill /IM llama-server.exe /F`.
 Two llama.cpp builds ship with the repo, and the app picks between them
 automatically:
 
-- **GPU first** — the Vulkan build in `models/llm-gpu/` (fast: ~33 tok/s,
+- **GPU first** — the Vulkan build in `assets/llama-cpp/vulkan/` (fast: ~33 tok/s,
   ~1.3 GB VRAM). Used whenever the machine can run it.
-- **CPU fallback** — the CPU build in `tools/llama-cpp/` (slower: ~16 tok/s,
+- **CPU fallback** — the CPU build in `assets/llama-cpp/cpu/` (slower: ~16 tok/s,
   0 VRAM). Takes over automatically when the GPU build cannot run: no
   Vulkan driver, too little VRAM, early crash, or a startup timeout.
   The console prints which backend came up, e.g.
@@ -90,7 +110,7 @@ useful on office laptops where you would rather keep the VRAM free.
 The server runs with `--no-webui` (API only) plus `--swa-full --cache-reuse 1` —
 LFM3 is a sliding-window-attention model, and these flags are what unlock
 prompt-prefix reuse (the KV-shift path is rejected with the default SWA cache).
-Prompts are rendered as ChatML in `src/llm.rs` and sent to the raw
+Prompts are rendered as ChatML in `crates/igris-core/src/llm.rs` and sent to the raw
 `/v1/completions` endpoint; the chat endpoint would re-tokenize per request and
 defeat the reuse.
 
@@ -102,7 +122,7 @@ around them.
 ```bash
 cargo run --release -- assist                    # live microphone (ENTER to finish)
 cargo run --release -- assist speech16.wav       # same pipeline with a WAV in real time
-cargo run --release -- assist --model models/medium-streaming
+cargo run --release -- assist --model assets/stt/medium-streaming
 cargo run --release -- assist --cpu              # force the CPU llama.cpp build
 ```
 
@@ -176,9 +196,9 @@ so speech starts before the text finishes. Flags and hooks:
   hears the assistant's own voice; barge-in in push-to-talk mode kills the
   synthesizer instantly and the next utterance respawns it.
 
-Runtime: `models/piper/piper.exe` (piper 2023.11.14-2 Windows x64) with the
+Runtime: `assets/piper/piper.exe` (piper 2023.11.14-2 Windows x64) with the
 matching `espeak-ng-data` folder next to it. The voice files live in
-`models/tts/`. One long-lived piper process serves all utterances — one text
+`assets/tts/`. One long-lived piper process serves all utterances — one text
 line on stdin, one WAV file written into `.tts-utt/` via `--output_dir` — so
 the model loads once (warm first audio within ~100-200 ms; a fresh spawn
 costs ~0.5-3.5 s depending on disk cache, which only happens after a
@@ -197,8 +217,8 @@ streaming stdout, mirroring the file-based approach the igrisv3 app uses.
 
 ## Models downloaded
 
-- `small-streaming`  -> `models/small-streaming` (`~142 MB`)
-- `medium-streaming` -> `models/medium-streaming` (`~425 MB`)
+- `small-streaming`  -> `assets/stt/small-streaming` (`~142 MB`)
+- `medium-streaming` -> `assets/stt/medium-streaming` (`~425 MB`)
 
 Both are fetched from `download.moonshine.ai` automatically via
 `moonshine-rs::get_stt_dependencies_with_options` (pinned manifest
@@ -219,11 +239,11 @@ completes, the reply streams back token-by-token (first token typically
 < 1 s). Conversation history is kept across exchanges. ENTER to finish.
 
 - The local LLM runs through **llama.cpp v0.9.0 (b12110)**, Vulkan build in
-  `models/llm-gpu/` (GPU: any Vulkan-capable adapter; here the MX350,
+  `assets/llama-cpp/vulkan/` (GPU: any Vulkan-capable adapter; here the MX350,
   `-ngl 99 -fa on -c 8000 --swa-full --cache-reuse 1` — the flags matter, see
-  `src/llm.rs`). The CPU
-  build stays in `tools/llama-cpp/` as fallback.
-- Model: `models/llm/LFM3-1.7B-Q4_K_M.gguf` (LiquidAI LFM3-1.7B, ~1 GB).
+  `crates/igris-core/src/llm.rs`). The CPU
+  build stays in `assets/llama-cpp/cpu/` as fallback.
+- Model: `assets/llama-cpp/model/LFM3-1.7B-Q4_K_M.gguf` (LiquidAI LFM3-1.7B, ~1 GB).
   The `llama-server` process keeps running after the app exits so the next
   run skips the model load; `Stop-Process -Name llama-server` frees it.
 - Test without a mic (streams a WAV in real time through the same

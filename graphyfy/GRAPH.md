@@ -50,7 +50,7 @@ No orphans (every module is reachable from `main`), no cycles, no self-edges.
 
 | External process | Purpose |
 |---|---|
-| `llama-server.exe` | LLM serving on `127.0.0.1:8081`; auto-spawned, outlives the app. GPU build (`models/llm-gpu`) tried first, CPU build (`tools/llama-cpp`) is the automatic fallback (`--cpu` / `MOON_LLM_CPU=1` forces CPU) |
+| `llama-server.exe` | LLM serving on `127.0.0.1:8081`; auto-spawned, outlives the app. GPU build (`assets/llama-cpp/vulkan`) tried first, CPU build (`assets/llama-cpp/cpu`) is the automatic fallback (`--cpu` / `MOON_LLM_CPU=1` forces CPU) |
 | `piper.exe` | TTS synthesis child, file-based protocol into `.tts-utt/tts_1..3.wav` rotation |
 | onnxruntime.dll | Loaded in-process by moonshine-sys for STT (copied next to exe by build.rs) |
 

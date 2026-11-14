@@ -403,7 +403,7 @@ impl Hold {
 /* ================================================================ */
 
 pub fn cmd_hotkey(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut model_dir = "models/small-streaming".to_string();
+    let mut model_dir = crate::paths::asset("stt/small-streaming").to_string_lossy().into_owned();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -437,7 +437,7 @@ pub fn cmd_hotkey(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!();
     let _ = io::stdout().flush();
 
-    crate::ensure_model(&model_dir, arch)?;
+    let model_dir = crate::models::ensure_model(&model_dir, arch)?;
     let transcriber = Transcriber::from_files(&model_dir, arch, None)?;
     println!("  models    : loaded");
     let _ = io::stdout().flush();

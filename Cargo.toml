@@ -1,12 +1,13 @@
-[package]
-name = "igris-ai"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-moonshine-rs = "0.2.9"
-ureq = { version = "3", features = ["json"] }
-serde_json = "1"
-regex = "1"
-chrono = "0.4"
-cpal = "0.18.2"
+# IGRIS workspace: agent core library + front-ends.
+#
+# - crates/igris-core — everything that makes IGRIS an agent: Moonshine STT,
+#   LFM3-1.7B LLM via llama.cpp, piper TTS, the ZeroClaw-derived tool parser,
+#   the dynamic tool registry and the agent loop. Front-ends link this.
+# - crates/igris-cli  — the reference terminal front-end (binary `igris-ai`).
+# - Runtime assets (llama.cpp builds, piper, STT/TTS models) live in the
+#   gitignored `assets/` tree at this root and resolve through
+#   `igris-core::paths` — CWD-independent, so a future GUI crate (dioxus /
+#   tauri) finds them too.
+[workspace]
+resolver = "3"
+members = ["crates/igris-core", "crates/igris-cli"]

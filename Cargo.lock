@@ -613,7 +613,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "igris-ai"
+name = "igris-cli"
+version = "0.1.0"
+dependencies = [
+ "igris-core",
+ "moonshine-rs",
+]
+
+[[package]]
+name = "igris-core"
 version = "0.1.0"
 dependencies = [
  "chrono",

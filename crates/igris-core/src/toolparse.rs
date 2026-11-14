@@ -320,7 +320,7 @@ impl StreamFilter {
 /// # Examples
 ///
 /// ```
-/// use zeroclaw_tool_call_parser::strip_trailing_terminal_markers;
+/// use igris_core::toolparse::strip_trailing_terminal_markers;
 ///
 /// assert_eq!(strip_trailing_terminal_markers("Summary<eom>"), "Summary");
 /// assert_eq!(strip_trailing_terminal_markers("Summary<|eom|>"), "Summary");

@@ -100,7 +100,7 @@ fn main() {
                 if path.file_name().is_some_and(|n| n == "out")
                     && path
                         .components()
-                        .any(|c| c.as_os_str().to_string_lossy().starts_with("igris-ai"))
+                        .any(|c| c.as_os_str().to_string_lossy().starts_with("igris-core"))
                 {
                     dests.push(path.join("onnxruntime.dll"));
                 }

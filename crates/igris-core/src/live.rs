@@ -467,7 +467,7 @@ pub(crate) fn open_mic() -> Result<MicSession, Box<dyn std::error::Error>> {
 
 pub fn cmd_live(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut file_path: Option<String> = None;
-    let mut model_dir = "models/small-streaming".to_string();
+    let mut model_dir = crate::paths::asset("stt/small-streaming").to_string_lossy().into_owned();
 
     let mut i = 0;
     while i < args.len() {
@@ -521,7 +521,7 @@ pub fn cmd_live(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let _ = io::stdout().flush();
 
     /* fetch the pinned model set if missing (same manifest as batch mode) */
-    crate::ensure_model(&model_dir, arch)?;
+    let model_dir = crate::models::ensure_model(&model_dir, arch)?;
 
     /* ---------- load model ---------- */
     let t_load = Instant::now();
