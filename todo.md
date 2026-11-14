@@ -160,7 +160,7 @@ someday-optional `mcp_tool` tenant type if a community integration is ever
 preferred over writing it. mem0-rs was evaluated for persistent memory and
 REJECTED (see v1.2).
 
-- [ ] **v1.1 — system & files** (goal.md §1/§3/§5):
+- [x] **v1.1 — system & files** (goal.md §1/§3/§5) — DONE 2026-11-14:
       - [x] **batch 1 DONE 2026-11-14**: `file_search` (bounded
             case-insensitive name walk over the common user folders or an
             explicit root; skip-list + depth/entry/3.5 s budget caps so
@@ -244,11 +244,32 @@ REJECTED (see v1.2).
             set to 40%." read back, restored to 70 · screenshot → real
             PNG verified on disk AND visually (default OneDrive Pictures
             path). The set_volume e2e also produced the unwrap fix above.
-      - [ ] remaining v1.1: `tools.toml` config-defined tools
-            (commands/URLs, incl. `play_song` → YouTube search URL) — no
-            core change per new tool; wiring decision pending: config
-            load must NOT live in `registry()`'s LazyLock initializer
-            (llm.rs pin tests call `registry()` and must stay hermetic)
+      - [x] **`tools.toml` DONE 2026-11-14 — v1.1 complete**: config-defined
+            tools at `%APPDATA%\igris\tools.toml` (`dirs::config_dir()`).
+            Each `[[tool]]`: name (slug: lowercase/digits/underscores),
+            description, optional schema (inline JSON string; default
+            no-params), and exactly one of `url` (browser via
+            ShellExecuteW, http/https, substituted values percent-encoded
+            down to RFC 3986 unreserved so values can never split the
+            query) or `command` (direct `std::process::Command` argv,
+            fire-and-forget like open_app, NO shell so argument values
+            are syntax-inert). `{placeholder}`s must map to declared
+            schema properties (checked at load). Missing file = 0 tools;
+            invalid file = stderr warning + ignored — bad config never
+            bricks the assistant. Wiring decision (recon 2026-11-14): the
+            config load must NOT live in `registry()`'s LazyLock
+            initializer (llm.rs pin tests call `registry()` and must stay
+            hermetic) — `load_config_tools()` runs at the TOP of CLI
+            main(), stages into a OnceLock side table, and `registry()`
+            folds it in at first use; tests never call the loader. Config
+            tenants can override built-ins (register replaces same-name,
+            by design). Gate 285 passed / 0 failed / 1 ignored (+10
+            tests; ToolDef gained Clone + a manual Debug for unwrap_err).
+            e2e: real config file with `play_song` (YouTube search URL) →
+            chat "play shape of you by ed sheeran" → ONE round, [tools]
+            play_song dispatched, browser opened (ShellExecuteW success),
+            reply clean; the batch-2 screenshot tool confirmed session
+            state. New deps: serde (derive), toml 0.9.
 - [ ] **v1.2 — memory** (goal.md §7): own ~150-LOC JSON store (mem0-rs
       rejected 2026-11-13: single-version crates with double-digit lifetime
       downloads, stale; mem0-style LLM extraction adds write-time latency +

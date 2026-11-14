@@ -1,5 +1,6 @@
 use igris_core::models::ensure_model;
 use igris_core::paths;
+use igris_core::tools;
 use igris_core::{assist::cmd_assist, hotkey::cmd_hotkey, llm::cmd_chat, live::cmd_live, tts::cmd_speak};
 use moonshine_rs::audio::load_audio_for_transcription;
 use moonshine_rs::{ModelArch, Transcriber};
@@ -53,6 +54,10 @@ fn wer(reference: &str, hypothesis: &str) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /* Config-defined tools must be staged before the first registry use
+     * (the registry is built lazily at first prompt/dispatch); a broken
+     * tools.toml is reported and ignored, never fatal. */
+    tools::load_config_tools();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} <AUDIO_FILE> [REFERENCE_TXT]", args[0]);
