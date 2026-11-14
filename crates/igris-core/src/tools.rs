@@ -23,6 +23,14 @@
 //! - `media_key`     — global media key press (play/next/prev/stop) via
 //!   `keybd_event`; hits whatever app owns the media session
 //!
+//! v1.1 batch 2 (2026-11-14) — system state:
+//! - `sys_stats`  — CPU / RAM / system-drive / battery / uptime snapshot
+//!   (read-only; CPU is sampled over ~150 ms inside the call)
+//! - `set_volume` — master output volume 0-100 through the audio endpoint
+//!   COM API (`IAudioEndpointVolume`), read back after setting
+//! - `screenshot` — primary-screen capture to a PNG (GDI `BitBlt` into a
+//!   32-bpp DIB section), optional viewer launch via `ShellExecuteW`
+//!
 //! Dynamism ladder: v1 code-registered → v1.1 `tools.toml` config-defined
 //! tools (name/desc/schema + allowlisted command template, no recompile —
 //! `register` replaces a same-name tenant to make overrides possible) → v3
@@ -48,7 +56,25 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{FILETIME, HWND};
+use windows::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDeviceCaps, HGDIOBJ, HORZRES,
+    ReleaseDC, SRCCOPY, SelectObject, VERTRES,
+};
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use windows::Win32::Media::Audio::{
+    eMultimedia, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
+};
+use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+};
+use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+use windows::Win32::System::SystemInformation::{
+    GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+};
+use windows::Win32::System::Threading::GetSystemTimes;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE,
     VK_MEDIA_PREV_TRACK, VK_MEDIA_STOP,
@@ -122,7 +148,7 @@ impl Registry {
             return Err(format!("unknown tool: {name}"));
         };
         let run = Arc::clone(&def.run);
-        let args = args.clone();
+        let args = unwrap_schema_confused_args(&def.schema, &args.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             /* A panic inside a tool drops the sender on unwind; the
@@ -303,6 +329,56 @@ pub fn seed_registry() -> Registry {
         }),
         run: Arc::new(run_media_key),
     });
+    r.register(ToolDef {
+        name: "sys_stats".to_string(),
+        desc: "Get a system status snapshot: CPU usage, RAM usage, free disk space on the \
+              system drive, battery level and power source, and uptime. Read-only."
+            .to_string(),
+        schema: json!({"type": "object", "properties": {}, "required": []}),
+        run: Arc::new(run_sys_stats),
+    });
+    r.register(ToolDef {
+        name: "set_volume".to_string(),
+        desc: "Set the system output volume to a percentage (0 = muted, 100 = full). \
+              Applies to the default playback device."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "volume": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Target volume as a percentage (0 = muted, 100 = full)"
+                }
+            },
+            "required": ["volume"]
+        }),
+        run: Arc::new(run_set_volume),
+    });
+    r.register(ToolDef {
+        name: "screenshot".to_string(),
+        desc: "Capture the screen (primary monitor) to a PNG file. By default saves to \
+              the Pictures folder with a timestamped name; pass a path to save elsewhere, \
+              and open=true to show the image in the default viewer."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Optional file path for the PNG (supports ~ for the \
+                        user home); defaults to the Pictures folder"
+                },
+                "open": {
+                    "type": "boolean",
+                    "description": "Open the saved image in the default viewer (default false)"
+                }
+            },
+            "required": []
+        }),
+        run: Arc::new(run_screenshot),
+    });
     r
 }
 
@@ -313,6 +389,41 @@ pub fn seed_registry() -> Registry {
 pub fn registry() -> &'static Registry {
     static REG: LazyLock<Registry> = LazyLock::new(seed_registry);
     &REG
+}
+
+/// LFM3 sometimes emits the DSML attr-form with the schema name instead of
+/// the argument name — `parameter=properties` (or `parameter=parameters`)
+/// with the intended arguments object as the body. The parser faithfully
+/// keys that body under "properties", so the real arguments end up one
+/// level deep: `{"properties": {"volume": 40}}`. When the tool's schema
+/// declares no parameter by that name, the wrapper is a formatting
+/// artifact: strip one level and dispatch the intended arguments. The
+/// honest-error alternative costs the model a recovery round it often
+/// cannot find — e2e evidence (2026-11-14): `set_volume` burned 5 rounds
+/// on the same confused shape and gave up, while a scalar-string-arg tool
+/// (`media_key`) does self-heal in one round. Double-dispatch is not a
+/// risk: dedup is per-response and this runs inside a single dispatch.
+fn unwrap_schema_confused_args(schema: &Value, args: &Value) -> Value {
+    const WRAPPER_KEYS: [&str; 2] = ["properties", "parameters"];
+    let Some(map) = args.as_object() else {
+        return args.clone();
+    };
+    if map.len() != 1 {
+        return args.clone();
+    }
+    let (key, value) = map.iter().next().expect("len checked above");
+    if !WRAPPER_KEYS.contains(&key.as_str()) || !value.is_object() {
+        return args.clone();
+    }
+    /* A schema that genuinely declares the key keeps it. */
+    let declared = schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(|p| p.contains_key(key));
+    if declared != Some(false) {
+        return args.clone();
+    }
+    value.clone()
 }
 
 /* ================================================================ */
@@ -919,6 +1030,324 @@ fn run_media_key(args: &Value) -> Result<String, String> {
     Ok(format!("Pressed media key: {key}"))
 }
 
+/* ================================================================ */
+/* sys_stats — CPU / RAM / disk / battery / uptime snapshot           */
+/* ================================================================ */
+
+fn run_sys_stats(_args: &Value) -> Result<String, String> {
+    let cpu = cpu_percent();
+    let ram = ram_summary()?;
+    let disk = disk_summary()?;
+    let power = power_summary()?;
+    Ok(format!(
+        "CPU: {cpu}% | RAM: {ram} | Disk: {disk} | {power} | Uptime: {}",
+        uptime_string()
+    ))
+}
+
+fn filetime_u64(ft: &FILETIME) -> u64 {
+    ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
+}
+
+/// One (idle, kernel, user) counter snapshot. On Windows the kernel time
+/// already includes idle time, so busy = kernel + user - idle.
+fn system_times() -> Result<(u64, u64, u64), String> {
+    let (mut idle, mut kernel, mut user) =
+        (FILETIME::default(), FILETIME::default(), FILETIME::default());
+    /* SAFETY: three out-pointers to our own locals. */
+    unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)) }
+        .map_err(|e| format!("sys_stats: GetSystemTimes failed: {e}"))?;
+    Ok((
+        filetime_u64(&idle),
+        filetime_u64(&kernel),
+        filetime_u64(&user),
+    ))
+}
+
+/// CPU usage sampled over ~150 ms inside this call (two counter reads).
+fn cpu_percent() -> u32 {
+    let Ok(t1) = system_times() else {
+        return 0;
+    };
+    std::thread::sleep(Duration::from_millis(150));
+    let Ok(t2) = system_times() else {
+        return 0;
+    };
+    /* wrapping_sub: counters never reset while we hold the machine, but a
+     * debug-mode panic on u64 underflow is a worse failure than a wrong % */
+    let idle = t2.0.wrapping_sub(t1.0);
+    let kernel = t2.1.wrapping_sub(t1.1);
+    let user = t2.2.wrapping_sub(t1.2);
+    let total = kernel + user;
+    if total == 0 {
+        return 0;
+    }
+    let busy = total.saturating_sub(idle);
+    ((busy as f64) * 100.0 / (total as f64)).round() as u32
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+fn ram_summary() -> Result<String, String> {
+    let mut mem = MEMORYSTATUSEX::default();
+    mem.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    /* SAFETY: out-pointer to our own struct, dwLength already set. */
+    unsafe { GlobalMemoryStatusEx(&mut mem) }
+        .map_err(|e| format!("sys_stats: GlobalMemoryStatusEx failed: {e}"))?;
+    let used = gib(mem.ullTotalPhys - mem.ullAvailPhys);
+    Ok(format!(
+        "{} GB used of {} GB ({}%)",
+        used,
+        gib(mem.ullTotalPhys),
+        mem.dwMemoryLoad
+    ))
+}
+
+fn disk_summary() -> Result<String, String> {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let dir = format!("{drive}\\");
+    let wide = to_wide(&dir);
+    let (mut free, mut total) = (0u64, 0u64);
+    /* SAFETY: NUL-terminated wide string built above; two out u64s. */
+    unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free), Some(&mut total), None) }
+        .map_err(|e| format!("sys_stats: GetDiskFreeSpaceExW failed: {e}"))?;
+    if total == 0 {
+        return Ok(format!("{drive} unknown"));
+    }
+    let used_pct = (((total - free) as f64) * 100.0 / (total as f64)).round() as u32;
+    Ok(format!(
+        "{drive} {} GB free of {} GB ({used_pct}% used)",
+        gib(free),
+        gib(total)
+    ))
+}
+
+fn power_summary() -> Result<String, String> {
+    let mut status = SYSTEM_POWER_STATUS::default();
+    /* SAFETY: out-pointer to our own struct. */
+    unsafe { GetSystemPowerStatus(&mut status) }
+        .map_err(|e| format!("sys_stats: GetSystemPowerStatus failed: {e}"))?;
+    const BATTERY_FLAG_NO_BATTERY: u8 = 128;
+    if status.BatteryFlag & BATTERY_FLAG_NO_BATTERY != 0 {
+        return Ok("Battery: none (desktop)".to_string());
+    }
+    let ac = match status.ACLineStatus {
+        0 => "on battery",
+        1 => "on AC power",
+        _ => "power source unknown",
+    };
+    if status.BatteryLifePercent == 255 {
+        return Ok(format!("Battery: unknown ({ac})"));
+    }
+    Ok(format!("Battery: {}% ({ac})", status.BatteryLifePercent))
+}
+
+fn uptime_string() -> String {
+    /* SAFETY: parameterless counter read. */
+    let secs = unsafe { GetTickCount64() } / 1000;
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let (hours, rem) = (rem / 3600, rem % 3600);
+    let minutes = rem / 60;
+    if days > 0 {
+        format!("{days}d {hours}h {minutes:02}m")
+    } else {
+        format!("{hours}h {minutes:02}m")
+    }
+}
+
+/* ================================================================ */
+/* set_volume — COM IAudioEndpointVolume absolute set + read-back     */
+/* ================================================================ */
+
+fn run_set_volume(args: &Value) -> Result<String, String> {
+    let volume = extract_i64(args, "volume", "set_volume")?;
+    if !(0..=100).contains(&volume) {
+        return Err(format!("volume must be 0-100, got {volume}"));
+    }
+    let achieved = set_master_volume(volume as u32)?;
+    Ok(format!("System volume set to {achieved}%."))
+}
+
+/// Set the master output volume through the default audio endpoint and
+/// read back the achieved level. Runs on the dispatch worker thread, so
+/// COM is initialized for this thread only and balanced below.
+fn set_master_volume(percent: u32) -> Result<u32, String> {
+    /* SAFETY: thread-local COM initialization; on a fresh dispatch worker
+     * this can only return S_OK/S_FALSE, both of which must be balanced
+     * by CoUninitialize, which is exactly what happens at the end. */
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr.is_err() {
+        return Err(format!("set_volume: COM initialization failed: {hr}"));
+    }
+    let result = (|| -> Result<u32, String> {
+        let endpoint = audio_endpoint()?;
+        let target = percent as f32 / 100.0;
+        /* SAFETY: null event-context GUID; endpoint is alive through the
+         * call and dropped by the closure scope afterwards. */
+        unsafe { endpoint.SetMasterVolumeLevelScalar(target, std::ptr::null()) }
+            .map_err(|e| format!("set_volume: SetMasterVolumeLevelScalar failed: {e}"))?;
+        let achieved = unsafe { endpoint.GetMasterVolumeLevelScalar() }
+            .map_err(|e| format!("set_volume: GetMasterVolumeLevelScalar failed: {e}"))?;
+        Ok((achieved * 100.0).round() as u32)
+    })();
+    /* SAFETY: balances the successful CoInitializeEx above. */
+    unsafe { CoUninitialize() };
+    result
+}
+
+fn audio_endpoint() -> Result<IAudioEndpointVolume, String> {
+    /* SAFETY: CoCreateInstance of the standard MMDeviceEnumerator class. */
+    let enumerator: IMMDeviceEnumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+            .map_err(|e| format!("set_volume: COM instantiation failed: {e}"))?;
+    let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) }
+        .map_err(|e| format!("set_volume: no default audio device: {e}"))?;
+    let endpoint: IAudioEndpointVolume = unsafe { device.Activate(CLSCTX_ALL, None) }
+        .map_err(|e| format!("set_volume: endpoint activation failed: {e}"))?;
+    Ok(endpoint)
+}
+
+/* ================================================================ */
+/* screenshot — GDI capture of the primary screen into a PNG          */
+/* ================================================================ */
+
+fn run_screenshot(args: &Value) -> Result<String, String> {
+    let path: PathBuf = match args.get("path") {
+        None | Some(Value::Null) => default_screenshot_path()?,
+        Some(Value::String(s)) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return Err("screenshot: path must not be empty".to_string());
+            }
+            expand_home_path(s).into()
+        }
+        Some(_) => return Err("screenshot: 'path' must be a string".to_string()),
+    };
+    let open = match args.get("open") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => return Err("screenshot: 'open' must be a boolean".to_string()),
+    };
+    if path.is_dir() {
+        return Err(format!(
+            "screenshot: path points to an existing folder: {}",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "screenshot: cannot create folder {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+    let (w, h, rgb) = capture_screen_rgb()?;
+    image::save_buffer(&path, &rgb, w, h, image::ColorType::Rgb8)
+        .map_err(|e| format!("screenshot: saving {} failed: {e}", path.display()))?;
+    let mut msg = format!("Screenshot saved to {} ({}x{}).", path.display(), w, h);
+    if open {
+        if let Err(e) = launch_default_viewer(&path) {
+            msg.push_str(&format!(" (could not open viewer: {e})"));
+        }
+    }
+    Ok(msg)
+}
+
+fn default_screenshot_path() -> Result<PathBuf, String> {
+    let base = dirs::picture_dir().unwrap_or_else(std::env::temp_dir);
+    let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    Ok(base.join(format!("igris_screenshot_{stamp}.png")))
+}
+
+fn launch_default_viewer(path: &Path) -> Result<(), String> {
+    let verb = to_wide("open");
+    let file = to_wide(&path.as_os_str().to_string_lossy());
+    /* SAFETY: ShellExecuteW with NUL-terminated buffers we built above;
+     * nothing borrowed outlives the call. */
+    let hinst = unsafe {
+        ShellExecuteW(
+            Some(HWND::default()),
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    /* Shell semantics: instance values <= 32 mean failure. */
+    if (hinst.0 as isize) <= 32 {
+        return Err(format!("ShellExecuteW failed for {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Capture the primary monitor as RGB bytes (top-down, row-major).
+fn capture_screen_rgb() -> Result<(u32, u32, Vec<u8>), String> {
+    /* SAFETY: standard GDI screen capture. Every handle taken below is
+     * released on every path before returning. */
+    unsafe {
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            return Err("screenshot: GetDC failed".to_string());
+        }
+        let w = GetDeviceCaps(Some(hdc), HORZRES);
+        let h = GetDeviceCaps(Some(hdc), VERTRES);
+        if w <= 0 || h <= 0 {
+            ReleaseDC(None, hdc);
+            return Err("screenshot: screen dimensions unavailable".to_string());
+        }
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h, /* negative: rows come top-down */
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hbmp = match CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(bmp) => bmp,
+            Err(e) => {
+                ReleaseDC(None, hdc);
+                return Err(format!("screenshot: CreateDIBSection failed: {e}"));
+            }
+        };
+        let mem = CreateCompatibleDC(Some(hdc));
+        if mem.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(hbmp.0));
+            ReleaseDC(None, hdc);
+            return Err("screenshot: CreateCompatibleDC failed".to_string());
+        }
+        let old = SelectObject(mem, HGDIOBJ(hbmp.0));
+        let blt = BitBlt(mem, 0, 0, w, h, Some(hdc), 0, 0, SRCCOPY).is_ok();
+        let len = (w as usize) * (h as usize) * 4;
+        let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
+        if blt {
+            let px = std::slice::from_raw_parts(bits as *const u8, len);
+            for quad in px.chunks_exact(4) {
+                rgb.push(quad[2]); /* R (buffer is BGRA) */
+                rgb.push(quad[1]); /* G */
+                rgb.push(quad[0]); /* B */
+            }
+        }
+        SelectObject(mem, old);
+        let _ = DeleteObject(HGDIOBJ(hbmp.0));
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, hdc);
+        if !blt {
+            return Err("screenshot: BitBlt failed".to_string());
+        }
+        Ok((w as u32, h as u32, rgb))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,7 +1395,10 @@ mod tests {
                 "media_key",
                 "open_app",
                 "open_url",
-                "read_file"
+                "read_file",
+                "screenshot",
+                "set_volume",
+                "sys_stats"
             ]
         );
     }
@@ -1485,5 +1917,131 @@ mod tests {
         assert!(reg()
             .dispatch("media_key", &json!({"key": "volume_mute"}))
             .is_err());
+    }
+
+    /* ---- sys_stats ---- */
+    /* Read-only queries on the live OS, so a full smoke run is hermetic. */
+
+    #[test]
+    fn sys_stats_reports_all_sections() {
+        let out = run_sys_stats(&json!({})).expect("sys_stats succeeds");
+        assert!(out.contains("CPU:") && out.contains("%"), "{out}");
+        assert!(out.contains("RAM:") && out.contains("GB"), "{out}");
+        assert!(out.contains("Disk:") && out.contains("GB"), "{out}");
+        assert!(out.contains("Battery:"), "{out}");
+        assert!(out.contains("Uptime:") && out.contains("m"), "{out}");
+    }
+
+    /* ---- set_volume ---- */
+    /* Validation only in unit tests — real COM calls change the user's
+     * actual output volume, so the set path is e2e territory. */
+
+    #[test]
+    fn set_volume_rejects_out_of_range_and_bad_args() {
+        assert!(run_set_volume(&json!({"volume": 101})).unwrap_err().contains("0-100"));
+        assert!(run_set_volume(&json!({"volume": -1})).unwrap_err().contains("0-100"));
+        assert!(run_set_volume(&json!({})).unwrap_err().contains("set_volume"));
+        assert!(run_set_volume(&json!({"volume": "loud"}))
+            .unwrap_err()
+            .contains("set_volume"));
+    }
+
+    /* ---- screenshot ---- */
+
+    #[test]
+    fn screenshot_rejects_bad_args_before_capturing() {
+        assert!(run_screenshot(&json!({"path": "   "})).unwrap_err().contains("path"));
+        assert!(run_screenshot(&json!({"path": 42})).unwrap_err().contains("path"));
+        assert!(run_screenshot(&json!({"open": "yes"})).unwrap_err().contains("open"));
+    }
+
+    #[test]
+    fn screenshot_smoke_saves_a_real_png() {
+        let dir = temp_root("screenshot");
+        let path = dir.join("shot.png");
+        let out = run_screenshot(&json!({"path": path.to_string_lossy()})).expect("screenshot");
+        assert!(out.contains("Screenshot saved"), "{out}");
+        let meta = fs::metadata(&path).expect("png exists on disk");
+        assert!(meta.len() > 1_000, "png suspiciously small: {}", meta.len());
+        use std::io::Read;
+        let mut head = [0u8; 4];
+        fs::File::open(&path)
+            .unwrap()
+            .read_exact(&mut head)
+            .expect("readable");
+        assert_eq!(&head, &[0x89, b'P', b'N', b'G'], "not a PNG signature");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /* ---- schema-confused wrapper unwrapping (dispatch-time repair) ---- */
+
+    #[test]
+    fn confused_schema_wrapper_args_are_unwrapped() {
+        let schema = reg()
+            .specs()
+            .into_iter()
+            .find(|s| s.name == "set_volume")
+            .unwrap()
+            .parameters_schema;
+        /* The e2e-observed shape: properties wrapper around the real args. */
+        assert_eq!(
+            unwrap_schema_confused_args(&schema, &json!({"properties": {"volume": 40}})),
+            json!({"volume": 40})
+        );
+        assert_eq!(
+            unwrap_schema_confused_args(&schema, &json!({"parameters": {"volume": 5}})),
+            json!({"volume": 5})
+        );
+        /* Clean calls pass through untouched. */
+        assert_eq!(
+            unwrap_schema_confused_args(&schema, &json!({"volume": 40})),
+            json!({"volume": 40})
+        );
+        /* Extra keys or non-object wrapper values are not repairable. */
+        assert_eq!(
+            unwrap_schema_confused_args(&schema, &json!({"properties": {"volume": 40}, "x": 1})),
+            json!({"properties": {"volume": 40}, "x": 1})
+        );
+        assert_eq!(
+            unwrap_schema_confused_args(&schema, &json!({"properties": 3})),
+            json!({"properties": 3})
+        );
+        /* A tool that legitimately declares the key keeps it. */
+        let declared = json!({
+            "type": "object",
+            "properties": {"properties": {"type": "string"}},
+            "required": []
+        });
+        assert_eq!(
+            unwrap_schema_confused_args(&declared, &json!({"properties": {"a": 1}})),
+            json!({"properties": {"a": 1}})
+        );
+        /* Schema without a properties field is left alone (conservative). */
+        assert_eq!(
+            unwrap_schema_confused_args(&json!({"type": "object"}), &json!({"properties": {}})),
+            json!({"properties": {}})
+        );
+    }
+
+    #[test]
+    fn dispatch_unwraps_confused_wrapper_before_running() {
+        let mut r = Registry::new();
+        r.register(ToolDef {
+            name: "probe".to_string(),
+            desc: "probe".to_string(),
+            schema: json!({
+                "type": "object",
+                "properties": {"value": {"type": "integer"}},
+                "required": ["value"]
+            }),
+            run: Arc::new(|args: &Value| -> Result<String, String> {
+                Ok(format!(
+                    "value={}",
+                    args.get("value").and_then(|v| v.as_i64()).unwrap_or(-1)
+                ))
+            }),
+        });
+        let out = r.dispatch("probe", &json!({"properties": {"value": 7}})).unwrap();
+        assert_eq!(out, "value=7");
     }
 }

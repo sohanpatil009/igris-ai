@@ -929,9 +929,23 @@ Example: User says something that needs a tool. You MUST respond with a real cal
         let o = block.find("**open_app**").unwrap();
         let ou = block.find("**open_url**").unwrap();
         let rf = block.find("**read_file**").unwrap();
-        assert!(c < cf && cf < fs && fs < g && g < mk && mk < o && o < ou && ou < rf);
+        let sc = block.find("**screenshot**").unwrap();
+        let sv = block.find("**set_volume**").unwrap();
+        let ss = block.find("**sys_stats**").unwrap();
+        assert!(
+            c < cf
+                && cf < fs
+                && fs < g
+                && g < mk
+                && mk < o
+                && o < ou
+                && ou < rf
+                && rf < sc
+                && sc < sv
+                && sv < ss
+        );
         // Every entry carries its schema on a Parameters line.
-        assert_eq!(block.matches("Parameters: `").count(), 8);
+        assert_eq!(block.matches("Parameters: `").count(), 11);
         // The calculate tenant's structured schema is advertised.
         assert!(block.contains("\"required\":[\"function\"]"));
     }

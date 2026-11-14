@@ -194,11 +194,61 @@ REJECTED (see v1.2).
             stream holdback (multibyte tag prefixes would panic). Gate
             269 passed / 0 failed / 1 ignored (+8 DSML tests). e2e re-run
             clean: play/pause, next track, get_time — no envelope text in
-            display, no haywire rounds.
-      - [ ] remaining: `sys_stats` · `set_volume`, `screenshot`
-            (windows-crate decision: YES 2026-11-13) · `tools.toml`
-            config-defined tools (commands/URLs, incl. `play_song` →
-            YouTube search URL) — no core change per new tool
+            display, no haywire rounds. DSML follow-ups, revisited by the
+            batch-2 e2e: (a) ~~honest-error preferred over unwrapping~~
+            REVERSED 2026-11-14 — the attr-format confusion
+            (`parameter=properties` + JSON child) does NOT reliably
+            self-heal: `media_key` healed in one round because its arg is
+            a scalar string the model can retype (`parameter=key`), but
+            `set_volume` (object/number args) burned 5 rounds repeating
+            `parameter=properties` → `parameter=parameters` and gave up
+            without ever dispatching. Fix shipped in tools.rs:
+            `unwrap_schema_confused_args` at dispatch — when args are
+            exactly `{"properties"| "parameters": {…}}` and the tool's
+            schema does not declare that key, strip one level and dispatch
+            the real args (schema-checked, so a tool that legitimately
+            declares the key keeps it; dedup makes double-dispatch a
+            non-risk). set_volume e2e now succeeds in ONE round; gate 275
+            passed (+2 tests). (b) LFM3 hallucinates fake inline
+            tool_result blocks when confused — parser ignores them (no
+            name-bearing dispatchable shape survives the gates), bounded
+            by MAX_TOOL_ITERATIONS; NEW 2026-11-14: when the model emits
+            the fake result AFTER a clean final answer (bare
+            `{"name": …, "result": …, "status": "ok"}` JSON, no envelope),
+            the parser correctly ignores it but the StreamFilter releases
+            it to display/TTS — the JSON line leaks into the chat/voice
+            output. Stream-filter follow-up: hold/strip trailing
+            fake-tool_result JSON the same way DSML spans are held.
+      - [x] **batch 2 DONE 2026-11-14**: `sys_stats` (GetSystemTimes CPU
+            sampled over ~150 ms + GlobalMemoryStatusEx RAM +
+            GetDiskFreeSpaceExW on %SystemDrive% + GetSystemPowerStatus
+            battery/AC + GetTickCount64 uptime; all read-only) ·
+            `set_volume` (COM: CoInitializeEx → MMDeviceEnumerator →
+            default render endpoint → IAudioEndpointVolume
+            SetMasterVolumeLevelScalar, read back via
+            GetMasterVolumeLevelScalar; COM init balanced on the dispatch
+            worker thread) · `screenshot` (GDI GetDC + CreateDIBSection
+            32-bpp top-down + BitBlt → BGRA→RGB → `image` crate PNG
+            (png-only feature set); default path = dirs::picture_dir()
+            with timestamp name, optional `open` via ShellExecuteW; every
+            GDI handle released on every path). New windows features:
+            Win32_System_{Threading,SystemInformation,Power,Com} ·
+            Win32_Storage_FileSystem · Win32_Media_Audio +
+            Win32_Media_Audio_Endpoints (endpoint interfaces live in a
+            submodule with their own feature gate) · Win32_Graphics_Gdi.
+            Gate 275 passed / 0 failed / 1 ignored (+6 tests incl. a live
+            screenshot smoke test verifying the PNG signature on disk).
+            e2e all clean, one round each: sys_stats (plausible live
+            values: CPU 3%, RAM 5.6/7.7 GB, disk 26.1 GB free, battery
+            54% AC, uptime 2d 13h) · set_volume set 40 → "System volume
+            set to 40%." read back, restored to 70 · screenshot → real
+            PNG verified on disk AND visually (default OneDrive Pictures
+            path). The set_volume e2e also produced the unwrap fix above.
+      - [ ] remaining v1.1: `tools.toml` config-defined tools
+            (commands/URLs, incl. `play_song` → YouTube search URL) — no
+            core change per new tool; wiring decision pending: config
+            load must NOT live in `registry()`'s LazyLock initializer
+            (llm.rs pin tests call `registry()` and must stay hermetic)
 - [ ] **v1.2 — memory** (goal.md §7): own ~150-LOC JSON store (mem0-rs
       rejected 2026-11-13: single-version crates with double-digit lifetime
       downloads, stale; mem0-style LLM extraction adds write-time latency +
