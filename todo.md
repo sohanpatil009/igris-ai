@@ -346,10 +346,46 @@ vendoring was rejected; see v1.2).
       stays a v2.5 item. One transient environmental note: a full gate
       once hung ~20 min on a stale build lock (no cargo process was
       left); rerun passed — treat as machine noise, not a code issue.
-- [ ] **v2 — dev & browser** (goal.md §4/§6): allowlisted `run_command` ·
-      `list_dir`, `content_search` · `web_fetch` (ureq, size-capped) ·
-      `download_file` · `web_search` (one backend decision: DDG HTML vs
-      API key)
+- [x] **v2 — dev & browser** (goal.md §4/§6) — DONE 2026-11-14: six tools
+      over zero new deps (ureq 3 + regex + serde already present):
+      `run_command` (curated allowlist: cargo check/build/test/run/new/
+      init/add/remove/fmt/clippy/tree + read-only git status/log/diff/
+      show/rev-parse; no shell, argv direct, control-byte rejection;
+      bare `cargo run` = build-then-launch detached so the app stays
+      alive) · `list_dir` (dirs-first, sizes, 200-entry cap) ·
+      `content_search` (line-number grep, NUL-binary sniff, 1500-file /
+      3.5 s budget) · `web_fetch` (512 KB cap, HTML→text, SSRF host
+      block) · `download_file` (Downloads-only, 200 MB cap, HTML-page
+      guard, content-length + streamed cap+1 reader) · `web_search`
+      (DDG Lite HTML, keyless — user decision; redirect-unwrap +
+      entity-decode). Per-tool time budgets via one `tool_budget` table
+      (run_command/download 120 s, web_fetch 25 s, web_search 20 s,
+      else the 5 s voice default). 22 tools registered; llm.rs protocol
+      pin updated (ordering chain + Parameters count). Gate: 319 passed
+      / 0 failed / 1 ignored. E2E all six green through the real agent
+      loop (LFM3 picked the right tool every time with 22 tools
+      advertised). FINDINGS (e2e-driven, both fixed in-tool): (1)
+      content_search at repo-root scope MISSED `set_master_volume` —
+      DFS pops the alphabetically-last top-level subtree first and the
+      nested `zeroclaw` clone ate the whole 1500-file budget (walk sim:
+      tools.rs sat at position 2296/2304); fixed with a breadth-first
+      walk + skip nested `.git` clones on descent (explicit root INTO
+      a clone still searches it) + PARTIAL-budget note made louder +
+      desc now tells the model to retry with a narrower root. (2)
+      validate_web_url kept the `:port` in the authority so
+      `127.0.0.1:8018` slipped past the private-host block —
+      is_private_host now strips all-digit ports (IPv6 brackets
+      handled) and catches bare `::1`. Test-evidence notes: decode
+      entities' numeric branch must strip the trailing `;` before
+      parsing; `validate_command` checks the subcommand before control
+      bytes (test inputs must put the control byte in a later arg).
+- [ ] **Modularize tools.rs (~4.7k lines) and toolparse.rs (~2.7k
+      vendored)** — user call 2026-11-14, do AFTER the v2 commit:
+      tools.rs → `tools/` module split (registry core / per-family
+      tool files / shared helpers / tests split alongside, structure
+      only, gate stays 319/0/1); toolparse.rs → mechanical split
+      keeping the vendored-notice header and per-part origin markers
+      (upstream diffing gets harder — accepted).
 - [ ] **v2.5 — gated actions** (goal.md §1/§3 safety rows): two-step spoken
       confirm UX in the agent loop (state intent → wait for spoken yes →
       execute; barge-in interplay) · `close_app` (live-learned 2026-11-13:

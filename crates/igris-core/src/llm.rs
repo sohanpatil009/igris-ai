@@ -924,10 +924,13 @@ Persistent memory: personal facts the user has shared (preferences, plans, dates
         assert!(block.contains("### Available Tools"));
         assert!(block.ends_with("\n\n"));
         let c = block.find("**calculate**").unwrap();
+        let cs = block.find("**content_search**").unwrap();
         let cf = block.find("**create_folder**").unwrap();
         let cn = block.find("**create_note**").unwrap();
+        let df = block.find("**download_file**").unwrap();
         let fs = block.find("**file_search**").unwrap();
         let g = block.find("**get_time**").unwrap();
+        let ld = block.find("**list_dir**").unwrap();
         let mk = block.find("**media_key**").unwrap();
         let mr = block.find("**memory_recall**").unwrap();
         let ms = block.find("**memory_save**").unwrap();
@@ -935,27 +938,36 @@ Persistent memory: personal facts the user has shared (preferences, plans, dates
         let ou = block.find("**open_url**").unwrap();
         let rf = block.find("**read_file**").unwrap();
         let rs = block.find("**reminder_set**").unwrap();
+        let rc = block.find("**run_command**").unwrap();
         let sc = block.find("**screenshot**").unwrap();
         let sv = block.find("**set_volume**").unwrap();
         let ss = block.find("**sys_stats**").unwrap();
+        let wf = block.find("**web_fetch**").unwrap();
+        let ws = block.find("**web_search**").unwrap();
         assert!(
-            c < cf
+            c < cs
+                && cs < cf
                 && cf < cn
-                && cn < fs
+                && cn < df
+                && df < fs
                 && fs < g
-                && g < mk
+                && g < ld
+                && ld < mk
                 && mk < mr
                 && mr < ms
                 && ms < o
                 && o < ou
                 && ou < rf
                 && rf < rs
-                && rs < sc
+                && rs < rc
+                && rc < sc
                 && sc < sv
                 && sv < ss
+                && ss < wf
+                && wf < ws
         );
         // Every entry carries its schema on a Parameters line.
-        assert_eq!(block.matches("Parameters: `").count(), 16);
+        assert_eq!(block.matches("Parameters: `").count(), 22);
         // The calculate tenant's structured schema is advertised.
         assert!(block.contains("\"required\":[\"function\"]"));
     }

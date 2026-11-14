@@ -519,7 +519,7 @@ mod tests {
         let path = temp_store_path("dup");
         let mut store = MemoryStore::open(&path).unwrap();
         store.add(MemoryKind::Memory, "Likes green tea", &[], None).unwrap();
-        let (rec, existed) = store.add(MemoryKind::Memory, "  likes GREEN tea ", &[], None).unwrap();
+        let (_, existed) = store.add(MemoryKind::Memory, "  likes GREEN tea ", &[], None).unwrap();
         assert!(existed, "case/whitespace-insensitive duplicate detected");
         assert_eq!(store.len(), 1);
         /* Same words under a different kind are a distinct record. */

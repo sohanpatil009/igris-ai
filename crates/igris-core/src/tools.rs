@@ -51,6 +51,24 @@
 //! store + vendored mem0-rust similarity kernels — see that module's doc).
 //! Everything lives in `%APPDATA%\igris\memory.json` and survives restart.
 //!
+//! v2 (2026-11-14) — dev & browser (goal.md §4/§5/§6):
+//! - `run_command`     — curated program+subcommand allowlist (cargo dev
+//!   subcommands + read-only git), no shell; bare `cargo run` becomes
+//!   build-then-launch so the app stays alive after the reply
+//! - `list_dir`        — bounded directory listing (folders first, sizes)
+//! - `content_search`  — substring grep over text files with line numbers
+//!   (breadth-first walk, binary sniff, skips dependency trees AND nested
+//!   git clones, time/file budget)
+//! - `web_fetch`       — size-capped page reader (HTML → readable text,
+//!   JSON passthrough); loopback/private literal hosts refused
+//! - `download_file`   — streamed save into Downloads only (the fixed
+//!   writable path), 200 MB cap, HTML-page guard
+//! - `web_search`      — DuckDuckGo "lite" HTML backend (no API key;
+//!   user decision 2026-11-14), redirect unwrapping + entity decode
+//!
+//! Dev/network tools declare longer time budgets than the 5 s voice
+//! default through [`tool_budget`] (one auditable table).
+//!
 //! Dynamism ladder: v1 code-registered → v1.1 `tools.toml` config-defined
 //! tools (name/desc/schema + allowlisted command template, no recompile —
 //! `register` replaces a same-name tenant to make overrides possible) → v3
@@ -70,7 +88,7 @@
 //! sees inside the tool_result envelope when Phase 4 wires the loop.
 
 use crate::llm::ToolSpec;
-use crate::memory::{self, MemoryKind, MemoryRecord, ScoredMemory};
+use crate::memory::{self, MemoryKind, ScoredMemory};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,8 +123,25 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-/// Per-tool execution budget (voice UX: never deadlock the loop).
+/// Default per-tool execution budget (voice UX: never deadlock the loop).
 const TOOL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tools that legitimately outlive the 5 s voice budget. One table on
+/// purpose: a single glance shows everything allowed to run long, and the
+/// dispatch layer stays the only place that knows about budgets. Barge-in
+/// still cuts the whole turn, so a slow build never traps the user.
+fn tool_budget(name: &str) -> Duration {
+    match name {
+        // dev commands: a cold `cargo build`/`test` can take minutes
+        "run_command" => Duration::from_secs(120),
+        // streaming a large file over a slow link
+        "download_file" => Duration::from_secs(120),
+        // plain page loads / one search round-trip
+        "web_fetch" => Duration::from_secs(25),
+        "web_search" => Duration::from_secs(20),
+        _ => TOOL_TIMEOUT,
+    }
+}
 
 /// One executable tenant of the registry.
 #[derive(Clone)]
@@ -169,8 +204,10 @@ impl Registry {
     }
 
     /// Run a tool and wait for its result (sequential, voice-context).
+    /// The budget comes from [`tool_budget`]: 5 s for everything except
+    /// the v2 dev/network tools that declare a longer one.
     pub fn dispatch(&self, name: &str, args: &Value) -> Result<String, String> {
-        self.dispatch_with_timeout(name, args, TOOL_TIMEOUT)
+        self.dispatch_with_timeout(name, args, tool_budget(name))
     }
 
     /// Run a tool on a worker thread with a hard budget. Unknown names and
@@ -548,6 +585,156 @@ pub fn seed_registry() -> Registry {
             "required": ["content", "due_at"]
         }),
         run: Arc::new(run_reminder_set),
+    });
+    /* v2 — dev & browser (goal.md §4/§5/§6) */
+    r.register(ToolDef {
+        name: "run_command".to_string(),
+        desc: "Run a curated developer command in a project directory and return its \
+              output. Allowed programs ONLY: cargo (subcommands check, build, test, run, \
+              new, init, add, remove, fmt, clippy, tree) and git (read-only: status, \
+              log, diff, show, rev-parse). Bare 'cargo run' builds and launches the app \
+              in the background. Use for build/check/test/git requests like 'run cargo \
+              check on my project' or 'what is the git status of X'."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "program": {
+                    "type": "string",
+                    "description": "'cargo' or 'git'"
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Subcommand and arguments, e.g. ['check'] or \
+                        ['status']. First item must be an allowed subcommand."
+                },
+                "working_dir": {
+                    "type": "string",
+                    "description": "Optional project directory to run in, e.g. 'E:\\my\\project'"
+                }
+            },
+            "required": ["program", "args"]
+        }),
+        run: Arc::new(run_run_command),
+    });
+    r.register(ToolDef {
+        name: "list_dir".to_string(),
+        desc: "List the contents of a directory — folders first (trailing /), then \
+              files with sizes (capped at 200 entries). Use for 'show me the files in \
+              X', 'what is in my Downloads folder', 'show the project structure' \
+              requests. path defaults to the user's home directory."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory to list; defaults to the user's home directory"
+                }
+            }
+        }),
+        run: Arc::new(run_list_dir),
+    });
+    r.register(ToolDef {
+        name: "content_search".to_string(),
+        desc: "Search INSIDE text files (code, notes, configs) for a substring and \
+              return matching lines as file:line:text. Use for 'find where X is \
+              defined', 'search my code for X', 'which files mention X' requests. \
+              Skips binaries and dependency/vendor trees; may return partial \
+              results on huge folders — if the result says the budget was \
+              reached, retry with a narrower root (a subfolder)."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Text to find, e.g. 'fn dispatch' or 'todo:'"
+                },
+                "root": {
+                    "type": "string",
+                    "description": "Optional directory to search in; defaults to the user's common folders"
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Optional file filter like '*.rs' or '*.md'"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max matches to return (default 25)"
+                }
+            },
+            "required": ["query"]
+        }),
+        run: Arc::new(run_content_search),
+    });
+    r.register(ToolDef {
+        name: "web_fetch".to_string(),
+        desc: "Fetch a public web page and return its readable text (HTML converted \
+              to plain text; JSON/other text returned as-is; size-capped). Use for \
+              'summarize this URL', 'read this page', or to read a result found by \
+              web_search. Binary files are refused — use download_file for those."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The http(s) URL to fetch"
+                }
+            },
+            "required": ["url"]
+        }),
+        run: Arc::new(run_web_fetch),
+    });
+    r.register(ToolDef {
+        name: "download_file".to_string(),
+        desc: "Download a file from a public URL into the user's Downloads folder \
+              (the only writable location). Use for 'download this file/pdf/image' \
+              requests. Returns the saved path; refuses webpages (HTML) and files \
+              over 200 MB."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The http(s) URL of the file"
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Optional name for the saved file; derived from the URL when omitted"
+                }
+            },
+            "required": ["url"]
+        }),
+        run: Arc::new(run_download_file),
+    });
+    r.register(ToolDef {
+        name: "web_search".to_string(),
+        desc: "Search the public web with DuckDuckGo. Call this tool for ANY request \
+              phrased like 'search the web for ...', 'look up ... online', 'find ... \
+              on the internet', or whenever current/live information beyond your \
+              training is needed (news, versions, prices, docs). Returns ranked \
+              titles, URLs and snippets; follow up with web_fetch to read a page in \
+              full."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What to search for"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Max results to return (default 8)"
+                }
+            },
+            "required": ["query"]
+        }),
+        run: Arc::new(run_web_search),
     });
     r
 }
@@ -949,6 +1136,13 @@ const SEARCH_SKIP_DIRS: &[&str] = &[
     "venv",
     "__pycache__",
 ];
+
+/// A directory containing a `.git` entry (folder or worktree file) is a
+/// nested repository — dependency-tree semantics: skipped when
+/// descending (an explicit root INSIDE the clone still searches it).
+fn is_nested_repo(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
 
 /// Default roots when the caller gives none: the user's content folders.
 /// Missing ones are skipped silently.
@@ -1906,9 +2100,1104 @@ fn run_config_command(template: &[String], args: &Value) -> Result<String, Strin
     Ok(format!("Ran {}.", argv[0]))
 }
 
+/* ================================================================ */
+/* v2 — dev & browser (goal.md §4/§5/§6)                             */
+/* list_dir · content_search · run_command ·                        */
+/* web_fetch · download_file · web_search                           */
+/*                                                                  */
+/* Safety policy: run_command is a curated program+subcommand        */
+/* allowlist (no shell, argv direct); download_file writes only into */
+/* the user's Downloads folder; web tools block loopback/private     */
+/* literal hosts so a fetched page cannot send the assistant after   */
+/* local services; every web read is byte-capped.                   */
+/* ================================================================ */
+
+/* ---------------------------------------------------------------- */
+/* list_dir                                                          */
+/* ---------------------------------------------------------------- */
+
+/// Hard entry cap: voice replies never need thousands of lines.
+const LIST_DIR_MAX_ENTRIES: usize = 200;
+
+/// Human byte size ("12 B", "3.4 KB", "5.6 MB", "2.1 GB").
+fn fmt_bytes(n: u64) -> String {
+    const K: f64 = 1024.0;
+    let n = n as f64;
+    if n < K {
+        format!("{n} B")
+    } else if n < K * K {
+        format!("{:.1} KB", n / K)
+    } else if n < K * K * K {
+        format!("{:.1} MB", n / (K * K))
+    } else {
+        format!("{:.1} GB", n / (K * K * K))
+    }
+}
+
+fn run_list_dir(args: &Value) -> Result<String, String> {
+    let raw = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let path = if raw.is_empty() {
+        PathBuf::from(home_dir_string())
+    } else {
+        PathBuf::from(expand_home_path(&raw))
+    };
+    if !path.is_dir() {
+        return Err(format!("Not a directory (or not found): {}", path.display()));
+    }
+    let mut entries: Vec<(String, bool, u64)> = Vec::new();
+    let read = fs::read_dir(&path)
+        .map_err(|e| format!("Cannot list '{}': {e}", path.display()))?;
+    for entry in read.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        entries.push((name, meta.is_dir(), meta.len()));
+    }
+    let total = entries.len();
+    /* Folders first, then case-insensitive names — the shape Explorer shows. */
+    entries.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+    });
+    let shown = total.min(LIST_DIR_MAX_ENTRIES);
+    let mut out = format!("{total} entries in {}:", path.display());
+    for (name, is_dir, size) in &entries[..shown] {
+        if *is_dir {
+            out.push_str(&format!("\n  {name}/"));
+        } else {
+            out.push_str(&format!("\n  {name} ({})", fmt_bytes(*size)));
+        }
+    }
+    if total > shown {
+        out.push_str(&format!("\n  [and {} more entries]", total - shown));
+    }
+    Ok(out)
+}
+
+/* ---------------------------------------------------------------- */
+/* content_search — bounded text grep over a directory tree          */
+/* ---------------------------------------------------------------- */
+
+/// File cap + time budget: partial results beat a dispatch timeout.
+const CONTENT_MAX_FILES: usize = 1_500;
+const CONTENT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const CONTENT_DEFAULT_LIMIT: u64 = 25;
+const CONTENT_MAX_LIMIT: u64 = 100;
+const CONTENT_SNIPPET_CHARS: usize = 200;
+
+/// Cheap text-vs-binary gate: NUL bytes in the first 8 KiB. (read_file
+/// sniffs replacement-character ratio after a full decode; here the
+/// decision must happen BEFORE decoding, per file, inside the budget.)
+fn looks_binary(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = fs::File::open(path) else {
+        return true;
+    };
+    let mut head = [0u8; 8192];
+    let mut read = 0usize;
+    loop {
+        match f.read(&mut head[read..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                read += n;
+                if read == head.len() {
+                    break;
+                }
+            }
+            Err(_) => return true,
+        }
+    }
+    head[..read].contains(&0)
+}
+
+fn run_content_search(args: &Value) -> Result<String, String> {
+    let query = required_str(args, "query", "content_search")?;
+    let query_lc = query.trim().to_lowercase();
+    if query_lc.is_empty() {
+        return Err("query is empty".into());
+    }
+    let limit =
+        optional_u64(args, "limit", CONTENT_DEFAULT_LIMIT, 1, CONTENT_MAX_LIMIT) as usize;
+    /* glob = "*.rs" style extension filter; stored without the dot. */
+    let glob_ext: Option<String> = args
+        .get("glob")
+        .and_then(|v| v.as_str())
+        .and_then(|g| {
+            let g = g.trim().trim_start_matches('*').trim_start_matches('.');
+            if g.is_empty() {
+                None
+            } else {
+                Some(g.to_lowercase())
+            }
+        });
+    let roots: Vec<PathBuf> = match args.get("root").and_then(|v| v.as_str()) {
+        Some(root) => {
+            let expanded = PathBuf::from(expand_home_path(root));
+            if !expanded.is_dir() {
+                return Err(format!(
+                    "root directory does not exist: {}",
+                    expanded.display()
+                ));
+            }
+            vec![expanded]
+        }
+        None => default_search_roots(),
+    };
+    if roots.is_empty() {
+        return Err("no searchable user folders found on this machine".into());
+    }
+    let deadline = Instant::now() + SEARCH_TIME_BUDGET;
+    let mut hits: Vec<(PathBuf, usize, String)> = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut budget_hit = false;
+    /* Breadth-first on purpose: a DFS pops the alphabetically-LAST
+     * top-level subtree first (observed live: a nested clone starved
+     * `crates/` entirely at repo-root scope). BFS gives top-level
+     * project folders the first turn and dependency-like trees the
+     * last. */
+    use std::collections::VecDeque;
+    'roots: for root in &roots {
+        let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+        queue.push_back((root.clone(), 0usize));
+        while let Some((dir, depth)) = queue.pop_front() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if Instant::now() >= deadline || files_scanned >= CONTENT_MAX_FILES {
+                    budget_hit = true;
+                    break 'roots;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    let name_lc = entry.file_name().to_string_lossy().to_lowercase();
+                    if depth < SEARCH_MAX_DEPTH
+                        && !name_lc.starts_with('.')
+                        && !SEARCH_SKIP_DIRS.contains(&name_lc.as_str())
+                        && !is_nested_repo(&path)
+                    {
+                        queue.push_back((path, depth + 1));
+                    }
+                    continue;
+                }
+                if let Some(ext) = &glob_ext {
+                    if path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase())
+                        != Some(ext.clone())
+                    {
+                        continue;
+                    }
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.len() > CONTENT_MAX_FILE_BYTES {
+                    continue;
+                }
+                files_scanned += 1;
+                if looks_binary(&path) {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(&path) else { continue };
+                let text = String::from_utf8_lossy(&bytes);
+                for (idx, line) in text.lines().enumerate() {
+                    if line.to_lowercase().contains(&query_lc) {
+                        let trimmed: String = line
+                            .trim_end()
+                            .chars()
+                            .take(CONTENT_SNIPPET_CHARS)
+                            .collect();
+                        hits.push((path.clone(), idx + 1, trimmed));
+                        if hits.len() >= limit {
+                            break 'roots;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let scope = if roots.len() == 1 {
+        roots[0].display().to_string()
+    } else {
+        "the user's common folders".to_string()
+    };
+    let budget_note = if budget_hit {
+        " (search budget reached before every folder was scanned — \
+         results may be PARTIAL)"
+    } else {
+        ""
+    };
+    if hits.is_empty() {
+        return Ok(format!(
+            "No matches for '{query}'{budget_note} after scanning {files_scanned} text \
+             files under {scope}."
+        ));
+    }
+    let mut out = format!(
+        "Found {} match(es) for '{query}'{budget_note} after scanning {files_scanned} \
+         text files under {scope}:",
+        hits.len()
+    );
+    for (path, line_no, line) in &hits {
+        out.push_str(&format!("\n{}:{line_no}: {line}", path.display()));
+    }
+    Ok(out)
+}
+
+/* ---------------------------------------------------------------- */
+/* run_command — curated program+subcommand allowlist                */
+/* ---------------------------------------------------------------- */
+
+/// Output ceiling fed to the model (compiler dumps can be enormous).
+const RUN_COMMAND_MAX_OUTPUT_CHARS: usize = 4_000;
+/// Internal kill deadline. Deliberately BELOW the dispatch budget
+/// (`tool_budget("run_command")` = 120 s) so the tool always answers
+/// before the dispatcher gives up.
+const RUN_COMMAND_INTERNAL_BUDGET: Duration = Duration::from_secs(105);
+
+/// goal.md safety rules: never free-form. Program → permitted first
+/// argument (the subcommand). `cargo run` is listed because it gets the
+/// special two-phase build-then-launch path below.
+const COMMAND_ALLOWLIST: &[(&str, &[&str])] = &[
+    (
+        "cargo",
+        &[
+            "check", "build", "test", "run", "new", "init", "add", "remove", "fmt",
+            "clippy", "tree",
+        ],
+    ),
+    ("git", &["status", "log", "diff", "show", "rev-parse"]),
+];
+
+fn allowed_subcommands(program: &str) -> Option<&'static [&'static str]> {
+    COMMAND_ALLOWLIST
+        .iter()
+        .find(|(p, _)| *p == program)
+        .map(|(_, subs)| *subs)
+}
+
+fn validate_command(program: &str, args: &[String]) -> Result<(), String> {
+    let Some(subs) = allowed_subcommands(program) else {
+        return Err(format!(
+            "Program '{program}' is not allowed. Allowed: {}",
+            COMMAND_ALLOWLIST
+                .iter()
+                .map(|(p, _)| *p)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    if args.is_empty() {
+        return Err(format!(
+            "Missing subcommand for '{program}'. Allowed: {}",
+            subs.join(", ")
+        ));
+    }
+    let sub = args[0].as_str();
+    if !subs.contains(&sub) {
+        return Err(format!(
+            "'{program} {sub}' is not allowed. Allowed: {}",
+            subs.join(", ")
+        ));
+    }
+    for a in args {
+        if a.is_empty() {
+            return Err("empty command argument".into());
+        }
+        /* No NUL (would truncate the argv) and no control bytes (no
+         * newline smuggling into a console). Values are otherwise
+         * verbatim argv entries — no shell, so no metacharacter risk. */
+        if a.bytes().any(|b| b == 0 || b < 0x20) {
+            return Err(format!("invalid control character in command argument '{a}'"));
+        }
+    }
+    Ok(())
+}
+
+/// Spawn + capture + bounded wait. Returns (exit code, combined output).
+/// `CREATE_NO_WINDOW` keeps console flashes off the desktop when the
+/// assistant itself runs headless.
+fn run_command_output(
+    prog: &str,
+    args: &[String],
+    wd: Option<&Path>,
+) -> Result<(i32, String), String> {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new(prog);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = wd {
+        cmd.current_dir(dir);
+    }
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Could not start {prog}: {e}"))?;
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let t_out = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stdout_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stderr_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if started.elapsed() >= RUN_COMMAND_INTERNAL_BUDGET {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("Could not wait for {prog}: {e}")),
+        }
+    };
+    let mut out_bytes = t_out.join().unwrap_or_default();
+    let err_bytes = t_err.join().unwrap_or_default();
+    if !out_bytes.is_empty() && !err_bytes.is_empty() && !out_bytes.ends_with(b"\n") {
+        out_bytes.push(b'\n');
+    }
+    out_bytes.extend_from_slice(&err_bytes);
+    let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+    Ok((exit_code, String::from_utf8_lossy(&out_bytes).into_owned()))
+}
+
+/// Shared output ceiling: cap by chars, append a truncation marker.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push_str(&format!(
+        "\n[truncated: showing first {max_chars} of {total} characters]"
+    ));
+    out
+}
+
+/// First `name = "..."` inside the `[package]` section of a Cargo.toml
+/// (line scan: comments and later sections ignored).
+fn manifest_package_name(text: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line.eq_ignore_ascii_case("[package]");
+            continue;
+        }
+        if in_package && !line.starts_with('#') && line.starts_with("name") {
+            if let Some(v) = line.split('=').nth(1) {
+                let v = v.trim().trim_matches('"').trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Two-phase bare `cargo run`: build (captured, bounded), then launch the
+/// built executable detached so the app stays alive after the reply —
+/// a bounded capture cannot do that (a never-exiting app would hang the
+/// turn or get killed). Workspace manifests without a `[package]` section
+/// fall back to a plain bounded `cargo run`.
+fn cargo_build_then_launch(wd: Option<&Path>) -> Result<String, String> {
+    let dir = wd
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let manifest = dir.join("Cargo.toml");
+    let manifest_text = fs::read_to_string(&manifest)
+        .map_err(|e| format!("Cannot read {}: {e}", manifest.display()))?;
+    let Some(pkg) = manifest_package_name(&manifest_text) else {
+        let (code, text) = run_command_output("cargo", &["run".to_string()], Some(&dir))?;
+        return Ok(format!(
+            "'cargo run' in {} finished with exit code {code}:\n{}",
+            dir.display(),
+            truncate_chars(&text, RUN_COMMAND_MAX_OUTPUT_CHARS)
+        ));
+    };
+    let (code, text) = run_command_output("cargo", &["build".to_string()], Some(&dir))?;
+    if code != 0 {
+        return Ok(format!(
+            "Build failed (exit code {code}):\n{}",
+            truncate_chars(&text, RUN_COMMAND_MAX_OUTPUT_CHARS)
+        ));
+    }
+    /* cargo maps hyphens to underscores in executable names. */
+    let exe = dir
+        .join("target")
+        .join("debug")
+        .join(format!("{}.exe", pkg.replace('-', "_")));
+    if !exe.is_file() {
+        return Err(format!(
+            "Build reported success but {} was not found",
+            exe.display()
+        ));
+    }
+    let launch = std::process::Command::new(&exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Could not launch {}: {e}", exe.display()))?;
+    let pid = launch.id();
+    drop(launch);
+    Ok(format!(
+        "Build succeeded; launched {} (pid {pid}). It keeps running in the background.",
+        exe.display()
+    ))
+}
+
+fn run_run_command(args: &Value) -> Result<String, String> {
+    let program = required_str(args, "program", "run_command")?
+        .trim()
+        .to_lowercase();
+    let cmd_args: Vec<String> = match args.get("args") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect(),
+        _ => return Err("Missing required parameter: args (array of strings)".into()),
+    };
+    validate_command(&program, &cmd_args)?;
+    let wd: Option<PathBuf> = match args.get("working_dir").and_then(|v| v.as_str()) {
+        Some(d) if !d.trim().is_empty() => {
+            let p = PathBuf::from(expand_home_path(d));
+            if !p.is_dir() {
+                return Err(format!("working_dir does not exist: {}", p.display()));
+            }
+            Some(p)
+        }
+        _ => None,
+    };
+
+    /* Bare `cargo run` gets the build-then-launch treatment. `cargo run
+     * -- <appargs>` keeps bounded-capture semantics on purpose. */
+    if program == "cargo" && cmd_args.len() == 1 && cmd_args[0] == "run" {
+        return cargo_build_then_launch(wd.as_deref());
+    }
+
+    let (code, text) = run_command_output(&program, &cmd_args, wd.as_deref())?;
+    let wd_note = wd
+        .as_ref()
+        .map(|p| format!(" in {}", p.display()))
+        .unwrap_or_default();
+    let out = if text.trim().is_empty() {
+        "(no output)".to_string()
+    } else {
+        truncate_chars(text.trim_end(), RUN_COMMAND_MAX_OUTPUT_CHARS)
+    };
+    Ok(format!(
+        "'{} {}'{wd_note} finished with exit code {code}:\n{out}",
+        program,
+        cmd_args.join(" ")
+    ))
+}
+
+/* ---------------------------------------------------------------- */
+/* web shared: agent, URL policy, entity decode                      */
+/* ---------------------------------------------------------------- */
+
+/// Browser-like UA: many sites (and DDG) 403 unknown clients.
+const WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/// Web agent for the v2 browser tools — separate from the LLM server
+/// agent (different timeout regime); per-request timeouts set at call
+/// time so each tool controls its own budget.
+static WEB_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .user_agent(WEB_USER_AGENT)
+        .build()
+        .into()
+});
+
+const WEB_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
+const WEB_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn web_get(
+    url: &str,
+    timeout: Duration,
+) -> Result<ureq::http::Response<ureq::Body>, String> {
+    WEB_AGENT
+        .get(url)
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call()
+        .map_err(|e| e.to_string())
+}
+
+/// Same scheme/character policy as `validate_open_url`, plus a block on
+/// loopback/private LITERAL hosts (SSRF guard: fetched-page content must
+/// never be able to send the assistant after local services). Best
+/// effort by hostname literal — DNS-resolution checks are out of scope.
+fn validate_web_url(url: &str) -> Result<(), String> {
+    validate_open_url(url)?;
+    let rest = url.trim();
+    let rest = rest.split_once("://").map(|(_, r)| r).unwrap_or(rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    /* strip userinfo */
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    if is_private_host(host) {
+        return Err(format!(
+            "Local/private addresses are not allowed for web tools (got '{host}')"
+        ));
+    }
+    Ok(())
+}
+
+fn is_private_host(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_lowercase();
+    if h.is_empty()
+        || h == "localhost"
+        || h == "0.0.0.0"
+        || h.ends_with(".localhost")
+        || h.ends_with(".local")
+    {
+        return true;
+    }
+    /* [IPv6] or [IPv6]:port — a bare suffix(']') strip would miss ports. */
+    if let Some(end) = h.find(']') {
+        let inner = &h[1..end];
+        let v6 = inner.split('%').next().unwrap_or(inner);
+        return v6 == "::1"
+            || v6.starts_with("fe8")
+            || v6.starts_with("fc")
+            || v6.starts_with("fd");
+    }
+    /* Bare host, possibly with a :port suffix — an authority like
+     * "127.0.0.1:8018" keeps the port, so the port must go before the
+     * IPv4 parse. Only strip an all-digit port when the prefix is a
+     * dotted/IPv4-shaped address (a bracket-less IPv6 like ::1 has no
+     * port and would be mangled by the split). */
+    let bare = if let Some(colon) = h.rfind(':') {
+        let (addr, port) = (&h[..colon], &h[colon + 1..]);
+        if !port.is_empty()
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && (addr.contains('.') || addr.parse::<std::net::Ipv4Addr>().is_ok())
+        {
+            addr
+        } else {
+            h.as_str()
+        }
+    } else {
+        h.as_str()
+    };
+    if let Ok(ip) = bare.parse::<std::net::Ipv4Addr>() {
+        return ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_broadcast()
+            || ip.is_unspecified();
+    }
+    /* Bracket-less IPv6 loopback (invalid in a URL authority, but cheap
+     * to catch; no legal DNS name contains a colon). */
+    bare.starts_with("::1")
+}
+
+/// Decode common HTML entities found in page/search text (named + decimal
+/// + hex numeric). Unknown or malformed entities pass through unchanged.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let entity = rest.find(';').filter(|&i| i <= 10).map(|i| &rest[..=i]);
+        match entity {
+            Some(e) => {
+                match e {
+                    "&amp;" => out.push('&'),
+                    "&lt;" => out.push('\u{3c}'),
+                    "&gt;" => out.push('\u{3e}'),
+                    "&quot;" => out.push('"'),
+                    "&apos;" | "&#39;" => out.push('\''),
+                    "&nbsp;" => out.push(' '),
+                    other => {
+                        if let Some(num) = other.strip_prefix("&#") {
+                            /* `other` still carries the terminating ';' */
+                            let num = num.strip_suffix(';').unwrap_or(num);
+                            let decoded = if let Some(hex) =
+                                num.strip_prefix('x').or_else(|| num.strip_prefix('X'))
+                            {
+                                u32::from_str_radix(hex, 16).ok()
+                            } else {
+                                num.parse::<u32>().ok()
+                            };
+                            match decoded.and_then(char::from_u32) {
+                                Some(c) => out.push(c),
+                                None => out.push_str(other),
+                            }
+                        } else {
+                            out.push_str(other);
+                        }
+                    }
+                }
+                rest = &rest[e.len()..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/* ---------------------------------------------------------------- */
+/* web_fetch — size-capped readable-text page reader                 */
+/* ---------------------------------------------------------------- */
+
+/// Hard byte cap on the response body actually read.
+const FETCH_MAX_BYTES: usize = 512 * 1024;
+/// Ceiling fed to the model after conversion.
+const FETCH_MAX_CHARS: usize = 6_000;
+
+static HTML_COMMENT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)\x3c!--.*?--\x3e").expect("static regex"));
+static HTML_SCRIPT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)\x3cscript\b[^>]*>.*?\x3c/script\x3e"#).expect("static regex")
+});
+static HTML_STYLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)\x3cstyle\b[^>]*>.*?\x3c/style\x3e"#).expect("static regex")
+});
+static HTML_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)\x3c(?:br\b[^>]*|/(?:p|div|h[1-6]|li|tr|td|table|ul|ol|blockquote|",
+        r"section|article|header|footer|nav|main|pre)\b[^>]*)\x3e"
+    ))
+    .expect("static regex")
+});
+static HTML_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x3c[^>]*\x3e").expect("static regex"));
+static HTML_WS_RUN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(" {2,}").expect("static regex"));
+
+/// Minimal HTML-to-readable-text conversion for model consumption:
+/// scripts/styles/comments removed, block boundaries become newlines,
+/// remaining tags stripped, entities decoded, whitespace collapsed.
+fn html_to_text(html: &str) -> String {
+    let s = HTML_COMMENT_RE.replace_all(html, " ");
+    let s = HTML_SCRIPT_RE.replace_all(&s, " ");
+    let s = HTML_STYLE_RE.replace_all(&s, " ");
+    let s = HTML_BLOCK_RE.replace_all(&s, "\n");
+    let s = HTML_TAG_RE.replace_all(&s, " ");
+    let s = HTML_WS_RUN_RE.replace_all(&s, " ");
+    let s = decode_entities(&s);
+    let mut out = String::with_capacity(s.len());
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+fn is_binary_content_type(ctype: &str) -> bool {
+    let main = ctype.split(';').next().unwrap_or("").trim();
+    if main.is_empty() {
+        return false; /* unknown: try the text path, sniffed next */
+    }
+    !(main.starts_with("text/")
+        || main.contains("json")
+        || main.contains("xml")
+        || main.contains("javascript")
+        || main.contains("csv"))
+}
+
+fn run_web_fetch(args: &Value) -> Result<String, String> {
+    use std::io::Read;
+    let url = required_str(args, "url", "web_fetch")?;
+    validate_web_url(url)?;
+    let url = url.trim().to_string();
+    let resp = web_get(&url, WEB_FETCH_TIMEOUT)
+        .map_err(|e| format!("Could not fetch {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status} from {url}"));
+    }
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if is_binary_content_type(&ctype) {
+        return Err(format!(
+            "'{url}' serves binary content ({ctype}) — web_fetch returns text; use \
+             download_file for files."
+        ));
+    }
+    /* take(cap + 1): read at most the cap, and one extra byte flags a
+     * bigger page without ever tripping the reader's own limit. */
+    let mut reader = resp
+        .into_body()
+        .into_with_config()
+        .limit((FETCH_MAX_BYTES + 1) as u64)
+        .reader();
+    let mut buf: Vec<u8> = Vec::new();
+    (&mut reader)
+        .take((FETCH_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Could not read body of {url}: {e}"))?;
+    let truncated = buf.len() > FETCH_MAX_BYTES;
+    buf.truncate(FETCH_MAX_BYTES);
+    let text = String::from_utf8_lossy(&buf);
+    let readable = if ctype.contains("html") || (ctype.is_empty() && text.contains('\u{3c}')) {
+        html_to_text(&text)
+    } else {
+        text.into_owned()
+    };
+    let mut out = truncate_chars(&readable, FETCH_MAX_CHARS);
+    if truncated {
+        out.push_str("\n[page larger than the fetch cap; content truncated]");
+    }
+    Ok(format!("Content of {url}:\n{out}"))
+}
+
+/* ---------------------------------------------------------------- */
+/* download_file — streamed save into Downloads (fixed writable path) */
+/* ---------------------------------------------------------------- */
+
+const DOWNLOAD_MAX_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Path-safety: no separators, no traversal, no reserved/control chars,
+/// no leading dots, sane length.
+fn sanitize_filename(name: &str) -> String {
+    let mut out: String = name
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '\u{3c}' | '\u{3e}' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    while out.starts_with('.') {
+        out.remove(0);
+    }
+    if out.is_empty() || out.chars().all(|c| c == '_') {
+        return String::new();
+    }
+    out.chars().take(100).collect()
+}
+
+/// Last non-empty path segment of a URL (query/fragment stripped),
+/// percent-decoded.
+fn download_filename_from_url(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let segment = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
+    percent_decode(segment)
+}
+
+/// Percent-decode %XX escapes (bytes preserved), everything else
+/// verbatim. Lossy UTF-8 on the final join.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            /* need bytes[i+1] and bytes[i+2] */
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(b) = hex {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn run_download_file(args: &Value) -> Result<String, String> {
+    use std::io::{Read, Write};
+    let url = required_str(args, "url", "download_file")?;
+    validate_web_url(url)?;
+    let url = url.trim().to_string();
+    let dir = dirs::download_dir().ok_or("Could not resolve the user's Downloads folder")?;
+    if !dir.is_dir() {
+        return Err(format!("Downloads folder not found: {}", dir.display()));
+    }
+    let name = match args.get("filename").and_then(|v| v.as_str()) {
+        Some(f) => {
+            let s = sanitize_filename(f);
+            if s.is_empty() {
+                return Err(format!("Invalid filename '{f}'"));
+            }
+            s
+        }
+        None => {
+            let derived = sanitize_filename(&download_filename_from_url(&url));
+            if derived.is_empty() {
+                return Err(
+                    "Could not derive a filename from the URL — pass a filename".into()
+                );
+            }
+            derived
+        }
+    };
+    let target = dir.join(&name);
+    if target.exists() {
+        return Err(format!(
+            "'{name}' already exists in Downloads — choose a different filename"
+        ));
+    }
+    let resp = web_get(&url, WEB_DOWNLOAD_TIMEOUT)
+        .map_err(|e| format!("Could not fetch {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status} from {url}"));
+    }
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if ctype.starts_with("text/html") {
+        return Err(format!(
+            "'{url}' returned a webpage (HTML), not a downloadable file — it may be an \
+             error page or a link to a viewer page."
+        ));
+    }
+    if let Some(len) = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if len > DOWNLOAD_MAX_BYTES {
+            return Err(format!(
+                "File is {len} bytes; download limit is {DOWNLOAD_MAX_BYTES}"
+            ));
+        }
+    }
+    /* LimitReader at cap+1: any server trying to exceed the cap errors
+     * out and the partial file is deleted — never a runaway disk write. */
+    let mut reader = resp
+        .into_body()
+        .into_with_config()
+        .limit(DOWNLOAD_MAX_BYTES + 1)
+        .reader();
+    let mut file = fs::File::create(&target)
+        .map_err(|e| format!("Could not create {}: {e}", target.display()))?;
+    let mut total: u64 = 0;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n as u64;
+                if total > DOWNLOAD_MAX_BYTES {
+                    drop(file);
+                    let _ = fs::remove_file(&target);
+                    return Err(format!(
+                        "File exceeds the {DOWNLOAD_MAX_BYTES} byte download limit; aborted"
+                    ));
+                }
+                file.write_all(&chunk[..n])
+                    .map_err(|e| format!("Write failed: {e}"))?;
+            }
+            Err(e) => {
+                drop(file);
+                let _ = fs::remove_file(&target);
+                return Err(format!("Download failed: {e}"));
+            }
+        }
+    }
+    let _ = file.flush();
+    Ok(format!(
+        "Downloaded {name} ({}) to {}",
+        fmt_bytes(total),
+        target.display()
+    ))
+}
+
+/* ---------------------------------------------------------------- */
+/* web_search — DuckDuckGo "lite" HTML backend (no API key)          */
+/* ---------------------------------------------------------------- */
+
+const SEARCH_RESULTS_DEFAULT: u64 = 8;
+const SEARCH_RESULTS_MAX: u64 = 15;
+const SEARCH_PAGE_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct WebResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// Clean a fragment (title/snippet): strip inline tags, decode entities,
+/// collapse whitespace.
+fn clean_html_fragment(s: &str) -> String {
+    let stripped = HTML_TAG_RE.replace_all(s, " ");
+    let decoded = decode_entities(&stripped);
+    HTML_WS_RUN_RE
+        .replace_all(&decoded, " ")
+        .trim()
+        .to_string()
+}
+
+/// `//duckduckgo.com/l/?uddg=<percent-encoded-target>&rut=…` redirect
+/// wrappers carry the real target in the uddg parameter.
+fn unwrap_ddg_redirect(href: &str) -> String {
+    let h = href.trim();
+    for prefix in [
+        "//duckduckgo.com/l/?uddg=",
+        "https://duckduckgo.com/l/?uddg=",
+        "http://duckduckgo.com/l/?uddg=",
+    ] {
+        if let Some(rest) = h.strip_prefix(prefix) {
+            let end = rest.find('&').unwrap_or(rest.len());
+            return percent_decode(&rest[..end]);
+        }
+    }
+    if let Some(rest) = h.strip_prefix("//") {
+        return format!("https://{rest}");
+    }
+    h.to_string()
+}
+
+/// Parse the DuckDuckGo "lite" result page. Markup verified live
+/// 2026-11-14 (probe): result titles in `class='result-link'` anchors
+/// (href is the redirect wrapper above), snippets in
+/// `class='result-snippet'` cells, in result order. Quote style varies,
+/// so the regexes accept both. Snippets are zipped by index — a result
+/// without a snippet row can shift alignment (accepted trade-off).
+fn parse_ddg_lite(html: &str) -> Vec<WebResult> {
+    static LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)\x3ca\b[^>]*class\s*=\s*['"]result-link['"][^>]*>(.*?)\x3c/a\x3e"#)
+            .expect("static regex")
+    });
+    static HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)\x3ca\b[^>]*href\s*=\s*['"]([^'"]+)['"]"#).expect("static regex")
+    });
+    static SNIP_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)\x3ctd\b[^>]*class\s*=\s*['"]result-snippet['"][^>]*>(.*?)\x3c/td\x3e"#)
+            .expect("static regex")
+    });
+    let mut results: Vec<WebResult> = Vec::new();
+    for m in LINK_RE.find_iter(html) {
+        let tag_and_text = m.as_str();
+        let url = HREF_RE
+            .captures(tag_and_text)
+            .and_then(|c| c.get(1))
+            .map(|h| unwrap_ddg_redirect(h.as_str()))
+            .unwrap_or_default();
+        if url.is_empty() {
+            continue;
+        }
+        let title = LINK_RE
+            .captures(tag_and_text)
+            .and_then(|c| c.get(1))
+            .map(|t| clean_html_fragment(t.as_str()))
+            .unwrap_or_default();
+        results.push(WebResult {
+            title,
+            url,
+            snippet: String::new(),
+        });
+    }
+    let snippets: Vec<String> = SNIP_RE
+        .captures_iter(html)
+        .filter_map(|c| c.get(1))
+        .map(|c| clean_html_fragment(c.as_str()))
+        .collect();
+    for (i, r) in results.iter_mut().enumerate() {
+        if let Some(s) = snippets.get(i) {
+            r.snippet = s.clone();
+        }
+    }
+    results
+}
+
+fn run_web_search(args: &Value) -> Result<String, String> {
+    let query = required_str(args, "query", "web_search")?;
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("query is empty".into());
+    }
+    let limit = optional_u64(
+        args,
+        "max_results",
+        SEARCH_RESULTS_DEFAULT,
+        1,
+        SEARCH_RESULTS_MAX,
+    ) as usize;
+    let url = format!(
+        "https://lite.duckduckgo.com/lite/?q={}",
+        url_encode_value(query)
+    );
+    let resp = web_get(&url, WEB_SEARCH_TIMEOUT)
+        .map_err(|e| format!("Search failed: {e}"))?;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        return Err(format!(
+            "DuckDuckGo returned HTTP {status} — the search backend may be \
+             rate-limiting; try again shortly."
+        ));
+    }
+    let html = resp
+        .into_body()
+        .into_with_config()
+        .limit(SEARCH_PAGE_MAX_BYTES as u64)
+        .read_to_string()
+        .map_err(|e| format!("Could not read search page: {e}"))?;
+    let results = parse_ddg_lite(&html);
+    if results.is_empty() {
+        return Err(
+            "DuckDuckGo returned no parseable results (markup change or bot challenge) — \
+             try rephrasing the query."
+                .into(),
+        );
+    }
+    let shown = results.len().min(limit);
+    let mut out = format!("Top {shown} web results for '{query}':");
+    for (i, r) in results.iter().take(shown).enumerate() {
+        out.push_str(&format!("\n{}. {}\n   {}", i + 1, r.title, r.url));
+        if !r.snippet.is_empty() {
+            out.push_str(&format!("\n   {}", r.snippet));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::MemoryRecord;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
@@ -1948,10 +3237,13 @@ mod tests {
             vec![
                 "activity_log",
                 "calculate",
+                "content_search",
                 "create_folder",
                 "create_note",
+                "download_file",
                 "file_search",
                 "get_time",
+                "list_dir",
                 "media_key",
                 "memory_recall",
                 "memory_save",
@@ -1959,9 +3251,12 @@ mod tests {
                 "open_url",
                 "read_file",
                 "reminder_set",
+                "run_command",
                 "screenshot",
                 "set_volume",
-                "sys_stats"
+                "sys_stats",
+                "web_fetch",
+                "web_search"
             ]
         );
     }
@@ -2830,7 +4125,7 @@ command = ["notepad.exe", "{text}"]
         }
         let names: Vec<String> = r.specs().into_iter().map(|s| s.name).collect();
         assert!(names.contains(&"play_song".to_string()));
-        assert_eq!(names.len(), 17); /* 16 built-ins + 1 config tenant */
+        assert_eq!(names.len(), 23); /* 22 built-ins + 1 config tenant */
         /* register() replaces same-name tenants: an override of get_time. */
         let defs = parse_config_tools(
             r#"
@@ -2845,5 +4140,382 @@ schema = '{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]
         r.register(defs.into_iter().next().unwrap());
         let get_time = r.specs().into_iter().find(|s| s.name == "get_time").unwrap();
         assert!(get_time.description.contains("Config override"));
+    }
+
+    /* ---- v2: per-tool budgets ---- */
+
+    #[test]
+    fn tool_budget_gives_v2_tools_more_than_the_voice_default() {
+        assert_eq!(tool_budget("run_command"), Duration::from_secs(120));
+        assert_eq!(tool_budget("download_file"), Duration::from_secs(120));
+        assert_eq!(tool_budget("web_fetch"), Duration::from_secs(25));
+        assert_eq!(tool_budget("web_search"), Duration::from_secs(20));
+        /* everything else keeps the 5 s voice budget */
+        assert_eq!(tool_budget("get_time"), TOOL_TIMEOUT);
+        assert_eq!(tool_budget("no_such_tool"), TOOL_TIMEOUT);
+    }
+
+    /* ---- list_dir ---- */
+
+    #[test]
+    fn list_dir_sorts_dirs_first_and_shows_sizes() {
+        let root = temp_root("listdir");
+        fs::create_dir_all(root.join("beta_dir")).unwrap();
+        fs::create_dir_all(root.join("gamma_dir")).unwrap();
+        fs::write(root.join("alpha_file.txt"), "hello world").unwrap();
+        let out = reg()
+            .dispatch("list_dir", &json!({"path": root.to_string_lossy()}))
+            .unwrap();
+        let b = out.find("beta_dir/").unwrap();
+        let g = out.find("gamma_dir/").unwrap();
+        let a = out.find("alpha_file.txt (11 B)").unwrap();
+        assert!(b < g && g < a, "{out}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_dir_caps_at_200_entries_with_overflow_note() {
+        let root = temp_root("listdir_cap");
+        for i in 0..205 {
+            fs::write(root.join(format!("f{i:03}.txt")), "x").unwrap();
+        }
+        let out = reg()
+            .dispatch("list_dir", &json!({"path": root.to_string_lossy()}))
+            .unwrap();
+        /* count file lines only — the overflow note also starts "\n  " */
+        assert_eq!(out.matches("\n  f").count(), 200);
+        assert!(out.contains("[and 5 more entries]"), "{out}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_dir_errors_on_missing_dir_and_defaults_to_home() {
+        assert!(
+            reg()
+                .dispatch("list_dir", &json!({"path": "Z:\\definitely\\missing"}))
+                .is_err()
+        );
+        /* no path -> the user's home listing (home exists in test envs) */
+        let out = reg().dispatch("list_dir", &json!({})).unwrap();
+        assert!(out.contains("entries in"), "{out}");
+    }
+
+    /* ---- content_search ---- */
+
+    #[test]
+    fn content_search_finds_lines_skips_binary_and_skipped_dirs() {
+        let root = temp_root("contentsearch");
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::write(
+            root.join("code.rs"),
+            "use std;\n\nfn dispatch_here() {}\nlet x = DISPATCH_SIZE;\n",
+        )
+        .unwrap();
+        fs::write(root.join("notes.md"), "DISPATCH means send\n").unwrap();
+        fs::write(root.join("node_modules").join("gone.txt"), "dispatch secret\n").unwrap();
+        fs::write(root.join("bin.dat"), b"dispatch\x00binary").unwrap();
+        let out = reg()
+            .dispatch(
+                "content_search",
+                &json!({"query": "dispatch", "root": root.to_string_lossy()}),
+            )
+            .unwrap();
+        assert!(out.contains("code.rs:3"), "{out}");
+        assert!(out.contains("code.rs:4"), "{out}");
+        assert!(out.contains("notes.md:1"), "{out}");
+        /* binary + dependency trees never surface */
+        assert!(!out.contains("bin.dat"), "{out}");
+        assert!(!out.contains("node_modules"), "{out}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn content_search_glob_filter_and_bad_root() {
+        let root = temp_root("contentsearch_glob");
+        fs::write(root.join("code.rs"), "needle here\n").unwrap();
+        fs::write(root.join("notes.md"), "needle there\n").unwrap();
+        let out = reg()
+            .dispatch(
+                "content_search",
+                &json!({"query": "needle", "root": root.to_string_lossy(), "glob": "*.rs"}),
+            )
+            .unwrap();
+        assert!(out.contains("code.rs:1"), "{out}");
+        assert!(!out.contains("notes.md"), "{out}");
+        let err = reg()
+            .dispatch(
+                "content_search",
+                &json!({"query": "x", "root": "Z:\\no\\such\\dir"}),
+            )
+            .unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn content_search_skips_nested_repos_on_descent() {
+        let root = temp_root("contentsearch_repo");
+        fs::create_dir_all(root.join("nested").join(".git")).unwrap();
+        fs::write(root.join("nested").join("hidden.txt"), "needle in a clone\n").unwrap();
+        fs::write(root.join("top.txt"), "needle at top\n").unwrap();
+        let out = reg()
+            .dispatch(
+                "content_search",
+                &json!({"query": "needle", "root": root.to_string_lossy()}),
+            )
+            .unwrap();
+        assert!(out.contains("top.txt:1"), "{out}");
+        assert!(!out.contains("nested"), "{out}");
+        /* an explicit root INTO the nested repo still searches it */
+        let out = reg()
+            .dispatch(
+                "content_search",
+                &json!({
+                    "query": "needle",
+                    "root": root.join("nested").to_string_lossy()
+                }),
+            )
+            .unwrap();
+        assert!(out.contains("hidden.txt:1"), "{out}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /* ---- run_command ---- */
+
+    #[test]
+    fn run_command_allowlist_rejects_free_form() {
+        let err = reg()
+            .dispatch(
+                "run_command",
+                &json!({"program": "python", "args": ["-c", "print(1)"]}),
+            )
+            .unwrap_err();
+        assert!(err.contains("is not allowed"), "{err}");
+        let err = reg()
+            .dispatch("run_command", &json!({"program": "cargo", "args": ["clean"]}))
+            .unwrap_err();
+        assert!(err.contains("not allowed"), "{err}");
+        let err = reg()
+            .dispatch("run_command", &json!({"program": "git", "args": ["push", "origin"]}))
+            .unwrap_err();
+        assert!(err.contains("not allowed"), "{err}");
+        let err = reg()
+            .dispatch("run_command", &json!({"program": "git", "args": []}))
+            .unwrap_err();
+        assert!(err.contains("Missing subcommand"), "{err}");
+        let err = reg()
+            .dispatch(
+                "run_command",
+                &json!({"program": "git", "args": ["status", "--short\n"]}),
+            )
+            .unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    #[test]
+    fn run_command_real_git_status_reports_exit_code() {
+        /* Read-only, fast, and proves the whole spawn-capture-wait path. */
+        let out = reg()
+            .dispatch(
+                "run_command",
+                &json!({
+                    "program": "git",
+                    "args": ["status"],
+                    "working_dir": env!("CARGO_MANIFEST_DIR")
+                }),
+            )
+            .unwrap();
+        assert!(out.contains("finished with exit code 0"), "{out}");
+        assert!(out.contains("'git status'"), "{out}");
+    }
+
+    #[test]
+    fn run_command_output_reports_nonzero_exit_without_failing() {
+        let (code, text) = run_command_output(
+            "git",
+            &["log".to_string(), "--definitely-not-a-flag".to_string()],
+            Some(Path::new(env!("CARGO_MANIFEST_DIR"))),
+        )
+        .unwrap();
+        assert_ne!(code, 0);
+        assert!(!text.is_empty(), "usage errors print something");
+    }
+
+    #[test]
+    fn run_command_working_dir_must_exist() {
+        let err = reg()
+            .dispatch(
+                "run_command",
+                &json!({"program": "git", "args": ["status"], "working_dir": "Z:\\no\\dir"}),
+            )
+            .unwrap_err();
+        assert!(err.contains("working_dir does not exist"), "{err}");
+    }
+
+    #[test]
+    fn manifest_package_name_scans_only_the_package_section() {
+        let text = "[package]\n# name = \"commented\"\nname = \"my-app\"\nedition = \"2024\"\n\
+                    \n[dependencies]\nname = \"should-not-win\"\n";
+        assert_eq!(manifest_package_name(text), Some("my-app".to_string()));
+        assert_eq!(manifest_package_name("[workspace]\nmembers = []\n"), None);
+    }
+
+    /* ---- shared v2 helpers ---- */
+
+    #[test]
+    fn percent_decode_sanitize_and_format_helpers() {
+        assert_eq!(
+            percent_decode("https%3A%2F%2Frust%2Dlang.org%2F"),
+            "https://rust-lang.org/"
+        );
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("%E2%82%AC"), "\u{20AC}");
+        assert_eq!(percent_decode("100%"), "100%"); /* dangling escape passes through */
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(sanitize_filename("a\u{3c}b\u{3e}:x?.txt"), "a_b__x_.txt");
+        assert_eq!(sanitize_filename("../x"), "_x");
+        assert_eq!(sanitize_filename("   "), "");
+        assert_eq!(sanitize_filename("___"), "");
+        assert_eq!(
+            download_filename_from_url("https://x.com/files/report%202026.pdf?dl=1"),
+            "report 2026.pdf"
+        );
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(2048), "2.0 KB");
+        assert_eq!(fmt_bytes(5_600_000), "5.3 MB");
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        let t = truncate_chars("hello world", 5);
+        assert!(t.starts_with("hello") && t.contains("[truncated"), "{t}");
+    }
+
+    /* ---- web tools: pure helpers + validation (live network is e2e) ---- */
+
+    #[test]
+    fn web_urls_block_private_hosts_and_non_http() {
+        for bad in [
+            "http://127.0.0.1:8018/health",
+            "https://localhost/x",
+            "http://10.0.0.5/x",
+            "http://192.168.1.10/x",
+            "http://172.16.0.1/x",
+            "http://169.254.169.254/metadata",
+            "http://[::1]:8080/x",
+            "http://machine.local/x",
+            "ftp://example.com/file",
+        ] {
+            assert!(validate_web_url(bad).is_err(), "must reject {bad}");
+        }
+        validate_web_url("https://example.com/page?q=1").unwrap();
+        validate_web_url("http://example.com").unwrap();
+    }
+
+    #[test]
+    fn decode_entities_named_decimal_hex_and_unknown() {
+        assert_eq!(decode_entities("a&amp;b"), "a&b");
+        assert_eq!(decode_entities("&lt;tag&gt;"), "\u{3c}tag\u{3e}");
+        assert_eq!(decode_entities("&quot;hi&quot;"), "\"hi\"");
+        assert_eq!(decode_entities("it&#39;s"), "it's");
+        assert_eq!(decode_entities("a&nbsp;b"), "a b");
+        assert_eq!(decode_entities("&#65;&#x42;"), "AB");
+        assert_eq!(decode_entities("&unknown;"), "&unknown;");
+        assert_eq!(decode_entities("100% & this"), "100% & this");
+    }
+
+    /// Angle tags written as escapes — no raw tag text in source.
+    const HTML_FIXTURE: &str = "\x3chtml\x3e\x3chead\x3e\x3ctitle\x3eMy Page\x3c/title\x3e\
+\x3cstyle\x3e.x{color:red}\x3c/style\x3e\x3c/head\x3e\
+\x3cbody\x3e\x3c!-- hidden --\x3e\x3ch1\x3eHello\x3c/h1\x3e\
+\x3cp\x3eFirst&nbsp;paragraph with \x3cb\x3ebold\x3c/b\x3e &amp; entities.\x3c/p\x3e\
+\x3cscript\x3ealert('no');\x3c/script\x3e\
+\x3cul\x3e\x3cli\x3eone\x3c/li\x3e\x3cli\x3etwo\x3c/li\x3e\x3c/ul\x3e\x3c/body\x3e\x3c/html\x3e";
+
+    #[test]
+    fn html_to_text_strips_noise_keeps_readable_text() {
+        let text = html_to_text(HTML_FIXTURE);
+        assert!(text.contains("My Page"), "{text}");
+        assert!(text.contains("Hello"), "{text}");
+        assert!(text.contains("First paragraph with bold & entities."), "{text}");
+        assert!(text.contains("one") && text.contains("two"), "{text}");
+        assert!(!text.contains("alert"), "{text}");
+        assert!(!text.contains("color:red"), "{text}");
+        assert!(!text.contains("hidden"), "{text}");
+    }
+
+    #[test]
+    fn binary_content_type_classification() {
+        assert!(is_binary_content_type("image/png"));
+        assert!(is_binary_content_type("application/pdf"));
+        assert!(is_binary_content_type("application/octet-stream"));
+        assert!(!is_binary_content_type("text/html; charset=utf-8"));
+        assert!(!is_binary_content_type("application/json"));
+        assert!(!is_binary_content_type("application/xhtml+xml"));
+        assert!(!is_binary_content_type(""));
+    }
+
+    /* Real markup shape captured live from lite.duckduckgo.com (probe,
+     * 2026-11-14): redirect-wrapped hrefs with percent-encoded targets,
+     * single-quoted classes, snippet cells in result order. */
+    const DDG_FIXTURE: &str = "\x3ctable\x3e\
+\x3ctr\x3e\x3ctd\x3e\x3ca rel='nofollow' href='//duckduckgo.com/l/?uddg=https%3A%2F%2Frust%2Dlang.org%2F&amp;rut=abc123' class='result-link'\x3eRust \x3cb\x3eProgramming\x3c/b\x3e Language\x3c/a\x3e\x3c/td\x3e\x3c/tr\x3e\
+\x3ctr\x3e\x3ctd\x3e&nbsp;&nbsp;&nbsp;\x3c/td\x3e\x3ctd class='result-snippet'\x3eA language empowering everyone to build reliable &amp; efficient software.\x3c/td\x3e\x3c/tr\x3e\
+\x3ctr\x3e\x3ctd\x3e\x3cspan class='link-text'\x3erust-lang.org\x3c/span\x3e\x3c/td\x3e\x3c/tr\x3e\
+\x3ctr\x3e\x3ctd\x3e\x3ca rel='nofollow' href='//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust%2Dlang.org%2F&amp;rut=def456' class='result-link'\x3eThe Rustdoc book\x3c/a\x3e\x3c/td\x3e\x3c/tr\x3e\
+\x3ctr\x3e\x3ctd\x3e&nbsp;&nbsp;&nbsp;\x3c/td\x3e\x3ctd class='result-snippet'\x3eLearn the language &lt;em&gt;for free&lt;/em&gt;\x3c/td\x3e\x3c/tr\x3e\
+\x3c/table\x3e";
+
+    #[test]
+    fn parse_ddg_lite_extracts_results_redirects_and_snippets() {
+        let results = parse_ddg_lite(DDG_FIXTURE);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert_eq!(results[0].title, "Rust Programming Language");
+        assert_eq!(results[0].url, "https://rust-lang.org/");
+        assert_eq!(
+            results[0].snippet,
+            "A language empowering everyone to build reliable & efficient software."
+        );
+        assert_eq!(results[1].title, "The Rustdoc book");
+        assert_eq!(results[1].url, "https://doc.rust-lang.org/");
+        assert_eq!(results[1].snippet, "Learn the language \u{3c}em\u{3e}for free\u{3c}/em\u{3e}");
+    }
+
+    #[test]
+    fn unwrap_ddg_redirect_variants() {
+        assert_eq!(
+            unwrap_ddg_redirect("//duckduckgo.com/l/?uddg=https%3A%2F%2Fx.org%2F&rut=z"),
+            "https://x.org/"
+        );
+        assert_eq!(
+            unwrap_ddg_redirect("https://duckduckgo.com/l/?uddg=a%20b&rut=z"),
+            "a b"
+        );
+        assert_eq!(
+            unwrap_ddg_redirect("//example.com/plain"),
+            "https://example.com/plain"
+        );
+        assert_eq!(
+            unwrap_ddg_redirect("https://example.com/full"),
+            "https://example.com/full"
+        );
+    }
+
+    #[test]
+    fn web_search_and_fetch_validation_errors() {
+        let err = reg().dispatch("web_search", &json!({"query": "   "})).unwrap_err();
+        assert!(err.contains("query is empty"), "{err}");
+        let err = reg()
+            .dispatch("web_fetch", &json!({"url": "http://127.0.0.1:8018/health"}))
+            .unwrap_err();
+        assert!(err.contains("Local/private"), "{err}");
+        let err = reg()
+            .dispatch("web_fetch", &json!({"url": "notaurl"}))
+            .unwrap_err();
+        assert!(err.contains("Only http"), "{err}");
+        let err = reg()
+            .dispatch(
+                "download_file",
+                &json!({"url": "https://example.com/f.pdf", "filename": "   "}),
+            )
+            .unwrap_err();
+        assert!(err.contains("Invalid filename"), "{err}");
     }
 }
