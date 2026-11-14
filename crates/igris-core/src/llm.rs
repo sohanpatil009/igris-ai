@@ -141,7 +141,8 @@ fn tool_call_protocol_instructions() -> String {
          {open}\n\
          {{\"name\": \"tool_name\", \"arguments\": {{\"param\": \"value\"}}}}\n\
          {close}\n\n\
-         You may use multiple tool calls in a single response. After tool execution, results appear in {result} tags. Continue reasoning with the results until you can give a final answer.\n\n",
+         You may use multiple tool calls in a single response. After tool execution, results appear in {result} tags. Continue reasoning with the results until you can give a final answer.\n\n\
+         Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first — never claim you don't know without checking.\n\n",
         open = toolparse::TOOL_CALL_OPEN,
         close = toolparse::TOOL_CALL_CLOSE,
         result = toolparse::TOOL_RESULT_OPEN,
@@ -911,7 +912,8 @@ Example: User says something that needs a tool. You MUST respond with a real cal
             + close
             + "\n\nYou may use multiple tool calls in a single response. After tool execution, results appear in "
             + result
-            + " tags. Continue reasoning with the results until you can give a final answer.\n\n";
+            + " tags. Continue reasoning with the results until you can give a final answer.\n\n\
+Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first — never claim you don't know without checking.\n\n";
         assert_eq!(tool_call_protocol_instructions(), expected);
     }
 
@@ -923,29 +925,37 @@ Example: User says something that needs a tool. You MUST respond with a real cal
         assert!(block.ends_with("\n\n"));
         let c = block.find("**calculate**").unwrap();
         let cf = block.find("**create_folder**").unwrap();
+        let cn = block.find("**create_note**").unwrap();
         let fs = block.find("**file_search**").unwrap();
         let g = block.find("**get_time**").unwrap();
         let mk = block.find("**media_key**").unwrap();
+        let mr = block.find("**memory_recall**").unwrap();
+        let ms = block.find("**memory_save**").unwrap();
         let o = block.find("**open_app**").unwrap();
         let ou = block.find("**open_url**").unwrap();
         let rf = block.find("**read_file**").unwrap();
+        let rs = block.find("**reminder_set**").unwrap();
         let sc = block.find("**screenshot**").unwrap();
         let sv = block.find("**set_volume**").unwrap();
         let ss = block.find("**sys_stats**").unwrap();
         assert!(
             c < cf
-                && cf < fs
+                && cf < cn
+                && cn < fs
                 && fs < g
                 && g < mk
-                && mk < o
+                && mk < mr
+                && mr < ms
+                && ms < o
                 && o < ou
                 && ou < rf
-                && rf < sc
+                && rf < rs
+                && rs < sc
                 && sc < sv
                 && sv < ss
         );
         // Every entry carries its schema on a Parameters line.
-        assert_eq!(block.matches("Parameters: `").count(), 11);
+        assert_eq!(block.matches("Parameters: `").count(), 16);
         // The calculate tenant's structured schema is advertised.
         assert!(block.contains("\"required\":[\"function\"]"));
     }

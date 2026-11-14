@@ -15,6 +15,7 @@ pub mod assist;
 pub mod hotkey;
 pub mod llm;
 pub mod live;
+pub mod memory;
 pub mod models;
 pub mod paths;
 pub mod toolparse;

@@ -157,8 +157,9 @@ register/replace, specs generated into the prompt, timeout-guarded dispatch —
 and `tools.toml` (v1.1) covers extension without recompiling. The old
 "v3 MCP/WASM" rung is replaced by this roadmap; an MCP client becomes a
 someday-optional `mcp_tool` tenant type if a community integration is ever
-preferred over writing it. mem0-rs was evaluated for persistent memory and
-REJECTED (see v1.2).
+preferred over writing it. Persistent memory shipped in v1.2 as a hybrid:
+own sync store + vendored mem0-rust similarity kernels (whole-crate
+vendoring was rejected; see v1.2).
 
 - [x] **v1.1 — system & files** (goal.md §1/§3/§5) — DONE 2026-11-14:
       - [x] **batch 1 DONE 2026-11-14**: `file_search` (bounded
@@ -270,12 +271,81 @@ REJECTED (see v1.2).
             play_song dispatched, browser opened (ShellExecuteW success),
             reply clean; the batch-2 screenshot tool confirmed session
             state. New deps: serde (derive), toml 0.9.
-- [ ] **v1.2 — memory** (goal.md §7): own ~150-LOC JSON store (mem0-rs
-      rejected 2026-11-13: single-version crates with double-digit lifetime
-      downloads, stale; mem0-style LLM extraction adds write-time latency +
-      nondeterminism this doesn't need) · `memory_save`, `memory_recall`,
-      `create_note` (workspace-scoped), `activity_log`, `reminder_set` ·
-      must survive restart
+- [x] **v1.2 — memory** (goal.md §7) — DONE 2026-11-14: approach — hybrid
+      (user choice): own persistent sync store + vendored mem0-rust
+      utilities. Deep source examination 2026-11-14 of
+      `mem0-rust` 0.2.0 (YASSERRMD — the real crate; "mem0-rs"
+      404s on crates.io; mem0-rust itself = 1 version, 70 lifetime downloads,
+      MIT, tokio-based): core `Memory` orchestrates Embedder → VectorStore →
+      optional LLM → optional SQLite history → optional reranker, all
+      async/tokio. Key facts: (a) default backend = `InMemoryStore`
+      (RwLock HashMap) + `MockEmbedder` (hash-of-tokens vectors) → EVERYTHING
+      volatile, restart = amnesia; the SQLite side persists only an audit
+      history log, NOT the memories; (b) persistence is explicitly outsourced
+      to external servers (Qdrant / Postgres+pgvector / Redis) — there is NO
+      local-file or SQLite vector backend; (c) inference path = 2 LLM calls
+      per write (fact extraction + update decisions) — unneeded here because
+      the tool-call layer already does extraction with user intent;
+      (d) found a real shipped bug: `reset()` has a `TODO: Build proper
+      filters` → scoped reset silently wipes ALL memories + history;
+      (e) vendoring the whole crate for IGRIS would mean WE write the
+      persistent vector-store backend (the hard part), an embedder story,
+      and a tokio↔sync bridge, then strip reqwest/HuggingFace/
+      Anthropic/graph/rerankers/pyo3/bins. What shipped instead
+      (`crates/igris-core/src/memory.rs` + tools): new module `memory` —
+      `MemoryStore` (sync, file-backed at `%APPDATA%\igris\memory.json`,
+      same trust domain as tools.toml; pretty JSON, versioned envelope,
+      atomic write = tmp + rename on EVERY mutation; corrupt file is
+      quarantined as `memory.json.corrupt-<stamp>` — never destroyed,
+      store restarts fresh) with kinds Memory/Note/Activity/Reminder
+      (id `m<millis>-<seq>`, tags normalized lowercase+dedup, created_at
+      local `%Y-%m-%d %H:%M:%S`, due_at verbatim for reminders).
+      VENDORED from mem0-rust 0.2.0 (MIT, attribution header, same
+      precedent as toolparse.rs/ZeroClaw): `cosine_similarity` + the
+      hash-of-tokens embedder (`hash_embed`, EMBED_DIMS=128), sync ports
+      of the same math. Recall is hybrid: exact substring (1.0) > tag
+      match incl. kind label singular/plural ("what are my reminders"
+      surfaces the whole kind; y→ies plural rule) (0.9) > vendored cosine
+      ≥ 0.2 ("similar"); ties break to newest; embeddings recomputed at
+      recall time (no vectors on disk — file stays human-readable);
+      exact-duplicate adds are not re-inserted (ci-equal same-kind
+      content → "already saved"). Zero new deps (chrono/serde/dirs
+      already present). Tools: `memory_save`, `memory_recall` (query +
+      optional tags filter + limit 1-50), `create_note`, `activity_log`,
+      `reminder_set` (content+due_at required; due_at stored verbatim,
+      ISO 8601 encouraged). Hermeticity: memory tool run fns validate
+      args BEFORE locking the process-wide store, so lib tests exercise
+      only the validation path via dispatch — the store logic (including
+      a unit-level survive-restart proof: write → drop → reopen →
+      recall) is tested directly in memory.rs with temp dirs. Gate 299
+      passed / 0 failed / 1 ignored (+14 tests: 11 memory + 2 tools
+      validation/format + sorted-names & count pins updated 11→16).
+      e2e (each CLI run = a fresh process, so this is real restart
+      survival): "remember that my exam is on March 3rd, and remind me
+      to call mom tomorrow at 9am" → ONE round, [tools] memory_save +
+      reminder_set; NEXT process "when is my exam?" → [tools]
+      memory_recall → March 3rd; "what reminders do I have?" → Call mom
+      (kind-label match, zero word overlap); "note that the wifi password
+      is hunter2" → saved (model chose memory_save with tags wifi/
+      password — reasonable for a durable fact; create_note unused that
+      turn); next process "what is my wifi password?" → hunter2.
+      PROMPT FINDING (e2e-driven): with the plain description, LFM3
+      skipped memory_recall for generic phrasings ("what is my X" —
+      answered "I don't have access" without calling any tool) while
+      "do you remember..." triggered it. Two fixes landed: (1) tool-call
+      protocol instructions gained a persistent-memory rule (call
+      memory_recall before claiming ignorance; pin updated); (2)
+      description rewritten to trigger-phrase form ("Call this tool for
+      ANY question phrased like 'what is my ...', 'when is my ...',
+      'do you remember ...'") — this second one flipped the failing
+      phrasing to a correct cross-session recall. Known model traits
+      (not bugs): hash-token collisions can add a low-score "similar"
+      rider to recall results (keyword hits always rank first; tests
+      assert collision-tolerance); activity_log saw no natural use this
+      session — its automation ("activity log wired into gated actions")
+      stays a v2.5 item. One transient environmental note: a full gate
+      once hung ~20 min on a stale build lock (no cargo process was
+      left); rerun passed — treat as machine noise, not a code issue.
 - [ ] **v2 — dev & browser** (goal.md §4/§6): allowlisted `run_command` ·
       `list_dir`, `content_search` · `web_fetch` (ureq, size-capped) ·
       `download_file` · `web_search` (one backend decision: DDG HTML vs
