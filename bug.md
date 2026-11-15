@@ -13,12 +13,6 @@ FIXED (in ledger).
 
 ## Open
 
-### BUG-007 — screenshots accumulate without bound in OneDrive Pictures — LOW (hygiene) — OPEN
-Every screenshot writes `C:\Users\sohan\OneDrive\Pictures\igris_screenshot_*.png`
-and nothing ever cleans up (OneDrive syncs them, too).
-Fix direction: rotate (keep last N) or a spoken "clear my screenshots"
-path; note OneDrive sync cost in the decision.
-
 ### BUG-008 — run_command cargo new/init can create folders anywhere — LOW (design review) — OPEN
 `cargo new` / `cargo init` are allowlisted and write a project folder
 into `working_dir` (or the process cwd) — i.e. writes OUTSIDE the
@@ -69,6 +63,13 @@ exit cleanly after a spawn?
 
 ## Fixed recently (ledger)
 
+- 2026-11-15 (`6cbc9fe`): default screenshots accumulated without bound
+  in the OneDrive-synced Pictures folder — after a default-path capture
+  the oldest `igris_screenshot_*.png` beyond 20 are pruned (stamp order
+  = age order, the just-saved file is protected, explicit user paths
+  and unrelated files are never touched, prune failures are ignored);
+  OneDrive note: deletions sync downward too, so the synced volume
+  stays bounded (BUG-007).
 - 2026-11-15 (`2cefc53`): llama-server reuse trusted a bare /health 200
   — ensure_server now identifies the running server via /props before
   reusing (GGUF file name from model_path/model_alias vs the bundled
