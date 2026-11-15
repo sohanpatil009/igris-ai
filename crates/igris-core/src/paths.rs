@@ -61,8 +61,17 @@ pub fn asset(name: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Both tests read/manipulate MOON_ASSETS, and cargo runs test
+    /// functions on parallel threads: without this lock the env test can
+    /// hold the var mid-set between the other test's two asset_root()
+    /// calls, making them resolve to different roots (observed 2026-11-15
+    /// as an intermittent `joined.starts_with(&root)` failure — the
+    /// concrete instance behind BUG-009's flaky-lib-test family).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn asset_joins_fragments_under_the_root() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = asset_root();
         let joined = asset("llama-cpp/vulkan/llama-server.exe");
         assert!(joined.starts_with(&root));
@@ -71,21 +80,16 @@ mod tests {
 
     #[test]
     fn mo_assets_env_overrides_the_root() {
-        // SAFETY: single-threaded test process, env var not read elsewhere
-        // in this test binary's concurrent tests? It is read by asset_root
-        // in the other test — serialize the pair by ordering: this test
-        // restores the var, and the other test tolerates any root.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = "MOON_ASSETS";
         let saved = std::env::var(key).ok();
-        /* SAFETY: test-only env manipulation; the process is single-threaded
-         * at this point and the var is restored (or removed) right after. */
+        /* Test-only env manipulation: serialized by ENV_LOCK above, and
+         * the var is restored (or removed) right after. */
         unsafe { std::env::set_var(key, "Z:/override") };
         let root = asset_root();
         if let Some(v) = saved {
-            /* SAFETY: same single-threaded test context as above. */
             unsafe { std::env::set_var(key, v) };
         } else {
-            /* SAFETY: same single-threaded test context as above. */
             unsafe { std::env::remove_var(key) };
         }
         assert_eq!(root, PathBuf::from("Z:/override"));
