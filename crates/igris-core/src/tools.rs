@@ -100,6 +100,7 @@ mod basic;
 mod config_tools;
 mod dev;
 mod files;
+mod gated;
 mod memory_tools;
 mod registry;
 mod shared;
@@ -116,6 +117,10 @@ use crate::tools::config_tools::CONFIG_TOOLS;
 use crate::tools::dev::run_run_command;
 use crate::tools::files::{
     run_content_search, run_create_folder, run_file_search, run_list_dir, run_read_file,
+};
+use crate::tools::gated::{
+    plan_close_app, plan_delete_file, plan_power_mode, plan_shutdown, run_close_app,
+    run_delete_file, run_power_mode, run_shutdown, run_shutdown_abort,
 };
 use crate::tools::memory_tools::{
     run_activity_log, run_create_note, run_memory_recall, run_memory_save, run_reminder_set,
@@ -663,6 +668,93 @@ pub fn seed_registry() -> Registry {
         gated: false,
         plan: None,
         run: Arc::new(run_web_search),
+    });
+    /* v2.5 — gated actions (goal.md): destructive actions that only run
+     * after a confirmed re-call (crate::gating). shutdown_abort is the
+     * UNGATED safety counterpart: canceling is always safe. */
+    r.register(ToolDef {
+        name: "close_app".to_string(),
+        desc: "Close one of the allowed desktop applications (notepad, calc, chrome, \
+              spotify, vscode). Windows get a close request first; anything still \
+              open after a short wait is force-closed — except notepad, which is \
+              never force-closed (it may hold unsaved documents)."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "app": {
+                    "type": "string",
+                    "enum": ["notepad", "calc", "chrome", "spotify", "vscode"],
+                    "description": "Which app to close"
+                }
+            },
+            "required": ["app"]
+        }),
+        gated: true,
+        plan: Some(Arc::new(plan_close_app)),
+        run: Arc::new(run_close_app),
+    });
+    r.register(ToolDef {
+        name: "delete_file".to_string(),
+        desc: "Move a single file to the Recycle Bin (recoverable from there). Use \
+              for 'delete the file X' requests. Folders are refused; system \
+              locations, program folders, the profile root itself and this app's \
+              own directory are protected."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File to delete (absolute, or ~ based)"
+                }
+            },
+            "required": ["path"]
+        }),
+        gated: true,
+        plan: Some(Arc::new(plan_delete_file)),
+        run: Arc::new(run_delete_file),
+    });
+    r.register(ToolDef {
+        name: "power_mode".to_string(),
+        desc: "Switch the Windows power plan: saver, balanced, or performance. \
+              Use for 'switch to high performance' / 'power saving mode' requests."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["saver", "balanced", "performance"],
+                    "description": "Which power plan to switch to"
+                }
+            },
+            "required": ["mode"]
+        }),
+        gated: true,
+        plan: Some(Arc::new(plan_power_mode)),
+        run: Arc::new(run_power_mode),
+    });
+    r.register(ToolDef {
+        name: "shutdown".to_string(),
+        desc: "Shut the PC down in 30 seconds. All open apps close; unsaved work \
+              is lost. The countdown can be canceled with shutdown_abort."
+            .to_string(),
+        schema: json!({"type": "object", "properties": {}, "required": []}),
+        gated: true,
+        plan: Some(Arc::new(plan_shutdown)),
+        run: Arc::new(run_shutdown),
+    });
+    r.register(ToolDef {
+        name: "shutdown_abort".to_string(),
+        desc: "Cancel a pending shutdown countdown. Harmless when no shutdown is \
+              pending. Use it when the user says 'abort the shutdown' or changes \
+              their mind after a shutdown was announced."
+            .to_string(),
+        schema: json!({"type": "object", "properties": {}, "required": []}),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_shutdown_abort),
     });
     r
 }

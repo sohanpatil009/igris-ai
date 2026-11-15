@@ -1234,10 +1234,12 @@ Gated tools: their first call only validates the action and announces the plan â
         assert!(block.contains("### Available Tools"));
         assert!(block.ends_with("\n\n"));
         let c = block.find("**calculate**").unwrap();
+        let ca = block.find("**close_app**").unwrap();
         let cs = block.find("**content_search**").unwrap();
         let cf = block.find("**create_folder**").unwrap();
         let cn = block.find("**create_note**").unwrap();
-        let df = block.find("**download_file**").unwrap();
+        let df = block.find("**delete_file**").unwrap();
+        let dl = block.find("**download_file**").unwrap();
         let fs = block.find("**file_search**").unwrap();
         let g = block.find("**get_time**").unwrap();
         let ld = block.find("**list_dir**").unwrap();
@@ -1246,20 +1248,25 @@ Gated tools: their first call only validates the action and announces the plan â
         let ms = block.find("**memory_save**").unwrap();
         let o = block.find("**open_app**").unwrap();
         let ou = block.find("**open_url**").unwrap();
+        let pm = block.find("**power_mode**").unwrap();
         let rf = block.find("**read_file**").unwrap();
         let rs = block.find("**reminder_set**").unwrap();
         let rc = block.find("**run_command**").unwrap();
         let sc = block.find("**screenshot**").unwrap();
         let sv = block.find("**set_volume**").unwrap();
+        let sd = block.find("**shutdown**").unwrap();
+        let sda = block.find("**shutdown_abort**").unwrap();
         let ss = block.find("**sys_stats**").unwrap();
         let wf = block.find("**web_fetch**").unwrap();
         let ws = block.find("**web_search**").unwrap();
         assert!(
-            c < cs
+            c < ca
+                && ca < cs
                 && cs < cf
                 && cf < cn
                 && cn < df
-                && df < fs
+                && df < dl
+                && dl < fs
                 && fs < g
                 && g < ld
                 && ld < mk
@@ -1267,17 +1274,20 @@ Gated tools: their first call only validates the action and announces the plan â
                 && mr < ms
                 && ms < o
                 && o < ou
-                && ou < rf
+                && ou < pm
+                && pm < rf
                 && rf < rs
                 && rs < rc
                 && rc < sc
                 && sc < sv
-                && sv < ss
+                && sv < sd
+                && sd < sda
+                && sda < ss
                 && ss < wf
                 && wf < ws
         );
         // Every entry carries its schema on a Parameters line.
-        assert_eq!(block.matches("Parameters: `").count(), 22);
+        assert_eq!(block.matches("Parameters: `").count(), 27);
         // The calculate tenant's structured schema is advertised.
         assert!(block.contains("\"required\":[\"function\"]"));
     }
