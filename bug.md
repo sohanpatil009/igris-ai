@@ -13,17 +13,6 @@ FIXED (in ledger).
 
 ## Open
 
-### BUG-003 — fake inline tool_result JSON leaks into display/TTS — HIGH (UX) — OPEN
-When LFM3 hallucinates a fake tool result AFTER a clean final answer
-(bare `{"name": …, "result": …, "status": "ok"}` JSON with no envelope),
-the parser correctly ignores it (no dispatchable shape survives), but
-`StreamFilter` releases it to display/TTS — a stray JSON line leaks into
-the chat/voice output. Observed live in v1.1 e2e.
-Fix direction: StreamFilter hold-back should treat a trailing bare
-`{"name":…,"result":…,"status":…}` line the way DSML spans are held —
-hold it until it is provably not tool machinery, then drop it.
-(Also tracked in todo.md under v1.1 batch 1 follow-up.)
-
 ### BUG-004 — memory recall returns hash-collision "similar" riders — MED (quality) — OPEN
 v1.2 finding: hash-token collisions can attach a low-score "similar"
 record to recall results even when it is not truly related; keyword
@@ -116,6 +105,14 @@ crash, not a test failure).
 
 ## Fixed recently (ledger)
 
+- 2026-11-15 (`2a93c0d`): a hallucinated bare tool-result JSON after a
+  clean final answer (`{"name": …, "result": …, "status": …}` with no
+  envelope) leaked to display/TTS — StreamFilter now holds any bare
+  JSON object from its opening spell and drops it at the closing brace
+  when the fake-result signature matches (name + result/status);
+  non-machinery objects release verbatim, protocol spans inside the
+  held object mark it contaminated, and the trigger never preempts a
+  preceding envelope opener (BUG-003).
 - 2026-11-15 (`07b0e20`): non-canonical IPv4 literals (2130706433,
   127.1, 0x7f.0.0.1, 0177.0.0.1) bypassed the private-host block —
   is_private_host now refuses any host whose every dot-segment is

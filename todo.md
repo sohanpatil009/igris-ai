@@ -220,7 +220,13 @@ vendoring was rejected; see v1.2).
             the parser correctly ignores it but the StreamFilter releases
             it to display/TTS — the JSON line leaks into the chat/voice
             output. Stream-filter follow-up: hold/strip trailing
-            fake-tool_result JSON the same way DSML spans are held.
+            fake-tool_result JSON the same way DSML spans are held —
+            DONE 2026-11-15 (`2a93c0d`, BUG-003): the fake-result
+            signature (name + result/status) is held from its `{"` spell
+            and dropped at the closing brace; non-machinery JSON releases
+            verbatim, protocol spans inside the held object mark it
+            contaminated, and the trigger never preempts a preceding
+            envelope opener; gate 331/0/1.
       - [x] **batch 2 DONE 2026-11-14**: `sys_stats` (GetSystemTimes CPU
             sampled over ~150 ms + GlobalMemoryStatusEx RAM +
             GetDiskFreeSpaceExW on %SystemDrive% + GetSystemPowerStatus
