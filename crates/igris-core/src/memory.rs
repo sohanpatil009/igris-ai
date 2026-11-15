@@ -39,6 +39,17 @@ pub const EMBED_DIMS: usize = 128;
 /// Cosine similarity below which a non-keyword candidate is not returned.
 const RECALL_SIMILARITY_THRESHOLD: f32 = 0.2;
 
+/// When keyword hits (exact/tag) are already present, a `similar` rider
+/// must score within this margin of the top hit to join them (BUG-004):
+/// hash-token collisions produce low non-zero cosines (observed ~0.26
+/// for the "march 3rd"-vs-mom collision, deterministic per build) that
+/// passed the base floor and rode along with keyword results as noise
+/// the model may read aloud. The floor never drops below
+/// [`RECALL_SIMILARITY_THRESHOLD`], and the pure-similar path (no
+/// keyword hits in the result) is unaffected — weakly-related hits are
+/// all the answer a keyword-less query has.
+const RECALL_RIDER_MARGIN: f32 = 0.6;
+
 /* ================================================================ */
 /* Vendored from mem0-rust 0.2.0                                     */
 /*                                                                   */
@@ -276,9 +287,11 @@ impl MemoryStore {
 
     /// Hybrid recall: `tags` (when given) restrict to records carrying any
     /// of them; scoring is exact substring > tag match > vendored cosine
-    /// (dropped below [`RECALL_SIMILARITY_THRESHOLD`]); ties break toward
-    /// the most recent record. Scans every record — trivial at assistant
-    /// scale, and there is no index to keep in sync.
+    /// (dropped below [`RECALL_SIMILARITY_THRESHOLD`], and next to
+    /// keyword hits a similar rider must additionally come within
+    /// [`RECALL_RIDER_MARGIN`] of the top hit — BUG-004); ties break
+    /// toward the most recent record. Scans every record — trivial at
+    /// assistant scale, and there is no index to keep in sync.
     pub fn recall(&self, query: &str, tags: &[String], limit: usize) -> Vec<ScoredMemory> {
         let query = query.trim();
         if query.is_empty() {
@@ -324,6 +337,18 @@ impl MemoryStore {
                 score,
                 via,
             });
+        }
+
+        /* BUG-004: when a keyword hit (exact/tag) leads the results, a
+         * `similar` rider must come within RECALL_RIDER_MARGIN of it —
+         * collision cosines in the 0.2-0.3 band are noise next to a
+         * keyword hit. Without keyword hits the base floor governs
+         * unchanged. */
+        let has_keyword = scored.iter().any(|h| h.via != "similar");
+        if has_keyword {
+            let top = scored.iter().map(|h| h.score).fold(0.0f32, f32::max);
+            let floor = (top - RECALL_RIDER_MARGIN).max(RECALL_SIMILARITY_THRESHOLD);
+            scored.retain(|h| h.via != "similar" || h.score >= floor);
         }
 
         scored.sort_by(|a, b| {
@@ -540,10 +565,13 @@ mod tests {
             .add(MemoryKind::Memory, "call mom tomorrow at 9", &tags(&["family"]), None)
             .unwrap();
 
-        /* Exact substring wins and ranks first; hash-token collisions may
-         * let the unrelated record ride along, but only as a `similar`
-         * hit below the keyword score (the vendored embedder is
-         * deterministic per build, so this stays stable run to run). */
+        /* Exact substring wins and ranks first; hash-token collisions
+         * used to let the unrelated record ride along as a `similar`
+         * hit below the keyword score (BUG-004: since the rider-margin
+         * filter, a collision cosine ~0.26 next to a 1.0 keyword hit is
+         * dropped, so hits[1..] is empty here in practice — the
+         * assertions hold either way). The vendored embedder is
+         * deterministic per build, so this stays stable run to run. */
         let hits = store.recall("march 3rd", &[], 5);
         assert_eq!(hits[0].via, "exact", "{hits:?}");
         assert_eq!(hits[0].record.content, "My exam is on March 3rd");
@@ -562,6 +590,35 @@ mod tests {
 
         /* Empty query = no hits, never a panic. */
         assert!(store.recall("   ", &[], 5).is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn recall_similar_rider_needs_margin_next_to_keyword_hits() {
+        /* BUG-004: "march 3rd" hits the exam record exactly; the mom
+         * record's collision cosine (~0.26, deterministic per build)
+         * used to ride along as `similar` noise below the base floor.
+         * Next to a keyword hit it must be dropped. */
+        let path = temp_store_path("rider");
+        let mut store = MemoryStore::open(&path).unwrap();
+        store
+            .add(MemoryKind::Memory, "My exam is on March 3rd", &[], None)
+            .unwrap();
+        store
+            .add(MemoryKind::Memory, "call mom tomorrow at 9", &[], None)
+            .unwrap();
+
+        let hits = store.recall("march 3rd", &[], 5);
+        assert_eq!(hits.len(), 1, "collision rider must be dropped: {hits:?}");
+        assert_eq!(hits[0].via, "exact");
+        assert_eq!(hits[0].record.content, "My exam is on March 3rd");
+
+        /* Without keyword hits the same similar scores stay admitable
+         * under the base floor (the pure-similar path is unchanged). */
+        let hits = store.recall("mom call", &[], 5);
+        assert!(!hits.is_empty(), "pure-similar recall still works");
+        assert_eq!(hits[0].via, "similar", "{hits:?}");
+        assert_eq!(hits[0].record.content, "call mom tomorrow at 9");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
