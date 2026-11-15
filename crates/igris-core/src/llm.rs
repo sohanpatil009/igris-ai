@@ -19,10 +19,8 @@ use crate::paths;
 use crate::toolparse;
 use crate::tools;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::io::{BufRead, Read, Write};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /* Two llama.cpp builds ship in the assets tree: a Vulkan (GPU) build in
@@ -606,6 +604,246 @@ pub fn ensure_server(force_cpu: bool) -> Result<(), Box<dyn std::error::Error>> 
     Err(format!("no llama-server could be started: {last_err}").into())
 }
 
+/* ================================================================ */
+/* isolated spawn (BUG-010): the server must inherit NOTHING         */
+/* ================================================================ */
+
+/// BUG-010: a llama-server spawned through `std::process::Command`
+/// inherits *every* inheritable handle this process holds — std always
+/// calls CreateProcessW with `bInheritHandles=TRUE` and never builds a
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. When we run under a redirected
+/// `cargo run` (or any pipeline), our handle table carries the parent
+/// chain's pipe write-ends twice: cargo's original handle plus std's
+/// inheritable duplicate made for us. Clearing the inherit flag on our
+/// three GetStdHandle entries cannot reach the originals, so the
+/// immortal detached server kept the pipe write-ends alive and outer
+/// pipelines never saw EOF even after this process had exited (the
+/// app-level trace always ran to completion). This manual spawn passes
+/// an explicit handle list instead: the child receives exactly its
+/// three std handles and nothing else, no matter what we happen to
+/// hold. Closing our process handle never kills the child — the server
+/// outlives this process by design.
+struct IsolatedChild {
+    process: windows::Win32::Foundation::HANDLE,
+}
+
+impl IsolatedChild {
+    /// Has the child exited? Non-blocking.
+    fn try_wait(&self) -> bool {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        unsafe { WaitForSingleObject(self.process, 0) == WAIT_OBJECT_0 }
+    }
+
+    /// Terminate the child (startup-failure paths) and reap it briefly.
+    fn kill(&self) {
+        use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        unsafe {
+            let _ = TerminateProcess(self.process, 1);
+            let _ = WaitForSingleObject(self.process, 2000);
+        }
+    }
+}
+
+impl Drop for IsolatedChild {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.process);
+        }
+    }
+}
+
+/// Spawn `exe` with `args`, stdio = NUL / NUL / `stderr_log`, inheriting
+/// no handle beyond those three (see [`IsolatedChild`]).
+fn spawn_isolated(
+    exe: &std::path::Path,
+    args: &[String],
+    stderr_log: &std::path::Path,
+) -> Result<IsolatedChild, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{
+        CloseHandle, GENERIC_ACCESS_RIGHTS, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        HANDLE_FLAG_INHERIT, SetHandleInformation,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+    use windows::Win32::System::Threading::{
+        CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
+        UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    };
+
+    /* Child stdio: NUL for stdin/stdout, the startup log for stderr. The
+     * log is shared read+write so the poll loop in try_start can read it
+     * while the server writes. */
+    let nul = |access: GENERIC_ACCESS_RIGHTS| -> Result<HANDLE, String> {
+        let mut w: Vec<u16> = "\\\\.\\NUL".encode_utf16().collect();
+        w.push(0);
+        unsafe {
+            CreateFileW(
+                PCWSTR(w.as_mut_ptr()),
+                access.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+            .map_err(|e| format!("opening NUL failed: {e}"))
+        }
+    };
+    let h_in = nul(GENERIC_READ)?;
+    let h_out = nul(GENERIC_WRITE)?;
+    let mut path_w: Vec<u16> = stderr_log.as_os_str().encode_wide().collect();
+    path_w.push(0);
+    let h_err = unsafe {
+        CreateFileW(
+            PCWSTR(path_w.as_mut_ptr()),
+            GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        .map_err(|e| format!("opening server stderr log failed: {e}"))
+    }?;
+
+    /* All three handles must be inheritable to travel through the handle
+     * list. */
+    for h in [h_in, h_out, h_err] {
+        unsafe {
+            SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
+                .map_err(|e| format!("SetHandleInformation failed: {e}"))?;
+        }
+    }
+
+    /* One-entry attribute list restricting inherited handles to exactly
+     * [stdin, stdout, stderr]. */
+    let mut size = 0usize;
+    unsafe {
+        /* Probe call: it "fails" by design and leaves the required
+         * buffer size in `size`. */
+        let _ = InitializeProcThreadAttributeList(None, 1, None, &mut size);
+    }
+    let mut list_buf = vec![0u8; size];
+    let list = LPPROC_THREAD_ATTRIBUTE_LIST(list_buf.as_mut_ptr().cast());
+    unsafe {
+        InitializeProcThreadAttributeList(Some(list), 1, None, &mut size)
+            .map_err(|e| format!("InitializeProcThreadAttributeList failed: {e}"))?;
+        let handles = [h_in, h_out, h_err];
+        UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            Some(handles.as_ptr().cast()),
+            core::mem::size_of::<[HANDLE; 3]>(),
+            None,
+            None,
+        )
+        .map_err(|e| format!("UpdateProcThreadAttribute failed: {e}"))?;
+    }
+
+    let mut si = STARTUPINFOEXW::default();
+    si.StartupInfo.cb = core::mem::size_of::<STARTUPINFOEXW>() as u32;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = h_in;
+    si.StartupInfo.hStdOutput = h_out;
+    si.StartupInfo.hStdError = h_err;
+    si.lpAttributeList = list;
+
+    let mut cmdline = make_command_line(exe, args);
+    let mut exe_wide: Vec<u16> = exe.as_os_str().encode_wide().collect();
+    exe_wide.push(0);
+    let mut pi: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
+    let spawn = unsafe {
+        CreateProcessW(
+            PCWSTR(exe_wide.as_mut_ptr()),
+            Some(PWSTR(cmdline.as_mut_ptr())),
+            None,
+            None,
+            true, /* bInheritHandles — the attribute list is what restricts */
+            /* EXTENDED_STARTUPINFO_PRESENT is mandatory with a
+             * STARTUPINFOEXW: without it CreateProcessW reads the struct
+             * as a plain STARTUPINFOW and silently ignores the attribute
+             * list (first live run leaked every handle again). */
+            PROCESS_CREATION_FLAGS(EXTENDED_STARTUPINFO_PRESENT.0),
+            None, /* environment: inherit ours */
+            PCWSTR::null(),
+            &si as *const STARTUPINFOEXW as *const STARTUPINFOW,
+            &mut pi,
+        )
+        .map_err(|e| format!("CreateProcessW failed: {e}"))
+    };
+    /* The list and the child-side std handles were consumed by
+     * CreateProcessW — drop our copies, list first. */
+    unsafe {
+        DeleteProcThreadAttributeList(list);
+        let _ = CloseHandle(h_in);
+        let _ = CloseHandle(h_out);
+        let _ = CloseHandle(h_err);
+    }
+    spawn?;
+    unsafe {
+        let _ = CloseHandle(pi.hThread);
+    }
+    Ok(IsolatedChild { process: pi.hProcess })
+}
+
+/// Compose a Windows command line with the same quoting rules
+/// std::process::Command uses (MSVCRT parsing: double every backslash
+/// that precedes a quote, 2n+1 backslashes to emit a quote, double
+/// trailing backslashes before a closing quote).
+fn make_command_line(exe: &std::path::Path, args: &[String]) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut cmd = Vec::new();
+    append_arg(&exe.as_os_str().encode_wide().collect::<Vec<_>>(), &mut cmd);
+    for a in args {
+        cmd.push(b' ' as u16);
+        append_arg(&a.encode_utf16().collect::<Vec<_>>(), &mut cmd);
+    }
+    cmd.push(0);
+    cmd
+}
+
+fn append_arg(arg: &[u16], cmd: &mut Vec<u16>) {
+    let quote = arg.is_empty()
+        || arg
+            .iter()
+            .any(|&c| c == b' ' as u16 || c == b'\t' as u16 || c == b'"' as u16);
+    if quote {
+        cmd.push(b'"' as u16);
+    }
+    let mut bs = 0usize;
+    for &c in arg {
+        if c == b'\\' as u16 {
+            bs += 1;
+        } else if c == b'"' as u16 {
+            for _ in 0..2 * bs + 1 {
+                cmd.push(b'\\' as u16);
+            }
+            cmd.push(b'"' as u16);
+            bs = 0;
+        } else {
+            for _ in 0..bs {
+                cmd.push(b'\\' as u16);
+            }
+            cmd.push(c);
+            bs = 0;
+        }
+    }
+    if quote {
+        for _ in 0..2 * bs {
+            cmd.push(b'\\' as u16);
+        }
+        cmd.push(b'"' as u16);
+    }
+}
+
 /// Spawn one backend and poll it until healthy. Ok carries the GPU device
 /// name when one shows up in the startup log. The child is deliberately
 /// not killed on success: it outlives this process and keeps serving for
@@ -618,77 +856,69 @@ fn try_start(backend: Backend) -> Result<Option<String>, String> {
             exe.display()
         ));
     }
-    let mut cmd = Command::new(&exe);
-    cmd.arg("-m")
-        .arg(paths::asset(LLM_MODEL))
-        .arg("-c")
-        .arg(CTX_TOKENS.to_string())
-        .arg("-fa")
-        .arg("on") /* flash attention: ~2x decode speed on this GPU */
+    let mut args = vec![
+        "-m".into(),
+        paths::asset(LLM_MODEL).to_string_lossy().into_owned(),
+        "-c".into(),
+        CTX_TOKENS.to_string(),
+        "-fa".into(),
+        "on".into(), /* flash attention: ~2x decode speed on this GPU */
         /* LFM3 mixes sliding-window attention layers; the default SWA
          * cache rejects KV-shift reuse ("cache_reuse is not supported by
          * this context"). --swa-full stores the full window and unlocks
          * prompt-prefix reuse. Both builds support it. */
-        .arg("--swa-full")
+        "--swa-full".into(),
         /* KV-shifting chunk reuse: a new request may also reuse interior
          * cache chunks, not just the leading prefix. */
-        .arg("--cache-reuse")
-        .arg("1")
+        "--cache-reuse".into(),
+        "1".into(),
         /* Do not pass -np: an explicit slot count disables the unified KV
          * buffer and cache-reuse gets rejected. Default slots (4 here) are
          * picked per request by LCP similarity, which keeps the warm slot
          * in play. */
-        .arg("--no-webui") /* terminal-only use; the port stays API-exclusive */
-        .arg("--port")
-        .arg(PORT.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        "--no-webui".into(), /* terminal-only use; the port stays API-exclusive */
+        "--port".into(),
+        PORT.to_string(),
+    ];
     if backend == Backend::Gpu {
-        cmd.arg("-ngl").arg("99"); /* offload every layer (Vulkan) */
+        args.push("-ngl".into());
+        args.push("99".into()); /* offload every layer (Vulkan) */
     }
-    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
-    let stderr = child.stderr.take().expect("stderr was piped");
-    /* Keep draining the server's stderr in the background: an unread
-     * pipe would eventually block the server, and the Vulkan build's
-     * failure reasons (no device, no VRAM) only appear there. */
-    let lines: Arc<Mutex<Vec<String>>> = Arc::default();
-    let failed = Arc::new(AtomicBool::new(false));
-    let fail_reason: Arc<Mutex<Option<String>>> = Arc::default();
-    let reader_lines = Arc::clone(&lines);
-    let reader_failed = Arc::clone(&failed);
-    let reader_reason = Arc::clone(&fail_reason);
-    let is_gpu = backend == Backend::Gpu;
-    std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if is_gpu {
-                let low = line.to_lowercase();
-                if !reader_failed.load(Ordering::Relaxed)
-                    && GPU_FAIL_HINTS.iter().any(|h| low.contains(h))
-                {
-                    *reader_reason.lock().expect("fail log") = Some(line.clone());
-                    reader_failed.store(true, Ordering::Relaxed);
-                }
-            }
-            reader_lines.lock().expect("stderr log").push(line);
-        }
-    });
+    /* The server's stderr (startup log; the Vulkan build's failure
+     * reasons only appear there) is captured to a file that the poll
+     * loop below re-reads — no pipe, no reader thread, nothing that
+     * could block the server or leak into it. */
+    let stderr_log = std::env::temp_dir().join("igris-llama-server-stderr.log");
+    let child = spawn_isolated(&exe, &args, &stderr_log)
+        .map_err(|e| format!("spawn failed: {e}"))?;
 
+    /* Startup-log state: lines seen so far, and the first GPU failure
+     * hint (no device, no VRAM) that triggers the CPU fallback
+     * immediately instead of waiting out the timeout. */
+    let mut lines: Vec<String> = Vec::new();
+    let mut fail_reason: Option<String> = None;
+    let is_gpu = backend == Backend::Gpu;
     let started = Instant::now();
     loop {
-        if failed.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let reason = fail_reason
-                .lock()
-                .expect("fail log")
-                .clone()
-                .unwrap_or_else(|| "vulkan unavailable".into());
+        if let Ok(text) = std::fs::read_to_string(&stderr_log) {
+            let fresh: Vec<String> = text.lines().map(str::to_string).collect();
+            if is_gpu && fail_reason.is_none() {
+                for line in &fresh {
+                    let low = line.to_lowercase();
+                    if GPU_FAIL_HINTS.iter().any(|h| low.contains(h)) {
+                        fail_reason = Some(line.clone());
+                        break;
+                    }
+                }
+            }
+            lines = fresh;
+        }
+        if let Some(reason) = fail_reason.clone() {
+            child.kill();
             return Err(reason);
         }
-        if let Ok(Some(_)) = child.try_wait() {
-            let _ = child.kill(); /* reap the exited child */
+        if child.try_wait() {
             let reason = lines
-                .lock()
-                .expect("stderr log")
                 .last()
                 .cloned()
                 .unwrap_or_else(|| "no stderr output".into());
@@ -698,7 +928,7 @@ fn try_start(backend: Backend) -> Result<Option<String>, String> {
             return Ok(device_name(&lines));
         }
         if started.elapsed() > backend.startup_timeout() {
-            let _ = child.kill();
+            child.kill();
             return Err(format!(
                 "{} did not become healthy in time",
                 backend.exe().display()
@@ -711,9 +941,8 @@ fn try_start(backend: Backend) -> Result<Option<String>, String> {
 /// Best-effort GPU name from the startup log, e.g. a line like
 /// "ggml_vulkan: 0 = NVIDIA GeForce MX350 (NVIDIA) | ..." yields
 /// "NVIDIA GeForce MX350".
-fn device_name(lines: &Mutex<Vec<String>>) -> Option<String> {
-    let v = lines.lock().ok()?;
-    v.iter().find_map(|line| {
+fn device_name(lines: &[String]) -> Option<String> {
+    lines.iter().find_map(|line| {
         let rest = line.trim().strip_prefix("ggml_vulkan:")?;
         let idx = rest.find(" = ")?;
         let after = &rest[idx + 3..];
