@@ -140,17 +140,22 @@ fn tool_call_protocol_instructions() -> String {
          {{\"name\": \"tool_name\", \"arguments\": {{\"param\": \"value\"}}}}\n\
          {close}\n\n\
          You may use multiple tool calls in a single response. After tool execution, results appear in {result} tags. Continue reasoning with the results until you can give a final answer.\n\n\
-         Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first — never claim you don't know without checking.\n\n",
+         Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first — never claim you don't know without checking.\n\n\
+         Gated tools: their first call only validates the action and announces the plan — it does NOT execute, and the result starts with NOT EXECUTED — CONFIRMATION REQUIRED. Tell the user exactly what will happen and wait for a clear yes; only after the user confirms, call the same tool again with identical arguments and it will execute. If the user declines or changes the request, do not call it again.\n\n",
         open = toolparse::TOOL_CALL_OPEN,
         close = toolparse::TOOL_CALL_CLOSE,
         result = toolparse::TOOL_RESULT_OPEN,
     )
 }
 
-/// The tool-calling prompt block: the verbatim protocol instructions plus
-/// the `### Available Tools` listing (ZeroClaw's `build_tool_instructions`
-/// shape, zeroclaw-runtime/src/agent/loop_.rs:1358-1383), with specs sorted
-/// by name so the system prompt is byte-stable for the KV cache.
+/// The tool-calling prompt block: the ZeroClaw protocol instructions
+/// (verbatim port of `TOOL_CALL_PROTOCOL_INSTRUCTIONS`,
+/// zeroclaw-runtime/src/agent/tool_call_format.rs:39-58) plus two rules
+/// of our own appended after it — persistent memory (v1.2) and gated
+/// tools (v2.5) — then the `### Available Tools` listing (ZeroClaw's
+/// `build_tool_instructions` shape, zeroclaw-runtime/src/agent/loop_.rs:
+/// 1358-1383), with specs sorted by name so the system prompt is
+/// byte-stable for the KV cache.
 pub fn tools_protocol_block(specs: &[ToolSpec]) -> String {
     use std::fmt::Write as _; // String takes fmt::Write, not the io::Write in scope above
     if specs.is_empty() {
@@ -333,6 +338,11 @@ pub fn agent_turn(
     max_tokens: i64,
     sink: &mut StreamSink,
 ) -> Result<AgentTurnEnd, Box<dyn std::error::Error>> {
+    /* One turn per utterance (the voice loop and the CLI chat both come
+     * through here): gated tools need a pending armed in a strictly
+     * earlier turn, so a same-turn re-call can never bypass the
+     * confirmation (v2.5). */
+    crate::gating::begin_turn();
     let registry = tools::registry();
     let mut state = AgentLoopState::new();
     while state.next_round() {
@@ -1183,9 +1193,11 @@ pub fn cmd_chat(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    /// The upstream protocol block, transcribed independently through
+    /// The ZeroClaw protocol block, transcribed independently through
     /// unicode escapes, pinned byte-for-byte against our runtime
-    /// construction so the "verbatim port" claim stays true.
+    /// construction so the "verbatim port" claim stays true — including
+    /// our two appended rules (persistent memory, v1.2; gated tools,
+    /// v2.5).
     #[test]
     fn tool_call_protocol_instructions_is_upstream_verbatim() {
         let open = "\u{3c}tool_call\u{3e}";
@@ -1210,7 +1222,8 @@ Example: User says something that needs a tool. You MUST respond with a real cal
             + "\n\nYou may use multiple tool calls in a single response. After tool execution, results appear in "
             + result
             + " tags. Continue reasoning with the results until you can give a final answer.\n\n\
-Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first — never claim you don't know without checking.\n\n";
+Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first — never claim you don't know without checking.\n\n\
+Gated tools: their first call only validates the action and announces the plan — it does NOT execute, and the result starts with NOT EXECUTED — CONFIRMATION REQUIRED. Tell the user exactly what will happen and wait for a clear yes; only after the user confirms, call the same tool again with identical arguments and it will execute. If the user declines or changes the request, do not call it again.\n\n";
         assert_eq!(tool_call_protocol_instructions(), expected);
     }
 

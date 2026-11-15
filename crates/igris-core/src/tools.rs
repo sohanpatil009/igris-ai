@@ -69,6 +69,14 @@
 //! Dev/network tools declare longer time budgets than the 5 s voice
 //! default through `tool_budget` (one auditable table).
 //!
+//! v2.5 (2026-11-15) — gated actions: destructive tools (close_app,
+//! delete_file, shutdown, power_mode) carry `gated: true` plus a `plan`
+//! validator. Their first call only validates + arms a pending (see
+//! [`crate::gating`]) and announces the action; a confirmed re-call in a
+//! later turn executes. Config-defined tools are always ungated and may
+//! not shadow a gated built-in name (see
+//! `Registry::register_ungated_guarded`).
+//!
 //! Dynamism ladder: v1 code-registered → v1.1 `tools.toml` config-defined
 //! tools (name/desc/schema + allowlisted command template, no recompile —
 //! `register` replaces a same-name tenant to make overrides possible) → v3
@@ -154,12 +162,16 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["function"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_calculate),
     });
     r.register(ToolDef {
         name: "get_time".to_string(),
         desc: "Get the current local date and time.".to_string(),
         schema: json!({"type": "object", "properties": {}, "required": []}),
+        gated: false,
+        plan: None,
         run: Arc::new(run_get_time),
     });
     r.register(ToolDef {
@@ -178,6 +190,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["app"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_open_app),
     });
     r.register(ToolDef {
@@ -205,6 +219,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["query"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_file_search),
     });
     r.register(ToolDef {
@@ -226,6 +242,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["path"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_read_file),
     });
     r.register(ToolDef {
@@ -243,6 +261,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["path"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_create_folder),
     });
     r.register(ToolDef {
@@ -258,6 +278,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["url"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_open_url),
     });
     r.register(ToolDef {
@@ -277,6 +299,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["key"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_media_key),
     });
     r.register(ToolDef {
@@ -285,6 +309,8 @@ pub fn seed_registry() -> Registry {
               system drive, battery level and power source, and uptime. Read-only."
             .to_string(),
         schema: json!({"type": "object", "properties": {}, "required": []}),
+        gated: false,
+        plan: None,
         run: Arc::new(run_sys_stats),
     });
     r.register(ToolDef {
@@ -304,6 +330,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["volume"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_set_volume),
     });
     r.register(ToolDef {
@@ -327,6 +355,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": []
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_screenshot),
     });
     r.register(ToolDef {
@@ -352,6 +382,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["content"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_memory_save),
     });
     r.register(ToolDef {
@@ -382,6 +414,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["query"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_memory_recall),
     });
     r.register(ToolDef {
@@ -404,6 +438,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["content"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_create_note),
     });
     r.register(ToolDef {
@@ -431,6 +467,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["action"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_activity_log),
     });
     r.register(ToolDef {
@@ -460,6 +498,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["content", "due_at"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_reminder_set),
     });
     /* v2 — dev & browser (goal.md §4/§5/§6) */
@@ -492,6 +532,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["program", "args"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_run_command),
     });
     r.register(ToolDef {
@@ -510,6 +552,8 @@ pub fn seed_registry() -> Registry {
                 }
             }
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_list_dir),
     });
     r.register(ToolDef {
@@ -543,6 +587,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["query"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_content_search),
     });
     r.register(ToolDef {
@@ -562,6 +608,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["url"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_web_fetch),
     });
     r.register(ToolDef {
@@ -585,6 +633,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["url"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_download_file),
     });
     r.register(ToolDef {
@@ -610,6 +660,8 @@ pub fn seed_registry() -> Registry {
             },
             "required": ["query"]
         }),
+        gated: false,
+        plan: None,
         run: Arc::new(run_web_search),
     });
     r
@@ -626,7 +678,10 @@ pub fn registry() -> &'static Registry {
         let mut r = seed_registry();
         if let Some(defs) = CONFIG_TOOLS.get() {
             for def in defs {
-                r.register(def.clone());
+                /* Config tools are always ungated, and they must not
+                 * shadow a gated built-in name (that would silently
+                 * un-gate a destructive action). */
+                r.register_ungated_guarded(def.clone());
             }
         }
         r

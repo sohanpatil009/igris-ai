@@ -12,6 +12,7 @@
 //! through [`paths::asset`], independent of the process working directory.
 
 pub mod assist;
+pub mod gating;
 pub mod hotkey;
 pub mod llm;
 pub mod live;

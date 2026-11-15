@@ -120,6 +120,8 @@ fn parse_config_tools(text: &str) -> Result<Vec<ToolDef>, String> {
                 name: name.to_string(),
                 desc: entry.description.trim().to_string(),
                 schema,
+                gated: false,
+                plan: None,
                 run: Arc::new(move |args: &Value| run_config_url(&url, args)),
             });
         } else if let Some(cmd) = &entry.command {
@@ -129,6 +131,8 @@ fn parse_config_tools(text: &str) -> Result<Vec<ToolDef>, String> {
                 name: name.to_string(),
                 desc: entry.description.trim().to_string(),
                 schema,
+                gated: false,
+                plan: None,
                 run: Arc::new(move |args: &Value| run_config_command(&cmd, args)),
             });
         }
