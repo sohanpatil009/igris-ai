@@ -406,7 +406,7 @@ fn turn_reply<'k, 'd>(
             let _ = io::stdout().flush();
             true
         };
-        let (reply, _first_ms) = llm::chat_stream(&msgs, 512, &mut on_tok)?;
+        let (reply, _first_ms) = llm::chat_stream(&msgs, 512, &mut on_tok, None)?;
         println!();
         if cut {
             println!();

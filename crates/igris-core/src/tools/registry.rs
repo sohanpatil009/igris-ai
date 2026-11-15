@@ -27,6 +27,32 @@ fn tool_budget(name: &str) -> Duration {
     }
 }
 
+/// Execute one resolved tool body on a worker thread with a hard budget.
+/// The shared body of [`Registry::exec_def`] and the parallel batch
+/// workers ([`Registry::dispatch_batch`]): a panic inside a tool drops
+/// the sender on unwind and surfaces as "crashed", never as a panic.
+fn exec_run(
+    run: Arc<dyn Fn(&Value) -> Result<String, String> + Send + Sync>,
+    name: &str,
+    args: &Value,
+    timeout: Duration,
+) -> Result<String, String> {
+    let args = args.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run(&args));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(format!("tool '{name}' timed out after {timeout:?}"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("tool '{name}' crashed"))
+        }
+    }
+}
+
 /// One executable tenant of the registry.
 #[derive(Clone)]
 pub struct ToolDef {
@@ -173,43 +199,151 @@ impl Registry {
         self.exec_def(def, &args, timeout)
     }
 
+    /// Run a batch of calls in one agent round (v3): independent calls
+    /// the model emitted together execute concurrently instead of
+    /// one-by-one, so a chain's cost goes from the sum of the tools to
+    /// roughly the slowest of them.
+    ///
+    /// Phase 1 (sequential) resolves each entry and makes every gating
+    /// decision — gated calls validate + announce or consume a pending
+    /// exactly as in [`Self::dispatch`] — while ungated runs and
+    /// consumed-pending executes are collected for phase 2. Phase 2
+    /// executes those concurrently, one worker thread each, with the
+    /// same per-tool budget and the same panic-to-"crashed" semantics as
+    /// [`Self::exec_def`]. Results return in call order, and consumed
+    /// gated executes still get their activity-log lines.
+    ///
+    /// Gating semantics are unchanged: a same-turn re-call still only
+    /// arms (freshness rule), and a batch that arms the same gated tool
+    /// twice follows the one-slot-per-tool drift rule (the last arm
+    /// wins; the earlier intent is dead, as the v2.5 design intends).
+    pub fn dispatch_batch(&self, batch: &[(String, Value)]) -> Vec<BatchOutcome> {
+        struct Deferred {
+            slot: usize,
+            name: String,
+            run: Arc<dyn Fn(&Value) -> Result<String, String> + Send + Sync>,
+            args: Value,
+            timeout: Duration,
+            gated: bool,
+        }
+        let mut outcomes: Vec<Option<Result<String, String>>> =
+            (0..batch.len()).map(|_| None).collect();
+        let mut deferred: Vec<Deferred> = Vec::new();
+        /* phase 1: resolve + gate decisions (identical rules per call) */
+        for (slot, (name, raw_args)) in batch.iter().enumerate() {
+            let Some(def) = self.tools.iter().find(|t| t.name == name.as_str()) else {
+                outcomes[slot] = Some(Err(format!("unknown tool: {name}")));
+                continue;
+            };
+            let args = unwrap_schema_confused_args(&def.schema, &raw_args.clone());
+            if !def.gated {
+                deferred.push(Deferred {
+                    slot,
+                    name: def.name.clone(),
+                    run: Arc::clone(&def.run),
+                    args,
+                    timeout: tool_budget(&def.name),
+                    gated: false,
+                });
+                continue;
+            }
+            let step = {
+                let mut store = match crate::gating::global().lock() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        outcomes[slot] =
+                            Some(Err("gating: pending store lock poisoned".to_string()));
+                        continue;
+                    }
+                };
+                self.decide_gated(
+                    &mut store,
+                    crate::gating::current_turn(),
+                    std::process::id(),
+                    def,
+                    &args,
+                )
+            };
+            match step {
+                Ok(GatedDecision::Armed { plan }) => {
+                    self.log_gated_step(def, &Ok(GatedOutcome::Armed { plan: plan.clone() }));
+                    outcomes[slot] = Some(Ok(crate::gating::armed_result(&plan)));
+                }
+                Ok(GatedDecision::ExecuteNow) => deferred.push(Deferred {
+                    slot,
+                    name: def.name.clone(),
+                    run: Arc::clone(&def.run),
+                    args,
+                    timeout: tool_budget(&def.name),
+                    gated: true,
+                }),
+                Err(e) => outcomes[slot] = Some(Err(e)),
+            }
+        }
+        /* phase 2: concurrent executions; each worker owns its data and
+         * reports back through the channel (a panic drops its sender) */
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = deferred.len();
+        for d in deferred {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let res = exec_run(d.run, &d.name, &d.args, d.timeout);
+                let _ = tx.send((d.slot, d.name, d.gated, res));
+            });
+        }
+        drop(tx);
+        let mut done = 0usize;
+        while done < spawned {
+            match rx.recv() {
+                Ok((slot, name, gated, res)) => {
+                    done += 1;
+                    if gated {
+                        if let Some(def) = self.tools.iter().find(|t| t.name == name) {
+                            self.log_gated_step(def, &Ok(GatedOutcome::Executed(res.clone())));
+                        }
+                    }
+                    outcomes[slot] = Some(res);
+                }
+                Err(_) => break, /* all senders gone; missing slots crashed */
+            }
+        }
+        /* workers that panicked never sent: report crashed, keep order */
+        for (slot, (name, _)) in batch.iter().enumerate() {
+            if outcomes[slot].is_none() {
+                outcomes[slot] = Some(Err(format!("tool '{name}' crashed")));
+            }
+        }
+        batch
+            .iter()
+            .zip(outcomes)
+            .map(|((name, _), r)| BatchOutcome {
+                name: name.clone(),
+                result: r.unwrap_or_else(|| Err("internal: unfilled batch slot".to_string())),
+            })
+            .collect()
+    }
+
     /// Execute one resolved tenant on a worker thread with a hard budget
     /// (the shared body of [`Self::dispatch`], [`Self::dispatch_with_timeout`]
     /// and the gated execute step).
     fn exec_def(&self, def: &ToolDef, args: &Value, timeout: Duration) -> Result<String, String> {
-        let run = Arc::clone(&def.run);
-        let args = args.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            /* A panic inside a tool drops the sender on unwind; the
-             * receiver maps that to an error instead of dying. */
-            let _ = tx.send(run(&args));
-        });
-        match rx.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                Err(format!("tool '{}' timed out after {timeout:?}", def.name))
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(format!("tool '{}' crashed", def.name))
-            }
-        }
+        exec_run(Arc::clone(&def.run), &def.name, args, timeout)
     }
 
     /// The pure gating decision for one gated call against an explicit
     /// pending store, turn and process id — the unit-testable core; the
     /// production [`Self::dispatch`] supplies the global store and the
     /// real counters. A fresh cross-turn (or cross-process) exact match
-    /// consumes the pending and executes; everything else validates +
-    /// arms and reports the plan.
-    fn dispatch_gated_core(
+    /// consumes the pending and reports [`GatedDecision::ExecuteNow`];
+    /// everything else validates + arms and reports the plan.
+    fn decide_gated(
         &self,
         store: &mut crate::gating::PendingStore,
         turn: u64,
         pid: u32,
         def: &ToolDef,
         args: &Value,
-    ) -> Result<GatedOutcome, String> {
+    ) -> Result<GatedDecision, String> {
         let canonical = crate::toolparse::canonicalize_json_for_tool_signature(args).to_string();
         if store
             .take_fresh(
@@ -221,11 +355,7 @@ impl Registry {
             )
             .is_some()
         {
-            return Ok(GatedOutcome::Executed(self.exec_def(
-                def,
-                args,
-                tool_budget(&def.name),
-            )));
+            return Ok(GatedDecision::ExecuteNow);
         }
         let Some(plan) = &def.plan else {
             return Err(format!("tool '{}' is gated but defines no plan", def.name));
@@ -239,7 +369,27 @@ impl Registry {
             pid,
             crate::gating::now_millis(),
         );
-        Ok(GatedOutcome::Armed { plan: plan_text })
+        Ok(GatedDecision::Armed { plan: plan_text })
+    }
+
+    /// The gating decision plus inline execution for the sequential
+    /// single-call path: [`Self::dispatch`]'s gated step.
+    fn dispatch_gated_core(
+        &self,
+        store: &mut crate::gating::PendingStore,
+        turn: u64,
+        pid: u32,
+        def: &ToolDef,
+        args: &Value,
+    ) -> Result<GatedOutcome, String> {
+        match self.decide_gated(store, turn, pid, def, args)? {
+            GatedDecision::Armed { plan } => Ok(GatedOutcome::Armed { plan }),
+            GatedDecision::ExecuteNow => Ok(GatedOutcome::Executed(self.exec_def(
+                def,
+                args,
+                tool_budget(&def.name),
+            ))),
+        }
     }
 
     /// Activity-log lines for the two gated outcomes (arm + execute), so
@@ -272,6 +422,22 @@ enum GatedOutcome {
     Armed { plan: String },
     /// A fresh cross-turn match consumed a pending and the tool ran.
     Executed(Result<String, String>),
+}
+
+/// The decision part of a gated dispatch, without the execution —
+/// the shape [`Registry::dispatch_batch`] needs to defer consumed-pending
+/// executions to the parallel phase.
+#[derive(Debug, PartialEq)]
+enum GatedDecision {
+    Armed { plan: String },
+    ExecuteNow,
+}
+
+/// One entry's result of a parallel dispatch batch, in call order.
+#[derive(Debug)]
+pub struct BatchOutcome {
+    pub name: String,
+    pub result: Result<String, String>,
 }
 
 /// LFM3 sometimes emits the DSML attr-form with the schema name instead of
@@ -755,6 +921,122 @@ mod tests {
             run: Arc::new(|_a| Ok("replaced".to_string())),
         });
         assert_eq!(r.dispatch("probe", &json!({})).unwrap(), "replaced");
+    }
+
+    /* ---- parallel batch dispatch (v3) ---- */
+
+    /// Two plain echo tenants with distinct payloads, for order + content
+    /// checks.
+    fn echo_pair() -> Registry {
+        let mut r = Registry::new();
+        for name in ["batch_alpha".to_string(), "batch_beta".to_string()] {
+            r.register(ToolDef {
+                name: name.clone(),
+                desc: "echo tenant".to_string(),
+                schema: json!({"type": "object", "properties": {}, "required": []}),
+                gated: false,
+                plan: None,
+                run: Arc::new(move |_a: &Value| -> Result<String, String> {
+                    Ok(format!("ran {name}"))
+                }),
+            });
+        }
+        r
+    }
+
+    #[test]
+    fn batch_reports_unknown_tools_and_keeps_call_order() {
+        let r = echo_pair();
+        let out = r.dispatch_batch(&[
+            ("batch_beta".to_string(), json!({})),
+            ("no_such_tool".to_string(), json!({})),
+            ("batch_alpha".to_string(), json!({})),
+        ]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].name, "batch_beta");
+        assert_eq!(out[0].result.as_deref(), Ok("ran batch_beta"));
+        assert_eq!(out[1].name, "no_such_tool");
+        assert_eq!(
+            out[1].result.clone().unwrap_err(),
+            "unknown tool: no_such_tool"
+        );
+        assert_eq!(out[2].name, "batch_alpha");
+        assert_eq!(out[2].result.as_deref(), Ok("ran batch_alpha"));
+    }
+
+    #[test]
+    fn batch_runs_independent_calls_concurrently() {
+        let mut r = Registry::new();
+        for name in ["batch_slow_a".to_string(), "batch_slow_b".to_string()] {
+            r.register(ToolDef {
+                name: name.clone(),
+                desc: "sleeping tenant".to_string(),
+                schema: json!({"type": "object", "properties": {}, "required": []}),
+                gated: false,
+                plan: None,
+                run: Arc::new(move |_a: &Value| -> Result<String, String> {
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok(format!("done {name}"))
+                }),
+            });
+        }
+        let batch = vec![
+            ("batch_slow_a".to_string(), json!({})),
+            ("batch_slow_b".to_string(), json!({})),
+        ];
+        let t0 = Instant::now();
+        let out = r.dispatch_batch(&batch);
+        let elapsed = t0.elapsed();
+        /* sequential would need ~800 ms; concurrent finishes in ~one
+         * sleep. A generous margin keeps the assert load-tolerant. */
+        assert!(elapsed < Duration::from_millis(700), "elapsed {elapsed:?}");
+        assert_eq!(out[0].result.as_deref(), Ok("done batch_slow_a"));
+        assert_eq!(out[1].result.as_deref(), Ok("done batch_slow_b"));
+    }
+
+    #[test]
+    fn batch_gated_arm_then_cross_turn_execute_via_global_store() {
+        let mut r = Registry::new();
+        let executed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&executed);
+        r.register(ToolDef {
+            name: "batch_probe_gated".to_string(),
+            desc: "gated batch tenant".to_string(),
+            schema: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            gated: true,
+            plan: Some(Arc::new(|args: &Value| -> Result<String, String> {
+                Ok(format!(
+                    "would remove {}",
+                    args.get("path").and_then(|v| v.as_str()).unwrap_or("?")
+                ))
+            })),
+            run: Arc::new(move |_args: &Value| -> Result<String, String> {
+                flag.store(true, AtomicOrdering::Relaxed);
+                Ok("removed".to_string())
+            }),
+        });
+        /* turn T: the batch call only arms */
+        crate::gating::begin_turn();
+        let args = json!({"path": "batch-probe-unique-path"});
+        let out = r
+            .dispatch_batch(&[("batch_probe_gated".to_string(), args.clone())]);
+        assert!(!executed.load(AtomicOrdering::Relaxed), "armed, not run");
+        assert!(out[0]
+            .result
+            .as_deref()
+            .unwrap()
+            .starts_with("NOT EXECUTED"), "arm announcement: {:?}", out[0].result);
+        /* turn T+1: the identical re-call consumes the pending, runs */
+        crate::gating::begin_turn();
+        let out = r
+            .dispatch_batch(&[("batch_probe_gated".to_string(), args)]);
+        assert!(executed.load(AtomicOrdering::Relaxed), "must execute now");
+        assert_eq!(out[0].result.as_deref(), Ok("removed"));
+        assert_eq!(out[0].name, "batch_probe_gated");
     }
 
     /* ---- list_dir ---- */

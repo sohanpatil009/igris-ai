@@ -19,6 +19,7 @@ pub mod live;
 pub mod memory;
 pub mod models;
 pub mod paths;
+pub mod toolgrammar;
 pub mod toolparse;
 pub mod tools;
 pub mod tts;

@@ -344,6 +344,12 @@ pub fn agent_turn(
      * confirmation (v2.5). */
     crate::gating::begin_turn();
     let registry = tools::registry();
+    /* grammar-constrained retries (v3): one grammar per turn, built from
+     * the sorted specs so the per-tool args rules are index-stable */
+    let grammar = crate::toolgrammar::tool_calls_grammar(&registry.specs());
+    /* true from the round after a malformed verdict until a good round */
+    let mut constrained = false;
+    let timed = std::env::var_os("MOON_TIMING").is_some();
     let mut state = AgentLoopState::new();
     while state.next_round() {
         let msgs = history.clone();
@@ -361,7 +367,20 @@ pub fn agent_turn(
                 false
             }
         };
-        let (raw, _first_ms) = chat_stream(&msgs, max_tokens, &mut on_tok)?;
+        let grammar_ref: Option<&str> = if constrained {
+            grammar.as_deref()
+        } else {
+            None
+        };
+        let t_llm = Instant::now();
+        let (raw, _first_ms) = chat_stream(&msgs, max_tokens, &mut on_tok, grammar_ref)?;
+        if timed {
+            eprintln!(
+                "[timing] round {} llm {}ms",
+                state.rounds,
+                t_llm.elapsed().as_millis()
+            );
+        }
         if std::env::var_os("MOON_DEBUG_RAW").is_some() {
             /* angle brackets escaped so the dump can be read safely in
              * logs/terminals where tag-like text is a parsing hazard */
@@ -385,6 +404,9 @@ pub fn agent_turn(
         let (_cleaned, calls) = toolparse::parse_tool_calls(&raw);
         if calls.is_empty() {
             if let Some(corrective) = state.malformed_verdict(&raw, &calls) {
+                /* the NEXT round samples under the tool-call grammar so
+                 * malformed syntax cannot repeat (v3) */
+                constrained = true;
                 history.push(json!({"role": "assistant", "content": raw}));
                 history.push(json!({"role": "user", "content": corrective}));
                 continue;
@@ -400,21 +422,53 @@ pub fn agent_turn(
         // degenerate reply can loop its envelope several times.
         let calls = dedup_tool_calls(calls);
         state.retries = 0;
+        constrained = false;
         let stored = toolparse::strip_trailing_terminal_markers(&raw);
         history.push(json!({"role": "assistant", "content": stored}));
         let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
         (sink.on_tool_round)(&names);
-        let mut outcomes: Vec<ToolOutcome> = Vec::new();
-        for call in &calls {
+        /* one call takes the plain path; several calls execute together
+         * on parallel workers (v3) with results in call order */
+        let t_tools = Instant::now();
+        let outcomes: Vec<ToolOutcome> = if calls.len() == 1 {
+            let call = &calls[0];
             let (status, output) = match registry.dispatch(&call.name, &call.arguments) {
                 Ok(out) => ("ok", out),
                 Err(e) => ("error", e),
             };
-            outcomes.push(ToolOutcome {
+            vec![ToolOutcome {
                 name: call.name.clone(),
                 status: status.to_string(),
                 output,
-            });
+            }]
+        } else {
+            let batch: Vec<(String, Value)> = calls
+                .iter()
+                .map(|c| (c.name.clone(), c.arguments.clone()))
+                .collect();
+            registry
+                .dispatch_batch(&batch)
+                .into_iter()
+                .map(|o| {
+                    let (status, output) = match o.result {
+                        Ok(out) => ("ok", out),
+                        Err(e) => ("error", e),
+                    };
+                    ToolOutcome {
+                        name: o.name,
+                        status: status.to_string(),
+                        output,
+                    }
+                })
+                .collect()
+        };
+        if timed {
+            eprintln!(
+                "[timing] round {} tools {}ms over {} call(s)",
+                state.rounds,
+                t_tools.elapsed().as_millis(),
+                calls.len()
+            );
         }
         history.push(json!({
             "role": "user",
@@ -1018,13 +1072,19 @@ pub fn prefill(messages: &[Value]) -> Result<u64, Box<dyn std::error::Error>> {
 /// The prompt is rendered closed-ended so the model answers after the
 /// generation prompt; generation stops at the EOS token, so no template
 /// junk reaches the caller.
+///
+/// `grammar` is an optional GBNF string passed to llama-server's
+/// `grammar` sampling constraint (see [`crate::toolgrammar`]); callers
+/// pass `None` for normal rounds and the tool-call grammar for
+/// corrective retries, where the model must emit a well-formed envelope.
 pub fn chat_stream(
     messages: &[Value],
     max_tokens: i64,
     on_token: &mut impl FnMut(&str) -> bool,
+    grammar: Option<&str>,
 ) -> Result<(String, u128), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
-    let body = json!({
+    let mut body = json!({
         "prompt": render_prompt(messages, true),
         "max_tokens": max_tokens,
         "temperature": TEMPERATURE,
@@ -1032,6 +1092,12 @@ pub fn chat_stream(
         "stream": true,
         "cache_prompt": true,
     });
+    /* `grammar` is llama-server's GBNF sampling constraint (native to the
+     * /v1/completions endpoint, live-probed 2026-11-15). It changes only
+     * the sampler, never the prompt, so the KV cache is unaffected. */
+    if let Some(g) = grammar {
+        body["grammar"] = json!(g);
+    }
     let resp = agent()
         .post(&format!("{}/v1/completions", base_url()))
         .header("Content-Type", "application/json")
@@ -1121,7 +1187,7 @@ fn stream_persona(
             let _ = std::io::stdout().flush();
             true
         };
-        chat_stream(&history, max_tokens, &mut on_tok)?;
+        chat_stream(&history, max_tokens, &mut on_tok, None)?;
         println!();
         return Ok(());
     }
