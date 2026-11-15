@@ -13,16 +13,6 @@ FIXED (in ledger).
 
 ## Open
 
-### BUG-004 — memory recall returns hash-collision "similar" riders — MED (quality) — OPEN
-v1.2 finding: hash-token collisions can attach a low-score "similar"
-record to recall results even when it is not truly related; keyword
-hits always rank first so the answer is usually right, but the rider is
-noise the model may read aloud. Tests assert collision-tolerance, so it
-is by-design tolerated, not desired.
-Fix direction: raise the similarity admission floor, or drop riders
-whose score is below the top hit by a margin; re-check the collision
-test expectations when tuning.
-
 ### BUG-005 — file_search walk is DFS-LIFO (same starvation shape we fixed in content_search) — LOW — OPEN
 v1 `file_search` still walks depth-first with a LIFO stack, so the
 alphabetically-LAST top-level subtree is scanned first; with the 30k
@@ -105,6 +95,13 @@ crash, not a test failure).
 
 ## Fixed recently (ledger)
 
+- 2026-11-15 (`4b6faac`): hash-token collisions attached low-score
+  "similar" riders to recall results (the "march 3rd"-vs-mom collision,
+  cosine ~0.26, passed the 0.2 base floor) — recall now drops similar
+  riders that score further than RECALL_RIDER_MARGIN (0.6) below the
+  top keyword hit; the pure-similar path keeps the base floor
+  (calibration showed the collision band overlaps the weak-related
+  band, so the floor is relative, not absolute) (BUG-004).
 - 2026-11-15 (`2a93c0d`): a hallucinated bare tool-result JSON after a
   clean final answer (`{"name": …, "result": …, "status": …}` with no
   envelope) leaked to display/TTS — StreamFilter now holds any bare
