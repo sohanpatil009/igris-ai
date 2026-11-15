@@ -13,16 +13,6 @@ FIXED (in ledger).
 
 ## Open
 
-### BUG-006 — llama-server reuse trusts /health only — LOW — SUSPECTED
-The agent loop reuses an already-running llama-server on :8018/:8081
-after a bare `/health` 200. If a server with a DIFFERENT model/GGUF is
-already bound to the port, we would reuse it blindly and get degraded
-or wrong behavior with no error. Not yet observed live.
-Verify: start a wrong-model server on :8081, run the CLI, see whether
-anything detects the mismatch. Fix direction: compare a model
-identifier (e.g. /props or /v1/models) against the expected GGUF before
-reusing; log loudly on mismatch.
-
 ### BUG-007 — screenshots accumulate without bound in OneDrive Pictures — LOW (hygiene) — OPEN
 Every screenshot writes `C:\Users\sohan\OneDrive\Pictures\igris_screenshot_*.png`
 and nothing ever cleans up (OneDrive syncs them, too).
@@ -39,26 +29,20 @@ scaffolding writes where the user points it".
 Decision needed: document as-is, or gate new/init behind the same
 two-step confirmation v2.5 will bring.
 
-### BUG-009 — lib test binary intermittently exits 101 with all suites green — LOW (flaky) — SUSPECTED
-Twice during the toolparse modularization the workspace gate
-(`cargo test --workspace | Out-Null; $LASTEXITCODE`) returned 101 with
-cargo's stderr "error: test failed, to rerun pass
-`-p igris-core --lib`"; every run where stdout was actually captured or
-displayed showed all suites green (lib 319/0/1, doctests 1/0/0) —
-including a full `| Out-File` capture immediately after. The failure
-detail was suppressed by Out-Null both times, so the offending test is
-not yet identified. Hypotheses: (a) a timing-sensitive test failing
-under machine load (candidates: `tools::registry` hung-tool budget
-test, `content_search` 3.5 s budget test, screenshot smoke) — note
-llama-server holds :8018/:8081 during these runs; (b) the lib test
-binary crashing AFTER `test result: ok` during native teardown (the
-same binary initializes ORT/moonshine and the screenshot test touches
-GDI), which cargo reports identically with no `failures:` block.
-Next step when it reproduces: capture full stdout
-(`| Out-File D:\Temp\opencode\gate_ws.txt -Encoding utf8`) and check
-for a `failures:` block vs. a clean tail; run the lib test binary
-directly for its raw exit code (an 0xC0000005-class code confirms a
-crash, not a test failure).
+## Open
+
+### BUG-010 — cargo-run chat may hang after SPAWNING llama-server under a piped stdout — LOW (flaky) — SUSPECTED
+One occurrence 2026-11-15 (BUG-006 verification): with the live
+llama-server killed, `cargo run -q -p igris-cli -- chat hi 2>&1 |
+Out-File …` printed the full answer (gpu backend ready + reply) but did
+not exit within a 5 min timeout; a follow-up run that only REUSED the
+running server exited 0 quickly. Spawn machinery is untouched by
+BUG-006, so this predates it; suspicion is the detached child holding
+an inherited pipe/console handle alive when stdout is redirected.
+Reproduction recipe: kill llama-server, run the piped chat command,
+observe no exit; interactively (no pipe) it should exit normally.
+Check next time it reproduces: does a plain console `cargo run -- chat`
+exit cleanly after a spawn?
 
 ---
 
@@ -85,6 +69,20 @@ crash, not a test failure).
 
 ## Fixed recently (ledger)
 
+- 2026-11-15 (`2cefc53`): llama-server reuse trusted a bare /health 200
+  — ensure_server now identifies the running server via /props before
+  reusing (GGUF file name from model_path/model_alias vs the bundled
+  LFM3 name, case-insensitive) and refuses loudly on a different model
+  or a foreign /health-only server (fail-closed when /props carries no
+  identity). Verified live: a foreign /health-200 server on :8081 was
+  refused with a clear error (pre-fix it would have been reused
+  blindly), and the correct server still reuses (BUG-006).
+- 2026-11-15 (`03c0139`): the flaky lib-test exit 101 was a
+  MOON_ASSETS env race — the two paths tests touch the env var while
+  cargo runs test threads in parallel, so the asset-join test could
+  resolve root and joined to different roots (assertion failure whose
+  FAILED line `Out-Null` discarded, matching the observed all-green
+  exit 101); the tests now serialize on a static lock (BUG-009).
 - 2026-11-15 (`50d4c88`): file_search still walked depth-first with a
   LIFO stack (the same starvation shape fixed in content_search,
   0559b8e) and never skipped nested clones — search_walk is now
