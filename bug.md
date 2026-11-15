@@ -13,24 +13,6 @@ FIXED (in ledger).
 
 ## Open
 
-### BUG-001 — web tools follow redirects into private hosts (SSRF) — HIGH — OPEN
-`web_fetch` / `download_file` validate the INITIAL url only
-(`validate_web_url`), but the shared ureq agent follows redirects by
-default (ureq 3.5.1 config has `max_redirects` / `save_redirect_history`
-fields). A public page that answers `Location: http://127.0.0.1:8018/...`
-would be followed server-side by ureq, fetching a local service and
-feeding its response to the model — exactly what the private-host block
-exists to prevent.
-Evidence: ureq source (config.rs L164-167) shows redirect machinery is on
-by default; our `web_get` sets no redirect policy.
-Suggested fix: build the agent (or per-request) with redirect history
-capture on, then post-check EVERY hop's host with `is_private_host` via
-`ResponseExt::get_redirect_history()` and error out if any hop is
-private/local (legit http→https and CDN hops pass). Alternative: disable
-auto-redirects and re-follow manually with re-validation per hop.
-Tests: local two-server e2e (public 302 → loopback) must fail closed;
-unit test the history check.
-
 ### BUG-002 — non-canonical IPv4 literals bypass the private-host block — MED — OPEN
 `is_private_host` parses the host with `Ipv4Addr::parse`, which only
 accepts full dotted quads. Windows' resolver (and most OS resolvers)
@@ -44,6 +26,12 @@ host (sans port) is not a valid full dotted quad, not bracketed IPv6,
 and contains no ASCII letter, REJECT it (no real domain is letterless);
 optionally expand integer forms and re-check instead of rejecting.
 Tests: the forms above + `0177.0.0.1` must be rejected.
+UPDATE 2026-11-15: partially mitigated at the web-tools socket layer by
+the BUG-001 resolver veto (`ab24b42`) — getaddrinfo resolves the
+non-canonical literals to 127.0.0.1 and the resolver's `is_private_ip`
+filter blocks the resolved private address (fail-closed). The literal
+hardening of `is_private_host`/`validate_web_url` stays open as
+defense-in-depth.
 
 ### BUG-003 — fake inline tool_result JSON leaks into display/TTS — HIGH (UX) — OPEN
 When LFM3 hallucinates a fake tool result AFTER a clean final answer
@@ -135,13 +123,24 @@ crash, not a test failure).
   Content-Disposition suggestion is ignored (feature gap, not a bug).
 - `content_search` reports PARTIAL results when its 3.5 s / 1500-file
   budget is hit — by design, and the note is deliberately loud now.
-- `is_private_host` checks literal hosts only; DNS-resolution and
-  rebinding checks are out of scope (BUG-002 narrows the bypass).
+- The web-tools private-host block includes DNS-level filtering now
+  (BUG-001 `ab24b42`): the resolver refuses private literal hosts
+  without DNS and drops private resolved addresses fail-closed, which
+  also covers rebinding. Remaining trade-offs: CGNAT 100.64/10 and
+  TEST-NET ranges stay allowed; BUG-002's non-canonical IPv4 literal
+  hardening on `is_private_host` remains open (mitigated at the socket
+  layer by the same veto).
 - `run_command` output is capped at 4000 chars — compiler dumps arrive
   truncated with an explicit marker.
 
 ## Fixed recently (ledger)
 
+- 2026-11-15 (`ab24b42`): web tools followed redirects into private
+  hosts (SSRF) — the ureq agent now vetoes local/private targets at the
+  resolver layer on EVERY request hop (initial URL + each redirect,
+  before any socket opens; also covers DNS rebinding via a fail-closed
+  resolved-address filter), with the redirect history as a second
+  backstop; CGNAT/TEST-NET stay allowed (BUG-001).
 - 2026-11-14 (`0559b8e`): validate_web_url kept the `:port` in the
   authority, so `127.0.0.1:8018` slipped past the private-host block —
   is_private_host now strips all-digit ports (IPv6 brackets handled)
