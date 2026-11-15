@@ -1,16 +1,27 @@
 //! Web tools (v2, goal.md sections 5/6): web_fetch (size-capped page
 //! reader), download_file (streamed save into the user's Downloads
 //! folder only), web_search (DuckDuckGo "lite" HTML backend, no API
-//! key). Shared here: the ureq agent, URL policy with the private-host
-//! block, HTML-to-text, entity decode, filename sanitizing.
+//! key). Shared here: the ureq agent — hardened so no request hop can
+//! ever target a local/private host (BUG-001): the URL policy blocks
+//! the initial literal host up front, the agent's resolver vetoes
+//! EVERY hop (initial URL and each followed redirect, including
+//! DNS-resolved private addresses), and the redirect history is a
+//! final backstop. Plus HTML-to-text, entity decode, filename
+//! sanitizing.
 
 use crate::tools::basic::validate_open_url;
 use crate::tools::shared::{fmt_bytes, optional_u64, required_str, truncate_chars, url_encode_value};
 use regex::Regex;
 use serde_json::Value;
 use std::fs;
+use std::net::IpAddr;
 use std::sync::LazyLock;
 use std::time::Duration;
+use ureq::config::Config;
+use ureq::http::Uri;
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::NextTimeout;
+use ureq::{Error, ResponseExt};
 
 /* ---------------------------------------------------------------- */
 /* web shared: agent, URL policy, entity decode                      */
@@ -23,11 +34,19 @@ const WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb
 /// Web agent for the v2 browser tools — separate from the LLM server
 /// agent (different timeout regime); per-request timeouts set at call
 /// time so each tool controls its own budget.
+///
+/// Built via `Agent::with_parts` to attach the `PrivateBlockResolver`
+/// veto. `DefaultConnector` is the stock TCP+TLS stack the plain
+/// config-built agent gets — only the resolver differs.
 static WEB_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
-    ureq::Agent::config_builder()
-        .user_agent(WEB_USER_AGENT)
-        .build()
-        .into()
+    ureq::Agent::with_parts(
+        ureq::Agent::config_builder()
+            .user_agent(WEB_USER_AGENT)
+            .save_redirect_history(true)
+            .build(),
+        ureq::unversioned::transport::DefaultConnector::default(),
+        PrivateBlockResolver,
+    )
 });
 
 const WEB_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -38,13 +57,23 @@ fn web_get(
     url: &str,
     timeout: Duration,
 ) -> Result<ureq::http::Response<ureq::Body>, String> {
-    WEB_AGENT
+    validate_web_url(url)?;
+    let resp = WEB_AGENT
         .get(url)
         .config()
         .timeout_global(Some(timeout))
         .build()
         .call()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    /* Second line of defense (BUG-001): the history carries every hop
+     * (initial, intermediates, final). If a private host slipped past
+     * the resolver veto anyway, fail here — the body is never read. */
+    if let Some(history) = resp.get_redirect_history() {
+        if let Some(msg) = refused_history_hop(history) {
+            return Err(msg);
+        }
+    }
+    Ok(resp)
 }
 
 /// Same scheme/character policy as `validate_open_url`, plus a block on
@@ -113,6 +142,116 @@ fn is_private_host(host: &str) -> bool {
     /* Bracket-less IPv6 loopback (invalid in a URL authority, but cheap
      * to catch; no legal DNS name contains a colon). */
     bare.starts_with("::1")
+}
+
+/* ---------------------------------------------------------------- */
+/* BUG-001: private-host veto at the resolver layer                  */
+/* ---------------------------------------------------------------- */
+
+/// Literal-host veto decision for one request-hop URI: Some(refusal)
+/// when the host is local/private. Pure so tests can pin the exact
+/// decision the resolver applies to every hop.
+fn private_host_refusal(uri: &Uri) -> Option<String> {
+    let host = uri.authority()?.host();
+    if is_private_host(host) {
+        Some(format!("refusing local/private address '{host}'"))
+    } else {
+        None
+    }
+}
+
+/// IP-level mirror of `is_private_host`'s address policy, applied to
+/// RESOLVED socket addresses (the literal path cannot see these).
+/// Parity set: loopback, RFC1918 private, link-local, broadcast,
+/// unspecified — plus IPv6 loopback, ULA (fc00::/7), link-local
+/// (fe80::/10) and v4-mapped forms. CGNAT 100.64/10 and TEST-NET
+/// documentation ranges stay allowed (documented trade-off).
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Resolver for `WEB_AGENT` (BUG-001): ureq re-resolves the URI of
+/// every request hop — the initial URL and each followed redirect
+/// (`call_run` resolves per loop iteration) — so vetoing here refuses
+/// a redirect to a local/private target BEFORE any socket opens, and
+/// no hand-rolled Location handling is needed (ureq's own redirect
+/// machinery stays authoritative). Two layers:
+///
+/// 1. the literal authority host (`is_private_host`) — refused with no
+///    DNS lookup at all;
+/// 2. the RESOLVED addresses (DNS-rebinding backstop: a public-looking
+///    name that resolves into a private range) — private addrs are
+///    dropped, and the hop fails closed if nothing public remains.
+///
+/// Scope note: `WEB_AGENT` runs proxy-less (a proxy configured with
+/// remote resolution would skip the resolver) and `DefaultConnector`
+/// supplies the same stock stack the plain config-built agent gets.
+#[derive(Debug)]
+struct PrivateBlockResolver;
+
+impl Resolver for PrivateBlockResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, Error> {
+        if let Some(msg) = private_host_refusal(uri) {
+            return Err(Error::BadUri(msg));
+        }
+        let addrs = DefaultResolver::default().resolve(uri, config, timeout)?;
+        let mut kept = self.empty();
+        let mut seen_private: Option<String> = None;
+        for addr in &addrs {
+            if is_private_ip(addr.ip()) {
+                seen_private.get_or_insert_with(|| addr.ip().to_string());
+                continue;
+            }
+            kept.push(*addr);
+        }
+        if kept.is_empty() {
+            let host = uri.authority().map(|a| a.host()).unwrap_or("");
+            return Err(Error::BadUri(format!(
+                "refusing local/private address '{host}' (resolved to {})",
+                seen_private.unwrap_or_default()
+            )));
+        }
+        Ok(kept)
+    }
+}
+
+/// Backstop over `get_redirect_history` (BUG-001 second line of
+/// defense): with `save_redirect_history(true)` the final response
+/// carries every hop — initial, intermediates, final. If a private
+/// host appears anywhere in the chain despite the resolver veto, the
+/// whole fetch fails before the body is read.
+fn refused_history_hop(history: &[Uri]) -> Option<String> {
+    history.iter().find_map(|uri| {
+        let host = uri.authority().map(|a| a.host()).unwrap_or("");
+        if is_private_host(host) {
+            Some(format!("redirect passed local/private address '{host}'"))
+        } else {
+            None
+        }
+    })
 }
 
 /// Decode common HTML entities found in page/search text (named + decimal
@@ -756,5 +895,178 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("Invalid filename"), "{err}");
+    }
+
+    /* ---- BUG-001: private-host veto on every request hop ---- */
+
+    #[test]
+    fn resolved_private_ips_match_the_literal_host_policy() {
+        for bad in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.9",
+            "172.31.255.1",
+            "192.168.0.1",
+            "169.254.169.254",
+            "255.255.255.255",
+            "0.0.0.0",
+        ] {
+            let ip: IpAddr = bad.parse().unwrap();
+            assert!(is_private_ip(ip), "{bad} must be refused");
+        }
+        /* 172.32.0.1 sits outside the private /12 — parity guard. */
+        assert!(!is_private_ip("172.32.0.1".parse().unwrap()));
+        assert!(!is_private_ip("8.8.8.8".parse().unwrap()));
+        for bad6 in [
+            "::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "febf::1234",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+        ] {
+            let ip: IpAddr = bad6.parse().unwrap();
+            assert!(is_private_ip(ip), "{bad6} must be refused");
+        }
+        assert!(!is_private_ip("2606:4700::1111".parse().unwrap()));
+        assert!(!is_private_ip("::ffff:8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn hop_veto_refuses_private_literals_and_allows_public() {
+        for bad in [
+            "http://127.0.0.1:8018/health",
+            "https://localhost/x",
+            "http://10.0.0.5/x",
+            "http://192.168.1.10/x",
+            "http://[::1]:8080/x",
+            "http://machine.local/x",
+        ] {
+            let uri: Uri = bad.parse().unwrap();
+            let msg = private_host_refusal(&uri).unwrap_or_else(|| panic!("must refuse {bad}"));
+            assert!(msg.contains("refusing local/private"), "{msg}");
+        }
+        assert!(private_host_refusal(&"https://example.com/x".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn history_backstop_flags_private_hops() {
+        let chain: Vec<Uri> = vec![
+            "https://example.com/x".parse().unwrap(),
+            "http://127.0.0.1:8018/health".parse().unwrap(),
+        ];
+        let msg = refused_history_hop(&chain).expect("private hop must be flagged");
+        assert!(msg.contains("local/private"), "{msg}");
+        let clean: Vec<Uri> = vec!["https://example.com/x".parse().unwrap()];
+        assert!(refused_history_hop(&clean).is_none());
+    }
+
+    #[test]
+    fn web_agent_refuses_private_hosts_before_connecting() {
+        /* Drives the REAL production agent (with_parts + veto resolver):
+         * ureq's own machinery surfaces the refusal. No DNS lookup and
+         * no socket ever happen — the literal veto fires first. */
+        let err = WEB_AGENT
+            .get("http://127.0.0.1:8018/health")
+            .call()
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing local/private"), "{err}");
+    }
+
+    /// Minimal raw-HTTP responder: answers `times` connections with a
+    /// canned response (request head drained first). Dependency-free
+    /// stand-in for the "fetched page" and "loopback service" servers.
+    fn serve_loop(listener: std::net::TcpListener, response: String, times: usize) {
+        use std::io::{BufRead, Write};
+        for _ in 0..times {
+            let Ok((mut sock, _)) = listener.accept() else {
+                break;
+            };
+            {
+                let mut reader = std::io::BufReader::new(&sock);
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    line.clear();
+                }
+            }
+            let _ = sock.write_all(response.as_bytes());
+            let _ = sock.flush();
+        }
+    }
+
+    #[test]
+    fn redirect_to_loopback_is_refused_at_every_layer() {
+        /* BUG-001 e2e: server A (stand-in for a fetched page) answers
+         * 302 -> server B on loopback. Offline constraint: no test can
+         * present a genuinely public initial host, so the layers are
+         * exercised as (1) the redirect machinery itself works on this
+         * fixture, (2) the per-hop veto refuses the Location target,
+         * (3) the real production agent refuses the request up front.
+         * The resolver re-resolves EVERY hop (ureq call_run), so (2) is
+         * the exact decision that gates a redirect hop in production. */
+        let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port_a = a.local_addr().unwrap().port();
+        let port_b = b.local_addr().unwrap().port();
+        let url_a = format!("http://127.0.0.1:{port_a}/");
+        let a_resp = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port_b}/x\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let b_resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
+        let ta = std::thread::spawn(move || serve_loop(a, a_resp, 2));
+        let tb = std::thread::spawn(move || serve_loop(b, b_resp.to_string(), 1));
+        let t = Duration::from_secs(5);
+
+        /* (1) fixture + ureq's redirect machinery: following A->B
+         * succeeds when nothing vetoes it. */
+        let follow: ureq::Agent = ureq::Agent::config_builder().build().into();
+        let resp = follow
+            .get(&url_a)
+            .config()
+            .timeout_global(Some(t))
+            .build()
+            .call()
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body = resp
+            .into_body()
+            .into_with_config()
+            .limit(4096)
+            .read_to_string()
+            .unwrap();
+        assert_eq!(body, "HELLO");
+
+        /* (2) raw 302 (redirects off) -> the per-hop veto refuses the
+         * Location target before any second hop could be resolved. */
+        let raw: ureq::Agent = ureq::Agent::config_builder().max_redirects(0).build().into();
+        let resp = raw
+            .get(&url_a)
+            .config()
+            .timeout_global(Some(t))
+            .build()
+            .call()
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 302);
+        let loc = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let uri: Uri = loc.parse().unwrap();
+        let refusal = private_host_refusal(&uri).expect("loopback redirect must be refused");
+        assert!(refusal.contains("refusing local/private"), "{refusal}");
+
+        /* (3) the REAL production agent refuses the request itself. */
+        let err = WEB_AGENT.get(&url_a).call().unwrap_err();
+        assert!(err.to_string().contains("refusing local/private"), "{err}");
+
+        ta.join().unwrap();
+        tb.join().unwrap();
     }
 }
