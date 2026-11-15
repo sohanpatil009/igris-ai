@@ -52,14 +52,21 @@ fn default_search_roots() -> Vec<PathBuf> {
 }
 
 /// Iterative bounded walk. Returns (matches, entries scanned, budget hit).
+/* Breadth-first on purpose (same shape as content_search below, BUG-005):
+ * a DFS pops the alphabetically-LAST top-level subtree first (observed
+ * live: a nested clone starved `crates/` entirely at repo-root scope).
+ * BFS gives top-level project folders the first turn and dependency-like
+ * trees the last. */
 fn search_walk(roots: &[PathBuf], query_lc: &str, limit: usize) -> (Vec<PathBuf>, usize, bool) {
     let deadline = Instant::now() + SEARCH_TIME_BUDGET;
     let mut matches = Vec::new();
     let mut scanned = 0usize;
     let mut budget_hit = false;
+    use std::collections::VecDeque;
     'roots: for root in roots {
-        let mut stack = vec![(root.clone(), 0usize)];
-        while let Some((dir, depth)) = stack.pop() {
+        let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+        queue.push_back((root.clone(), 0usize));
+        while let Some((dir, depth)) = queue.pop_front() {
             let Ok(entries) = fs::read_dir(&dir) else {
                 continue;
             };
@@ -75,8 +82,9 @@ fn search_walk(roots: &[PathBuf], query_lc: &str, limit: usize) -> (Vec<PathBuf>
                     if depth < SEARCH_MAX_DEPTH
                         && !name_lc.starts_with('.')
                         && !SEARCH_SKIP_DIRS.contains(&name_lc.as_str())
+                        && !is_nested_repo(&path)
                     {
-                        stack.push((path, depth + 1));
+                        queue.push_back((path, depth + 1));
                     }
                 } else if name_lc.contains(query_lc) {
                     matches.push(path);
@@ -539,6 +547,58 @@ mod tests {
             )
             .is_err());
         fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn file_search_walk_is_breadth_first() {
+        /* BUG-005: with limit 1 the alphabetically-first top-level
+         * subtree must win. DFS-LIFO popped the last-pushed subtree
+         * first, so the late subtree starved the early one. */
+        let root = temp_root("fs_bfs");
+        fs::create_dir_all(root.join("aaa_sub")).unwrap();
+        fs::create_dir_all(root.join("zzz_sub")).unwrap();
+        fs::write(root.join("aaa_sub").join("aaa_target.txt"), "x").unwrap();
+        fs::write(root.join("zzz_sub").join("zzz_target.txt"), "x").unwrap();
+        let out = reg()
+            .dispatch(
+                "file_search",
+                &json!({"query": "target", "limit": 1, "root": root.to_string_lossy()}),
+            )
+            .unwrap();
+        assert!(out.contains("Found 1"), "{out}");
+        assert!(out.contains("aaa_sub"), "BFS must reach the first subtree: {out}");
+        assert!(!out.contains("zzz_sub"), "{out}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn file_search_skips_nested_repos_on_descent() {
+        /* Same dependency-tree semantics as content_search (BUG-005):
+         * a nested clone is not descended into from a parent root, but
+         * an explicit root INTO the clone still searches it. */
+        let root = temp_root("fs_repo");
+        fs::create_dir_all(root.join("nested").join(".git")).unwrap();
+        fs::write(root.join("nested").join("hidden.txt"), "x").unwrap();
+        fs::write(root.join("top.txt"), "x").unwrap();
+        let out = reg()
+            .dispatch(
+                "file_search",
+                &json!({"query": "txt", "root": root.to_string_lossy()}),
+            )
+            .unwrap();
+        assert!(out.contains("top.txt"), "{out}");
+        assert!(!out.contains("nested"), "{out}");
+        let out = reg()
+            .dispatch(
+                "file_search",
+                &json!({
+                    "query": "txt",
+                    "root": root.join("nested").to_string_lossy()
+                }),
+            )
+            .unwrap();
+        assert!(out.contains("hidden.txt"), "{out}");
+        fs::remove_dir_all(&root).ok();
     }
 
     /* ---- read_file ---- */
