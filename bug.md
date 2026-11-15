@@ -13,18 +13,8 @@ FIXED (in ledger).
 
 ## Open
 
-### BUG-010 — cargo-run chat may hang after SPAWNING llama-server under a piped stdout — LOW (flaky) — SUSPECTED
-One occurrence 2026-11-15 (BUG-006 verification): with the live
-llama-server killed, `cargo run -q -p igris-cli -- chat hi 2>&1 |
-Out-File …` printed the full answer (gpu backend ready + reply) but did
-not exit within a 5 min timeout; a follow-up run that only REUSED the
-running server exited 0 quickly. Spawn machinery is untouched by
-BUG-006, so this predates it; suspicion is the detached child holding
-an inherited pipe/console handle alive when stdout is redirected.
-Reproduction recipe: kill llama-server, run the piped chat command,
-observe no exit; interactively (no pipe) it should exit normally.
-Check next time it reproduces: does a plain console `cargo run -- chat`
-exit cleanly after a spawn?
+(none — everything currently known is fixed; the list re-fills as new
+reproducible bugs surface)
 
 ---
 
@@ -50,6 +40,26 @@ exit cleanly after a spawn?
   truncated with an explicit marker.
 
 ## Fixed recently (ledger)
+
+- 2026-11-15 (`4ab9bb1`): a piped `cargo run … chat hi` hung forever after the
+  answer had printed and both cargo and igris-ai had exited — root cause:
+  std spawns llama-server with `bInheritHandles=TRUE` and no
+  PROC_THREAD_ATTRIBUTE_HANDLE_LIST, and under a redirected pipeline the
+  app's table carries the parent chain's pipe write-ends twice (cargo's
+  original handle plus std's inheritable duplicate made for us), so the
+  immortal detached server kept them open and the outer `Out-File` never
+  saw EOF; clearing the three GetStdHandle inherit flags and
+  `stdin(Stdio::null())` did NOT stop it (the duplicates are unreachable
+  via the std handles — direct-exe-with-pipes probes were clean, which
+  isolated cargo as the extra-handle source). try_start now spawns
+  llama-server manually via CreateProcessW with a handle list restricted
+  to exactly [NUL stdin, NUL stdout, stderr log file] —
+  EXTENDED_STARTUPINFO_PRESENT is mandatory, without it the list is
+  silently ignored and the first live run still leaked — and the poll
+  loop re-reads the stderr log file instead of running a pipe-drain
+  thread. Verified: the faithful cargo-run repro that hung 4x at 240 s
+  now exits 0 in 27-35 s on the spawn path, 4.5-7.5 s on the reuse path,
+  direct file-redirect launches unchanged (BUG-010).
 
 - 2026-11-15 (`0e881de`): cargo new/init design review — DECISION:
   documented as-is. goal.md's safety rules now state the actual policy
