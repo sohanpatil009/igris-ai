@@ -13,26 +13,6 @@ FIXED (in ledger).
 
 ## Open
 
-### BUG-002 — non-canonical IPv4 literals bypass the private-host block — MED — OPEN
-`is_private_host` parses the host with `Ipv4Addr::parse`, which only
-accepts full dotted quads. Windows' resolver (and most OS resolvers)
-also accept decimal (`http://2130706433/` = 127.0.0.1), partial-dotted
-(`http://127.1/`), and hex forms (`http://0x7f.0.0.1/`) — all resolve to
-loopback while our check sees "not an IP, not private". Also flagged:
-`bare.starts_with("::1")` is a catch-all for bracket-less IPv6 but does
-not cover other loopback-ish literals.
-Suggested fix: harden `validate_web_url`'s host extraction — if the
-host (sans port) is not a valid full dotted quad, not bracketed IPv6,
-and contains no ASCII letter, REJECT it (no real domain is letterless);
-optionally expand integer forms and re-check instead of rejecting.
-Tests: the forms above + `0177.0.0.1` must be rejected.
-UPDATE 2026-11-15: partially mitigated at the web-tools socket layer by
-the BUG-001 resolver veto (`ab24b42`) — getaddrinfo resolves the
-non-canonical literals to 127.0.0.1 and the resolver's `is_private_ip`
-filter blocks the resolved private address (fail-closed). The literal
-hardening of `is_private_host`/`validate_web_url` stays open as
-defense-in-depth.
-
 ### BUG-003 — fake inline tool_result JSON leaks into display/TTS — HIGH (UX) — OPEN
 When LFM3 hallucinates a fake tool result AFTER a clean final answer
 (bare `{"name": …, "result": …, "status": "ok"}` JSON with no envelope),
@@ -126,15 +106,23 @@ crash, not a test failure).
 - The web-tools private-host block includes DNS-level filtering now
   (BUG-001 `ab24b42`): the resolver refuses private literal hosts
   without DNS and drops private resolved addresses fail-closed, which
-  also covers rebinding. Remaining trade-offs: CGNAT 100.64/10 and
-  TEST-NET ranges stay allowed; BUG-002's non-canonical IPv4 literal
-  hardening on `is_private_host` remains open (mitigated at the socket
-  layer by the same veto).
+  also covers rebinding; the literal layer also refuses non-canonical
+  IPv4 literals (BUG-002 `07b0e20`). Remaining trade-offs: CGNAT
+  100.64/10 and TEST-NET ranges stay allowed, and hex-spelled
+  loopback-ish v6 literals beyond `::1` (e.g. `[::ffff:7f00:1]`) are
+  caught by the resolver layer only.
 - `run_command` output is capped at 4000 chars — compiler dumps arrive
   truncated with an explicit marker.
 
 ## Fixed recently (ledger)
 
+- 2026-11-15 (`07b0e20`): non-canonical IPv4 literals (2130706433,
+  127.1, 0x7f.0.0.1, 0177.0.0.1) bypassed the private-host block —
+  is_private_host now refuses any host whose every dot-segment is
+  numeric (digits/0x-hex), restructures the port strip so the named
+  checks see port-free hosts (localhost:8018 and foo.local:8080 had
+  slipped too), and covers [::ffff:127.0.0.1]-style mapped literals by
+  delegating the IP policy to the shared is_private_ip (BUG-002).
 - 2026-11-15 (`ab24b42`): web tools followed redirects into private
   hosts (SSRF) — the ureq agent now vetoes local/private targets at the
   resolver layer on EVERY request hop (initial URL + each redirect,
