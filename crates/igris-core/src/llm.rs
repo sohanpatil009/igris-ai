@@ -450,6 +450,48 @@ fn server_ready() -> bool {
     )
 }
 
+/// Lowercased file name of the GGUF this build expects to serve, e.g.
+/// "lfm3-1.7b-q4_k_m.gguf" — the identity a reused server must carry.
+fn expected_model_id() -> &'static str {
+    static EXPECTED: OnceLock<String> = OnceLock::new();
+    EXPECTED.get_or_init(|| {
+        std::path::Path::new(LLM_MODEL)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_lowercase())
+            .unwrap_or_else(|| LLM_MODEL.to_lowercase())
+    })
+}
+
+/// Extract the GGUF file name from a llama-server /props body. Tolerant
+/// across builds: the live bundled build (b12110) reports `model_path`
+/// top-level; `model_alias` is the older spelling. None when the body is
+/// not props-shaped JSON (a foreign server, a 404 page).
+fn parse_props_model_id(body: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    for key in ["model_path", "model_alias"] {
+        if let Some(p) = v.get(key).and_then(|x| x.as_str()) {
+            if let Some(name) = std::path::Path::new(p).file_name() {
+                return Some(name.to_string_lossy().to_lowercase());
+            }
+        }
+    }
+    None
+}
+
+/// The running server's own model identity (GGUF file name, lowercased)
+/// from its /props endpoint; None when it does not answer with one
+/// (foreign server on the port, or a llama-server build without /props).
+fn server_model_id() -> Option<String> {
+    let mut resp = agent()
+        .get(&format!("{}/props", base_url()))
+        .config()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .build()
+        .call()
+        .ok()?;
+    resp.body_mut().read_to_string().ok().and_then(|b| parse_props_model_id(&b))
+}
+
 /// Which llama.cpp build to try. The GPU build is preferred; the CPU
 /// build runs on any Windows x64 machine.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -506,8 +548,34 @@ static FORCE_CPU: OnceLock<bool> = OnceLock::new();
 pub fn ensure_server(force_cpu: bool) -> Result<(), Box<dyn std::error::Error>> {
     let force_cpu = *FORCE_CPU.get_or_init(|| force_cpu || std::env::var("MOON_LLM_CPU").is_ok());
     if server_ready() {
-        println!("  llm       : reusing already-running llama-server (:{PORT})");
-        return Ok(());
+        /* BUG-006: /health says "a llama-server is up", not "the RIGHT
+         * model is up" — a wrong-model or foreign server on the port
+         * used to be reused blindly (degraded answers, no error).
+         * Identify it via /props before reusing; refuse loudly on
+         * mismatch. Fail-closed when /props carries no identity. */
+        match server_model_id() {
+            Some(id) if id == expected_model_id() => {
+                println!("  llm       : reusing already-running llama-server (:{PORT})");
+                return Ok(());
+            }
+            Some(id) => {
+                let msg = format!(
+                    "port {PORT} is already serving a DIFFERENT model ('{id}', expected \
+                     '{}'). Kill that llama-server, then run IGRIS again.",
+                    expected_model_id()
+                );
+                eprintln!("  llm       : {msg}");
+                return Err(msg.into());
+            }
+            None => {
+                let msg = format!(
+                    "port {PORT} answers /health but is not our llama-server (/props \
+                     carries no model identity). Free the port, then run IGRIS again."
+                );
+                eprintln!("  llm       : {msg}");
+                return Err(msg.into());
+            }
+        }
     }
     let order: &[Backend] = if force_cpu {
         &[Backend::Cpu]
@@ -1098,5 +1166,36 @@ Persistent memory: personal facts the user has shared (preferences, plans, dates
         assert!(msg.contains("\"status\":\"ok\""));
         assert!(msg.contains("\"status\":\"error\""));
         assert!(msg.trim_end().ends_with(toolparse::TOOL_RESULT_CLOSE));
+    }
+
+    /* ---- BUG-006: server-reuse identity check ---- */
+
+    #[test]
+    fn expected_model_id_is_the_bundled_gguf_name() {
+        assert_eq!(expected_model_id(), "lfm3-1.7b-q4_k_m.gguf");
+    }
+
+    #[test]
+    fn props_model_id_extraction_tolerates_build_shapes() {
+        /* The live bundled build (b12110): top-level model_path with a
+         * full Windows path (observed 2026-11-15 on :8081). */
+        let live = r#"{"model_path":"E:\\proj\\assets\\llama-cpp/model/LFM3-1.7B-Q4_K_M.gguf","build_info":"b12110"}"#;
+        assert_eq!(
+            parse_props_model_id(live).as_deref(),
+            Some("lfm3-1.7b-q4_k_m.gguf")
+        );
+        /* Older spelling: model_alias. */
+        let alias = r#"{"model_alias":"/models/LFM3-1.7B-Q4_K_M.gguf"}"#;
+        assert_eq!(
+            parse_props_model_id(alias).as_deref(),
+            Some("lfm3-1.7b-q4_k_m.gguf")
+        );
+        /* A wrong model is extracted as itself (the caller compares). */
+        let wrong = r#"{"model_path":"C:\\other\\Qwen2-0.5B.gguf"}"#;
+        assert_eq!(parse_props_model_id(wrong).as_deref(), Some("qwen2-0.5b.gguf"));
+        /* Foreign/404/garbage bodies carry no identity. */
+        assert_eq!(parse_props_model_id("<html>404</html>"), None);
+        assert_eq!(parse_props_model_id(r#"{"total_slots":4}"#), None);
+        assert_eq!(parse_props_model_id(""), None);
     }
 }
