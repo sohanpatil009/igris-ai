@@ -1,4 +1,4 @@
-//! Local LLM inference through llama.cpp (no Ollama).
+﻿//! Local LLM inference through llama.cpp (no Ollama).
 //!
 //! The GGUF in `assets/llama-cpp/model/` is served by the bundled
 //! `llama-server` (Vulkan GPU build in `assets/llama-cpp/vulkan/`), which
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
  * alike. `--cpu` (or MOON_LLM_CPU=1) skips the GPU attempt. NOTE: if the
  * flags below change, kill any leftover llama-server so the next run
  * starts one with the new configuration. */
-/* Fragments under the resolved asset root (crate::paths) — resolved at
+/* Fragments under the resolved asset root (crate::paths) â€” resolved at
  * use time so every front-end finds them regardless of its CWD. */
 const LLAMA_GPU_EXE: &str = "llama-cpp/vulkan/llama-server.exe";
 const LLAMA_CPU_EXE: &str = "llama-cpp/cpu/llama-server.exe";
@@ -140,8 +140,8 @@ fn tool_call_protocol_instructions() -> String {
          {{\"name\": \"tool_name\", \"arguments\": {{\"param\": \"value\"}}}}\n\
          {close}\n\n\
          You may use multiple tool calls in a single response. After tool execution, results appear in {result} tags. Continue reasoning with the results until you can give a final answer.\n\n\
-         Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first — never claim you don't know without checking.\n\n\
-         Gated tools: their first call only validates the action and announces the plan — it does NOT execute, and the result starts with NOT EXECUTED — CONFIRMATION REQUIRED. Tell the user exactly what will happen and wait for a clear yes; only after the user confirms, call the same tool again with identical arguments and it will execute. If the user declines or changes the request, do not call it again.\n\n",
+         Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first â€” never claim you don't know without checking.\n\n\
+         Gated tools: their first call only validates the action and announces the plan â€” it does NOT execute, and the result starts with NOT EXECUTED â€” CONFIRMATION REQUIRED. Tell the user exactly what will happen and wait for a clear yes; only after the user confirms, call the same tool again with identical arguments and it will execute. If the user declines or changes the request, do not call it again.\n\n",
         open = toolparse::TOOL_CALL_OPEN,
         close = toolparse::TOOL_CALL_CLOSE,
         result = toolparse::TOOL_RESULT_OPEN,
@@ -151,8 +151,8 @@ fn tool_call_protocol_instructions() -> String {
 /// The tool-calling prompt block: the ZeroClaw protocol instructions
 /// (verbatim port of `TOOL_CALL_PROTOCOL_INSTRUCTIONS`,
 /// zeroclaw-runtime/src/agent/tool_call_format.rs:39-58) plus two rules
-/// of our own appended after it — persistent memory (v1.2) and gated
-/// tools (v2.5) — then the `### Available Tools` listing (ZeroClaw's
+/// of our own appended after it â€” persistent memory (v1.2) and gated
+/// tools (v2.5) â€” then the `### Available Tools` listing (ZeroClaw's
 /// `build_tool_instructions` shape, zeroclaw-runtime/src/agent/loop_.rs:
 /// 1358-1383), with specs sorted by name so the system prompt is
 /// byte-stable for the KV cache.
@@ -184,7 +184,7 @@ pub fn tools_enabled(no_tools_flag: bool) -> bool {
 }
 
 /// System prompt for a history seed: the `base` persona plus the tool
-/// protocol block when tools are on. Called once at seed time — the system
+/// protocol block when tools are on. Called once at seed time â€” the system
 /// turn never changes mid-session, keeping the KV-cache prefix stable.
 /// Specs come from the tool registry (src/tools.rs), the single owner of
 /// the tool list.
@@ -205,12 +205,24 @@ pub const MAX_TOOL_ITERATIONS: usize = 10;
 /// Malformed tool-call retries per turn (ZeroClaw's number).
 pub const MAX_MALFORMED_RETRIES: usize = 2;
 
-/// Loop bookkeeping for one agent turn: the iteration budget and the
-/// malformed-retry budget, kept pure so the caps are unit-testable
-/// without a live server.
+/// Loop bookkeeping for one agent turn: the iteration budget, the
+/// malformed-retry budget, and the validation-streak escalation (v3
+/// hardening), kept pure so the caps are unit-testable without a live
+/// server.
 pub struct AgentLoopState {
     pub rounds: usize,
     pub retries: usize,
+    /// Consecutive rounds whose calls were ALL rejected before any
+    /// execution (unknown name / wrong-typed args / refused plan).
+    /// Domain errors never count â€” a real result must be allowed to end
+    /// in a plain-words answer.
+    pub invalid_streak: usize,
+    /// Whether any round this turn reached dispatch (parsed calls and
+    /// ran the tool round). The DSML drift correction only fires before
+    /// the first execution: after one, a prose-wrapped envelope echo is
+    /// noise (the prose is the answer), before one it is a failed tool
+    /// attempt that must not silently become the final reply.
+    pub executed_any: bool,
 }
 
 impl AgentLoopState {
@@ -218,6 +230,8 @@ impl AgentLoopState {
         AgentLoopState {
             rounds: 0,
             retries: 0,
+            invalid_streak: 0,
+            executed_any: false,
         }
     }
 
@@ -255,6 +269,91 @@ impl AgentLoopState {
              naming one of your available tools, or answer in plain words."
         ))
     }
+
+    /// Verdict for a zero-call reply that carries the model's native DSML
+    /// envelope on a round where nothing has executed yet
+    /// (`executed_any == false`). Live evidence (2026-11-15): a first
+    /// round of prose + a MANGLED DSML envelope parses to zero calls, is
+    /// NOT flagged by the issue detector (it only catches DSML when the
+    /// response OPENS with the envelope), and silently becomes the final
+    /// answer — raw tags streamed to the user, nothing armed. The
+    /// prose-echo exemption exists for rounds after a success; before
+    /// any execution there is no answer to protect. Shares the malformed
+    /// retry budget, and the retry round is grammar-forced by the loop.
+    pub fn dsml_drift_verdict(&mut self, raw: &str) -> Option<String> {
+        if self.executed_any
+            || !raw.contains(toolparse::DSML_OPEN)
+            || toolparse::looks_like_tool_protocol_example(raw)
+            || self.retries >= MAX_MALFORMED_RETRIES
+        {
+            return None;
+        }
+        self.retries += 1;
+        Some(
+            "Your last response used your native DSML envelope format, which \
+             cannot be dispatched here. Reply with exactly one JSON object \
+             inside one tool-call tag pair, naming one of your available \
+             tools, or answer in plain words."
+                .to_string(),
+        )
+    }
+
+    /// What to do after a dispatched round (v3 hardening). Live evidence
+    /// (2026-11-15): when a round's calls all fail validation â€” the
+    /// schema-echo/alias-mangling defect class, which PARSES so the
+    /// malformed path never fires â€” the model, given only the error
+    /// results, drifts to a prose question and the turn ends with zero
+    /// progress. The escalation ladder:
+    ///
+    /// streak 1 â†’ one free corrective retry round (unconstrained: the
+    /// model may legitimately answer in plain words, e.g. when the user
+    /// never said which file to delete);
+    /// streak 2 â†’ grammar-force the next round, making echoed/wrong-typed
+    /// argument shapes unrepresentable (the tool-call grammar admits only
+    /// schema-typed values);
+    /// streak â‰¥ 3 â†’ stand down: forcing failed to resolve it, so stop
+    /// spending rounds on constraints and let the model speak or the
+    /// iteration budget end the turn.
+    pub fn validation_verdict(&mut self, outcomes: &[ToolOutcome]) -> ValidationStep {
+        let all_invalid = !outcomes.is_empty()
+            && outcomes
+                .iter()
+                .all(|o| o.phase == crate::tools::DispatchPhase::Invalid);
+        if !all_invalid {
+            /* a mix, an armed announce, or a real execution: the round
+             * made progress (or got a real result) â€” reset the streak */
+            self.invalid_streak = 0;
+            return ValidationStep::None;
+        }
+        self.invalid_streak += 1;
+        match self.invalid_streak {
+            1 => {
+                let first = outcomes[0].output.clone();
+                ValidationStep::Corrective(format!(
+                    "Every tool call this round was rejected before anything executed ({first}). \
+                     Reply with one corrected tool call in the canonical JSON envelope, or, \
+                     if you cannot determine the correct arguments, answer in plain words."
+                ))
+            }
+            2 => ValidationStep::ForceGrammar,
+            _ => ValidationStep::None,
+        }
+    }
+}
+
+/// The agent loop's decision after a round whose calls were all
+/// rejected before execution â€” see
+/// [`AgentLoopState::validation_verdict`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationStep {
+    /// Results message alone; the next round is unconstrained.
+    None,
+    /// Append the corrective note to the results message; the next
+    /// round stays unconstrained (the model may answer in plain words).
+    Corrective(String),
+    /// Grammar-force the next round: shapes that failed twice must
+    /// become unrepresentable.
+    ForceGrammar,
 }
 
 /// One executed tool call, as it flows into the results message.
@@ -262,6 +361,9 @@ pub struct ToolOutcome {
     pub name: String,
     pub status: String, // "ok" | "error"
     pub output: String,
+    /// Which path the call took (v3 hardening): rounds where every call
+    /// died before execution drive the escalation ladder.
+    pub phase: crate::tools::DispatchPhase,
 }
 
 /// One tool_result block inside the results user message (the shape the
@@ -277,7 +379,7 @@ pub fn tool_result_block(name: &str, status: &str, output: &str) -> String {
 
 /// The user message that carries tool results back to the model: a
 /// stable `[Tool results]` carrier prefix plus one tool_result block per
-/// executed call. Plain appended text — `render_prompt` needs no change
+/// executed call. Plain appended text â€” `render_prompt` needs no change
 /// and the KV-cache prefix stays stable.
 pub fn tool_results_user_message(outcomes: &[ToolOutcome]) -> String {
     let mut s = String::from("[Tool results]\n");
@@ -329,7 +431,7 @@ pub enum AgentTurnEnd {
 /// One agent turn on `history` (which already holds the system seed and
 /// the user message): stream a reply with protocol hold-back, parse it,
 /// execute any tool calls against the registry, feed the results back as
-/// a user message, and repeat — until a plain final reply, a barge-in, or
+/// a user message, and repeat â€” until a plain final reply, a barge-in, or
 /// the iteration budget. History only ever grows (each round appends its
 /// raw assistant envelopes and the results message), so every round is a
 /// strict prompt-prefix of the next and `cache_prompt` stays effective.
@@ -411,6 +513,14 @@ pub fn agent_turn(
                 history.push(json!({"role": "user", "content": corrective}));
                 continue;
             }
+            if let Some(corrective) = state.dsml_drift_verdict(&raw) {
+                /* first-contact DSML drift: grammar-force the retry so
+                 * the native envelope spelling becomes unrepresentable */
+                constrained = true;
+                history.push(json!({"role": "assistant", "content": raw}));
+                history.push(json!({"role": "user", "content": corrective}));
+                continue;
+            }
             let stored = toolparse::strip_trailing_terminal_markers(&raw);
             if !stored.is_empty() {
                 history.push(json!({"role": "assistant", "content": stored}));
@@ -422,7 +532,7 @@ pub fn agent_turn(
         // degenerate reply can loop its envelope several times.
         let calls = dedup_tool_calls(calls);
         state.retries = 0;
-        constrained = false;
+        state.executed_any = true;
         let stored = toolparse::strip_trailing_terminal_markers(&raw);
         history.push(json!({"role": "assistant", "content": stored}));
         let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
@@ -432,7 +542,8 @@ pub fn agent_turn(
         let t_tools = Instant::now();
         let outcomes: Vec<ToolOutcome> = if calls.len() == 1 {
             let call = &calls[0];
-            let (status, output) = match registry.dispatch(&call.name, &call.arguments) {
+            let (result, phase) = registry.dispatch_classified(&call.name, &call.arguments);
+            let (status, output) = match result {
                 Ok(out) => ("ok", out),
                 Err(e) => ("error", e),
             };
@@ -440,6 +551,7 @@ pub fn agent_turn(
                 name: call.name.clone(),
                 status: status.to_string(),
                 output,
+                phase,
             }]
         } else {
             let batch: Vec<(String, Value)> = calls
@@ -458,6 +570,7 @@ pub fn agent_turn(
                         name: o.name,
                         status: status.to_string(),
                         output,
+                        phase: o.phase,
                     }
                 })
                 .collect()
@@ -470,9 +583,22 @@ pub fn agent_turn(
                 calls.len()
             );
         }
+        /* the results message, plus the escalation-ladder verdict (v3
+         * hardening) which may append a corrective note or force the
+         * next round to sample under the tool-call grammar */
+        let mut results_msg = tool_results_user_message(&outcomes);
+        match state.validation_verdict(&outcomes) {
+            ValidationStep::None => constrained = false,
+            ValidationStep::Corrective(note) => {
+                results_msg.push('\n');
+                results_msg.push_str(&note);
+                constrained = false;
+            }
+            ValidationStep::ForceGrammar => constrained = true,
+        }
         history.push(json!({
             "role": "user",
-            "content": tool_results_user_message(&outcomes)
+            "content": results_msg
         }));
     }
     Ok(AgentTurnEnd::Exhausted)
@@ -513,7 +639,7 @@ fn server_ready() -> bool {
 }
 
 /// Lowercased file name of the GGUF this build expects to serve, e.g.
-/// "lfm3-1.7b-q4_k_m.gguf" — the identity a reused server must carry.
+/// "lfm3-1.7b-q4_k_m.gguf" â€” the identity a reused server must carry.
 fn expected_model_id() -> &'static str {
     static EXPECTED: OnceLock<String> = OnceLock::new();
     EXPECTED.get_or_init(|| {
@@ -611,7 +737,7 @@ pub fn ensure_server(force_cpu: bool) -> Result<(), Box<dyn std::error::Error>> 
     let force_cpu = *FORCE_CPU.get_or_init(|| force_cpu || std::env::var("MOON_LLM_CPU").is_ok());
     if server_ready() {
         /* BUG-006: /health says "a llama-server is up", not "the RIGHT
-         * model is up" — a wrong-model or foreign server on the port
+         * model is up" â€” a wrong-model or foreign server on the port
          * used to be reused blindly (degraded answers, no error).
          * Identify it via /props before reusing; refuse loudly on
          * mismatch. Fail-closed when /props carries no identity. */
@@ -673,7 +799,7 @@ pub fn ensure_server(force_cpu: bool) -> Result<(), Box<dyn std::error::Error>> 
 /* ================================================================ */
 
 /// BUG-010: a llama-server spawned through `std::process::Command`
-/// inherits *every* inheritable handle this process holds — std always
+/// inherits *every* inheritable handle this process holds â€” std always
 /// calls CreateProcessW with `bInheritHandles=TRUE` and never builds a
 /// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. When we run under a redirected
 /// `cargo run` (or any pipeline), our handle table carries the parent
@@ -685,7 +811,7 @@ pub fn ensure_server(force_cpu: bool) -> Result<(), Box<dyn std::error::Error>> 
 /// app-level trace always ran to completion). This manual spawn passes
 /// an explicit handle list instead: the child receives exactly its
 /// three std handles and nothing else, no matter what we happen to
-/// hold. Closing our process handle never kills the child — the server
+/// hold. Closing our process handle never kills the child â€” the server
 /// outlives this process by design.
 struct IsolatedChild {
     process: windows::Win32::Foundation::HANDLE,
@@ -830,7 +956,7 @@ fn spawn_isolated(
             Some(PWSTR(cmdline.as_mut_ptr())),
             None,
             None,
-            true, /* bInheritHandles — the attribute list is what restricts */
+            true, /* bInheritHandles â€” the attribute list is what restricts */
             /* EXTENDED_STARTUPINFO_PRESENT is mandatory with a
              * STARTUPINFOEXW: without it CreateProcessW reads the struct
              * as a plain STARTUPINFOW and silently ignores the attribute
@@ -844,7 +970,7 @@ fn spawn_isolated(
         .map_err(|e| format!("CreateProcessW failed: {e}"))
     };
     /* The list and the child-side std handles were consumed by
-     * CreateProcessW — drop our copies, list first. */
+     * CreateProcessW â€” drop our copies, list first. */
     unsafe {
         DeleteProcThreadAttributeList(list);
         let _ = CloseHandle(h_in);
@@ -950,7 +1076,7 @@ fn try_start(backend: Backend) -> Result<Option<String>, String> {
     }
     /* The server's stderr (startup log; the Vulkan build's failure
      * reasons only appear there) is captured to a file that the poll
-     * loop below re-reads — no pipe, no reader thread, nothing that
+     * loop below re-reads â€” no pipe, no reader thread, nothing that
      * could block the server or leak into it. */
     let stderr_log = std::env::temp_dir().join("igris-llama-server-stderr.log");
     let child = spawn_isolated(&exe, &args, &stderr_log)
@@ -1261,7 +1387,7 @@ mod tests {
 
     /// The ZeroClaw protocol block, transcribed independently through
     /// unicode escapes, pinned byte-for-byte against our runtime
-    /// construction so the "verbatim port" claim stays true — including
+    /// construction so the "verbatim port" claim stays true â€” including
     /// our two appended rules (persistent memory, v1.2; gated tools,
     /// v2.5).
     #[test]
@@ -1288,8 +1414,8 @@ Example: User says something that needs a tool. You MUST respond with a real cal
             + "\n\nYou may use multiple tool calls in a single response. After tool execution, results appear in "
             + result
             + " tags. Continue reasoning with the results until you can give a final answer.\n\n\
-Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first — never claim you don't know without checking.\n\n\
-Gated tools: their first call only validates the action and announces the plan — it does NOT execute, and the result starts with NOT EXECUTED — CONFIRMATION REQUIRED. Tell the user exactly what will happen and wait for a clear yes; only after the user confirms, call the same tool again with identical arguments and it will execute. If the user declines or changes the request, do not call it again.\n\n";
+Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first â€” never claim you don't know without checking.\n\n\
+Gated tools: their first call only validates the action and announces the plan â€” it does NOT execute, and the result starts with NOT EXECUTED â€” CONFIRMATION REQUIRED. Tell the user exactly what will happen and wait for a clear yes; only after the user confirms, call the same tool again with identical arguments and it will execute. If the user declines or changes the request, do not call it again.\n\n";
         assert_eq!(tool_call_protocol_instructions(), expected);
     }
 
@@ -1439,6 +1565,115 @@ Gated tools: their first call only validates the action and announces the plan �
     }
 
     #[test]
+    fn dsml_drift_flags_first_contact_and_spares_post_success() {
+        use toolparse::{DSML_CLOSE, DSML_OPEN};
+        /* prose-first mangled DSML envelope: the exact live round-1
+         * failure (2026-11-15) — parses to zero calls and is NOT flagged
+         * by the issue detector, which only catches DSML openers */
+        let raw = format!(
+            "I'll move that file to the recycle bin.\n{}tool_name delete_file{}",
+            DSML_OPEN, DSML_CLOSE
+        );
+        let mut s = AgentLoopState::new();
+        let verdict = s.dsml_drift_verdict(&raw);
+        match &verdict {
+            Some(note) => assert!(note.contains("DSML"), "{note}"),
+            None => panic!("first-contact drift must be corrected"),
+        }
+        assert_eq!(s.retries, 1, "drift shares the retry budget");
+
+        /* after a round that executed tools, the same shape is the
+         * prose answer with a held-back echo — no corrective round */
+        let mut s2 = AgentLoopState::new();
+        s2.executed_any = true;
+        assert!(s2.dsml_drift_verdict(&raw).is_none());
+        assert_eq!(s2.retries, 0);
+
+        /* and the drift budget is the shared malformed budget */
+        let mut s3 = AgentLoopState::new();
+        assert!(s3.dsml_drift_verdict(&raw).is_some());
+        assert!(s3.dsml_drift_verdict(&raw).is_some());
+        assert!(
+            s3.dsml_drift_verdict(&raw).is_none(),
+            "drift caps at {MAX_MALFORMED_RETRIES}"
+        );
+    }
+
+    fn invalid_outcome(name: &str, output: &str) -> ToolOutcome {
+        ToolOutcome {
+            name: name.to_string(),
+            status: "error".to_string(),
+            output: output.to_string(),
+            phase: crate::tools::DispatchPhase::Invalid,
+        }
+    }
+
+    #[test]
+    fn validation_ladder_corrective_then_grammar_then_standdown() {
+        use crate::tools::DispatchPhase;
+        let mut s = AgentLoopState::new();
+        let boom = [invalid_outcome("delete_file", "cannot plan 'delete_file': missing path")];
+        /* streak 1: one free corrective retry, unconstrained */
+        let step = s.validation_verdict(&boom);
+        match &step {
+            ValidationStep::Corrective(note) => {
+                assert!(note.contains("canonical JSON envelope"), "{note}");
+                assert!(note.contains("missing path"), "{note}");
+                assert!(
+                    note.contains("answer in plain words"),
+                    "the free round must be allowed to ask instead"
+                );
+            }
+            other => panic!("expected Corrective, got {other:?}"),
+        }
+        /* streak 2: the model flailed again â€” grammar-force */
+        let step = s.validation_verdict(&boom);
+        assert_eq!(step, ValidationStep::ForceGrammar);
+        /* streak 3: stand down â€” stop spending rounds on constraints */
+        let step = s.validation_verdict(&boom);
+        assert_eq!(step, ValidationStep::None);
+        /* and a round with a real execution resets everything */
+        let ok = [ToolOutcome {
+            name: "get_time".to_string(),
+            status: "ok".to_string(),
+            output: "14:00".to_string(),
+            phase: DispatchPhase::Ran,
+        }];
+        assert_eq!(s.validation_verdict(&ok), ValidationStep::None);
+        assert_eq!(s.invalid_streak, 0);
+        /* after the reset the ladder starts from corrective again */
+        assert!(matches!(
+            s.validation_verdict(&boom),
+            ValidationStep::Corrective(_)
+        ));
+    }
+
+    #[test]
+    fn validation_ladder_never_fires_on_progress() {
+        use crate::tools::DispatchPhase;
+        let mut s = AgentLoopState::new();
+        let echo = |phase| ToolOutcome {
+            name: "t".to_string(),
+            status: "error".to_string(),
+            output: "x".to_string(),
+            phase,
+        };
+        /* an armed announce waits on the user â€” not a failure */
+        assert_eq!(
+            s.validation_verdict(&[echo(DispatchPhase::Armed)]),
+            ValidationStep::None
+        );
+        assert_eq!(s.invalid_streak, 0);
+        /* a mix of one real result + one invalid call: made progress */
+        let mixed = [
+            echo(DispatchPhase::Ran),
+            echo(DispatchPhase::Invalid),
+        ];
+        assert_eq!(s.validation_verdict(&mixed), ValidationStep::None);
+        assert_eq!(s.invalid_streak, 0, "mixed rounds must not accumulate");
+    }
+
+    #[test]
     fn dedup_tool_calls_collapses_repeated_identical_calls() {
         let g = || toolparse::ParsedToolCall {
             name: "get_time".to_string(),
@@ -1469,11 +1704,13 @@ Gated tools: their first call only validates the action and announces the plan �
                 name: "get_time".to_string(),
                 status: "ok".to_string(),
                 output: "2026-11-13 14:00:00 on Friday".to_string(),
+                phase: crate::tools::DispatchPhase::Ran,
             },
             ToolOutcome {
                 name: "nope".to_string(),
                 status: "error".to_string(),
                 output: "unknown tool: nope".to_string(),
+                phase: crate::tools::DispatchPhase::Invalid,
             },
         ];
         let msg = tool_results_user_message(&outcomes);

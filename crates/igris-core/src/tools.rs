@@ -110,7 +110,7 @@ mod system;
 mod web;
 
 pub use config_tools::{config_tools_path, load_config_tools};
-pub use registry::{Registry, ToolDef};
+pub use registry::{DispatchPhase, Registry, ToolDef};
 
 use crate::tools::basic::{run_calculate, run_get_time, run_media_key, run_open_app, run_open_url};
 use crate::tools::config_tools::CONFIG_TOOLS;

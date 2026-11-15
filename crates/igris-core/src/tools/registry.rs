@@ -157,17 +157,40 @@ impl Registry {
     /// return the NOT EXECUTED announcement; the confirmed re-call
     /// executes. The model-facing status stays plain "ok"/"error".
     pub fn dispatch(&self, name: &str, args: &Value) -> Result<String, String> {
+        self.dispatch_classified(name, args).0
+    }
+
+    /// [`Self::dispatch`] plus the phase classification the agent loop's
+    /// retry heuristics need (v3 hardening): did the call arm, actually
+    /// run, or die before any execution?
+    pub fn dispatch_classified(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> (Result<String, String>, DispatchPhase) {
         let Some(def) = self.tools.iter().find(|t| t.name == name) else {
-            return Err(format!("unknown tool: {name}"));
+            return (Err(format!("unknown tool: {name}")), DispatchPhase::Invalid);
         };
         let args = unwrap_schema_confused_args(&def.schema, &args.clone());
+        if let Err(msg) = check_arg_shapes(&def.schema, &args) {
+            return (Err(msg), DispatchPhase::Invalid);
+        }
         if !def.gated {
-            return self.exec_def(def, &args, tool_budget(name));
+            return (
+                self.exec_def(def, &args, tool_budget(name)),
+                DispatchPhase::Ran,
+            );
         }
         let step = {
-            let mut store = crate::gating::global().lock().map_err(|_| {
-                "gating: pending store lock poisoned".to_string()
-            })?;
+            let mut store = match crate::gating::global().lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    return (
+                        Err("gating: pending store lock poisoned".to_string()),
+                        DispatchPhase::Invalid,
+                    );
+                }
+            };
             self.dispatch_gated_core(
                 &mut store,
                 crate::gating::current_turn(),
@@ -178,9 +201,12 @@ impl Registry {
         };
         self.log_gated_step(def, &step);
         match step {
-            Ok(GatedOutcome::Armed { plan }) => Ok(crate::gating::armed_result(&plan)),
-            Ok(GatedOutcome::Executed(result)) => result,
-            Err(e) => Err(e),
+            Ok(GatedOutcome::Armed { plan }) => (
+                Ok(crate::gating::armed_result(&plan)),
+                DispatchPhase::Armed,
+            ),
+            Ok(GatedOutcome::Executed(result)) => (result, DispatchPhase::Ran),
+            Err(e) => (Err(e), DispatchPhase::Invalid),
         }
     }
 
@@ -228,6 +254,9 @@ impl Registry {
         }
         let mut outcomes: Vec<Option<Result<String, String>>> =
             (0..batch.len()).map(|_| None).collect();
+        /* default Invalid covers the never-reached-a-body slots (unknown
+         * name, refused plan); armed/executed slots overwrite it */
+        let mut phases: Vec<DispatchPhase> = vec![DispatchPhase::Invalid; batch.len()];
         let mut deferred: Vec<Deferred> = Vec::new();
         /* phase 1: resolve + gate decisions (identical rules per call) */
         for (slot, (name, raw_args)) in batch.iter().enumerate() {
@@ -236,7 +265,12 @@ impl Registry {
                 continue;
             };
             let args = unwrap_schema_confused_args(&def.schema, &raw_args.clone());
+            if let Err(msg) = check_arg_shapes(&def.schema, &args) {
+                outcomes[slot] = Some(Err(msg));
+                continue;
+            }
             if !def.gated {
+                phases[slot] = DispatchPhase::Ran;
                 deferred.push(Deferred {
                     slot,
                     name: def.name.clone(),
@@ -267,16 +301,20 @@ impl Registry {
             match step {
                 Ok(GatedDecision::Armed { plan }) => {
                     self.log_gated_step(def, &Ok(GatedOutcome::Armed { plan: plan.clone() }));
+                    phases[slot] = DispatchPhase::Armed;
                     outcomes[slot] = Some(Ok(crate::gating::armed_result(&plan)));
                 }
-                Ok(GatedDecision::ExecuteNow) => deferred.push(Deferred {
-                    slot,
-                    name: def.name.clone(),
-                    run: Arc::clone(&def.run),
-                    args,
-                    timeout: tool_budget(&def.name),
-                    gated: true,
-                }),
+                Ok(GatedDecision::ExecuteNow) => {
+                    phases[slot] = DispatchPhase::Ran;
+                    deferred.push(Deferred {
+                        slot,
+                        name: def.name.clone(),
+                        run: Arc::clone(&def.run),
+                        args,
+                        timeout: tool_budget(&def.name),
+                        gated: true,
+                    })
+                }
                 Err(e) => outcomes[slot] = Some(Err(e)),
             }
         }
@@ -316,9 +354,11 @@ impl Registry {
         batch
             .iter()
             .zip(outcomes)
-            .map(|((name, _), r)| BatchOutcome {
+            .zip(phases)
+            .map(|(((name, _), r), phase)| BatchOutcome {
                 name: name.clone(),
                 result: r.unwrap_or_else(|| Err("internal: unfilled batch slot".to_string())),
+                phase,
             })
             .collect()
     }
@@ -438,6 +478,22 @@ enum GatedDecision {
 pub struct BatchOutcome {
     pub name: String,
     pub result: Result<String, String>,
+    /// Which path the call took (v3 hardening): the agent loop's retry
+    /// heuristics classify rounds by whether anything actually executed.
+    pub phase: DispatchPhase,
+}
+
+/// Which path a dispatched call took. Loop machinery, not model
+/// vocabulary — the model-facing status stays the plain "ok"/"error".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchPhase {
+    /// The call validated + armed and waits for the user's confirmation.
+    Armed,
+    /// A tool body ran; the result (ok or a domain error) is real.
+    Ran,
+    /// The call never reached a tool body: unknown name, unparseable or
+    /// wrong-typed arguments, refused plan. Nothing executed.
+    Invalid,
 }
 
 /// LFM3 sometimes emits the DSML attr-form with the schema name instead of
@@ -473,6 +529,45 @@ fn unwrap_schema_confused_args(schema: &Value, args: &Value) -> Value {
         return args.clone();
     }
     value.clone()
+}
+
+/// A value that is the parameter's schema definition rather than an
+/// argument value — the schema-echo defect seen live (2026-11-15):
+/// `{"path": {"description": ..., "type": "string"}, "app": null}`. The
+/// parser accepts this shape (it is valid JSON in an envelope), so it
+/// reaches dispatch, and the tool's own `Missing required parameter`
+/// misreports the problem — the model DID supply `path`, as the wrong
+/// kind of JSON. Naming the real defect gives the model a correctable
+/// diagnosis instead of a misleading one.
+fn is_schema_echo(v: &Value) -> bool {
+    v.as_object().is_some_and(|o| {
+        o.contains_key("type")
+            && (o.contains_key("description")
+                || o.contains_key("properties")
+                || o.contains_key("enum")
+                || o.contains_key("items"))
+    })
+}
+
+/// Pre-dispatch shape check over required parameters: a required
+/// property that IS present must carry a plausible value, not a schema
+/// echo. Absent properties stay with the tool's own validation (it
+/// knows whether a default exists), and unknown extra keys are ignored
+/// as before.
+fn check_arg_shapes(schema: &Value, args: &Value) -> Result<(), String> {
+    let Some(required) = schema.get("required").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for name in required.iter().filter_map(Value::as_str) {
+        if let Some(v) = args.get(name) {
+            if is_schema_echo(v) {
+                return Err(format!(
+                    "argument '{name}' was given as its schema definition instead of a value — provide the actual value (a JSON string for '{name}')"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -924,6 +1019,82 @@ mod tests {
     }
 
     /* ---- parallel batch dispatch (v3) ---- */
+
+    #[test]
+    fn dispatch_classified_marks_phases() {
+        let mut r = Registry::new();
+        r.register(ToolDef {
+            name: "cls_ok".to_string(),
+            desc: "echo".to_string(),
+            schema: json!({"type": "object", "properties": {}, "required": []}),
+            gated: false,
+            plan: None,
+            run: Arc::new(|_a| Ok("ran".to_string())),
+        });
+        r.register(ToolDef {
+            name: "cls_err".to_string(),
+            desc: "domain failure".to_string(),
+            schema: json!({"type": "object", "properties": {}, "required": []}),
+            gated: false,
+            plan: None,
+            run: Arc::new(|_a| Err("not found".to_string())),
+        });
+        let (gated, flag) = gated_probe();
+        /* unknown name never reaches a body */
+        let (res, phase) = r.dispatch_classified("no_such", &json!({}));
+        assert_eq!(phase, DispatchPhase::Invalid);
+        assert_eq!(res.unwrap_err(), "unknown tool: no_such");
+        /* success and domain failure both mean the body ran */
+        let (res, phase) = r.dispatch_classified("cls_ok", &json!({}));
+        assert_eq!(phase, DispatchPhase::Ran);
+        assert_eq!(res.unwrap(), "ran");
+        let (res, phase) = r.dispatch_classified("cls_err", &json!({}));
+        assert_eq!(phase, DispatchPhase::Ran, "a domain error is a real result");
+        assert_eq!(res.unwrap_err(), "not found");
+        /* gated arm: validated + announced, nothing executed */
+        let (res, phase) = gated.dispatch_classified(
+            "probe_gated",
+            &json!({"path": "cls-probe-unique"}),
+        );
+        assert_eq!(phase, DispatchPhase::Armed);
+        assert!(res.unwrap().starts_with("NOT EXECUTED"));
+        assert!(!flag.load(AtomicOrdering::Relaxed));
+    }
+
+    #[test]
+    fn schema_echo_args_get_a_named_diagnosis() {
+        let (r, flag) = gated_probe();
+        /* the live defect shape: the parameter's schema as the value */
+        let (res, phase) = r.dispatch_classified(
+            "probe_gated",
+            &json!({
+                "path": {"description": "File to delete", "type": "string"},
+                "app": null
+            }),
+        );
+        assert_eq!(phase, DispatchPhase::Invalid);
+        let err = res.unwrap_err();
+        assert!(err.contains("schema definition"), "{err}");
+        assert!(err.contains("'path'"), "{err}");
+        /* nothing armed, nothing planned — the call died pre-execution */
+        assert!(!flag.load(AtomicOrdering::Relaxed));
+        /* the plain dispatch wrapper surfaces the same diagnosis */
+        let err = r
+            .dispatch("probe_gated", &json!({"path": {"type": "string", "description": "x"}}))
+            .unwrap_err();
+        assert!(err.contains("schema definition"), "{err}");
+    }
+
+    #[test]
+    fn batch_reports_phase_per_call() {
+        let r = echo_pair();
+        let out = r.dispatch_batch(&[
+            ("no_such_tool".to_string(), json!({})),
+            ("batch_alpha".to_string(), json!({})),
+        ]);
+        assert_eq!(out[0].phase, DispatchPhase::Invalid);
+        assert_eq!(out[1].phase, DispatchPhase::Ran);
+    }
 
     /// Two plain echo tenants with distinct payloads, for order + content
     /// checks.
