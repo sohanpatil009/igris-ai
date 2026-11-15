@@ -13,16 +13,6 @@ FIXED (in ledger).
 
 ## Open
 
-### BUG-005 — file_search walk is DFS-LIFO (same starvation shape we fixed in content_search) — LOW — OPEN
-v1 `file_search` still walks depth-first with a LIFO stack, so the
-alphabetically-LAST top-level subtree is scanned first; with the 30k
-entry cap it is far less likely to starve (name matching, no file
-reads, default roots are user folders), but the pathology is the same
-one that made content_search miss `set_master_volume` at repo scope
-(fixed there with BFS + nested-repo skip in 0559b8e).
-Fix direction: port the BFS + `is_nested_repo` skip to file_search's
-`search_walk`; keep the 30k entry budget.
-
 ### BUG-006 — llama-server reuse trusts /health only — LOW — SUSPECTED
 The agent loop reuses an already-running llama-server on :8018/:8081
 after a bare `/health` 200. If a server with a DIFFERENT model/GGUF is
@@ -95,6 +85,13 @@ crash, not a test failure).
 
 ## Fixed recently (ledger)
 
+- 2026-11-15 (`50d4c88`): file_search still walked depth-first with a
+  LIFO stack (the same starvation shape fixed in content_search,
+  0559b8e) and never skipped nested clones — search_walk is now
+  breadth-first (top-level folders get the first turn, dependency-like
+  trees the last) and skips nested repos on descent (explicit roots
+  inside a clone still search it); the 30k entry / 3.5 s budgets are
+  unchanged (BUG-005).
 - 2026-11-15 (`4b6faac`): hash-token collisions attached low-score
   "similar" riders to recall results (the "march 3rd"-vs-mom collision,
   cosine ~0.26, passed the 0.2 base floor) — recall now drops similar
