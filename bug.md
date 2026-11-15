@@ -13,18 +13,6 @@ FIXED (in ledger).
 
 ## Open
 
-### BUG-008 — run_command cargo new/init can create folders anywhere — LOW (design review) — OPEN
-`cargo new` / `cargo init` are allowlisted and write a project folder
-into `working_dir` (or the process cwd) — i.e. writes OUTSIDE the
-Downloads-only rule that governs download_file. Accepted when the
-allowlist was designed (dev tools need it), but goal.md's safety wording
-should be reconciled so the docs say "downloads go to Downloads; dev
-scaffolding writes where the user points it".
-Decision needed: document as-is, or gate new/init behind the same
-two-step confirmation v2.5 will bring.
-
-## Open
-
 ### BUG-010 — cargo-run chat may hang after SPAWNING llama-server under a piped stdout — LOW (flaky) — SUSPECTED
 One occurrence 2026-11-15 (BUG-006 verification): with the live
 llama-server killed, `cargo run -q -p igris-cli -- chat hi 2>&1 |
@@ -63,6 +51,16 @@ exit cleanly after a spawn?
 
 ## Fixed recently (ledger)
 
+- 2026-11-15 (`0e881de`): cargo new/init design review — DECISION:
+  documented as-is. goal.md's safety rules now state the actual policy
+  precisely: reads are confirmation-free; the only confirmation-free
+  writes are additive-only (download_file → Downloads folder only;
+  allowlisted cargo new/init scaffold a new project folder where the
+  user points them) and neither modifies nor deletes existing state;
+  anything that changes or removes existing state stays
+  confirmation-gated (machinery lands in v2.5). files.rs's v2 safety
+  banner carries the same wording. Revisit only if v2.5 later wants
+  scaffolding behind the spoken confirmation too (BUG-008).
 - 2026-11-15 (`6cbc9fe`): default screenshots accumulated without bound
   in the OneDrive-synced Pictures folder — after a default-path capture
   the oldest `igris_screenshot_*.png` beyond 20 are pruned (stamp order
