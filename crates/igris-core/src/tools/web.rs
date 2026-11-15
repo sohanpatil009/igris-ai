@@ -77,9 +77,11 @@ fn web_get(
 }
 
 /// Same scheme/character policy as `validate_open_url`, plus a block on
-/// loopback/private LITERAL hosts (SSRF guard: fetched-page content must
-/// never be able to send the assistant after local services). Best
-/// effort by hostname literal — DNS-resolution checks are out of scope.
+/// loopback/private hosts (SSRF guard: fetched-page content must never
+/// be able to send the assistant after local services). Layer one of
+/// three (BUG-001): this literal check (incl. non-canonical IPv4
+/// literals per BUG-002), the per-hop resolver veto on resolved
+/// addresses, and the redirect-history backstop.
 fn validate_web_url(url: &str) -> Result<(), String> {
     validate_open_url(url)?;
     let rest = url.trim();
@@ -97,33 +99,37 @@ fn validate_web_url(url: &str) -> Result<(), String> {
 
 fn is_private_host(host: &str) -> bool {
     let h = host.trim().trim_end_matches('.').to_lowercase();
-    if h.is_empty()
-        || h == "localhost"
-        || h == "0.0.0.0"
-        || h.ends_with(".localhost")
-        || h.ends_with(".local")
-    {
-        return true;
-    }
     /* [IPv6] or [IPv6]:port — a bare suffix(']') strip would miss ports. */
     if let Some(end) = h.find(']') {
         let inner = &h[1..end];
         let v6 = inner.split('%').next().unwrap_or(inner);
-        return v6 == "::1"
+        if v6 == "::1"
             || v6.starts_with("fe8")
             || v6.starts_with("fc")
-            || v6.starts_with("fd");
+            || v6.starts_with("fd")
+        {
+            return true;
+        }
+        /* v4-mapped bracketed literal: [::ffff:127.0.0.1] IS loopback. */
+        return match v6.strip_prefix("::ffff:") {
+            Some(v4) => match v4.parse::<std::net::Ipv4Addr>() {
+                Ok(ip) => is_private_ip(IpAddr::V4(ip)),
+                Err(_) => false,
+            },
+            None => false,
+        };
     }
     /* Bare host, possibly with a :port suffix — an authority like
      * "127.0.0.1:8018" keeps the port, so the port must go before the
-     * IPv4 parse. Only strip an all-digit port when the prefix is a
-     * dotted/IPv4-shaped address (a bracket-less IPv6 like ::1 has no
-     * port and would be mangled by the split). */
+     * checks. Strip an all-digit port unless the prefix itself contains
+     * ':' (bracket-less IPv6 shape: "127.0.0.1:8018" → "127.0.0.1" and
+     * "localhost:8018" → "localhost" are wanted, "::1" → ":"/"1" is
+     * not). */
     let bare = if let Some(colon) = h.rfind(':') {
         let (addr, port) = (&h[..colon], &h[colon + 1..]);
         if !port.is_empty()
             && port.bytes().all(|b| b.is_ascii_digit())
-            && (addr.contains('.') || addr.parse::<std::net::Ipv4Addr>().is_ok())
+            && !addr.contains(':')
         {
             addr
         } else {
@@ -132,16 +138,45 @@ fn is_private_host(host: &str) -> bool {
     } else {
         h.as_str()
     };
+    /* Named-private hosts, checked PORT-FREE: "localhost:8018" →
+     * "localhost", "foo.local:8080" → "foo.local" — both slipped the
+     * named checks while the port was still attached. */
+    if bare.is_empty()
+        || bare == "localhost"
+        || bare.ends_with(".localhost")
+        || bare.ends_with(".local")
+    {
+        return true;
+    }
     if let Ok(ip) = bare.parse::<std::net::Ipv4Addr>() {
-        return ip.is_loopback()
-            || ip.is_private()
-            || ip.is_link_local()
-            || ip.is_broadcast()
-            || ip.is_unspecified();
+        return is_private_ip(IpAddr::V4(ip));
     }
     /* Bracket-less IPv6 loopback (invalid in a URL authority, but cheap
      * to catch; no legal DNS name contains a colon). */
-    bare.starts_with("::1")
+    if bare.starts_with("::1") {
+        return true;
+    }
+    /* BUG-002: non-canonical IPv4 literals — decimal (2130706433 =
+     * 127.0.0.1), partial (127.1), hex (0x7f.0.0.1) and octal
+     * (0177.0.0.1) forms resolve to private addresses via getaddrinfo
+     * while Ipv4Addr::parse rejects them. Refuse when every dot-segment
+     * is numeric (digits or 0x-hex): no real domain is numeric-only, so
+     * this fails closed with negligible over-blocking (word hosts like
+     * "007.com" keep a letter segment and pass). */
+    is_numeric_ipv4_literal(bare)
+}
+
+/// True for hosts whose every dot-segment is digits or 0x-hex — the
+/// numeric-literal family getaddrinfo interprets (BUG-002).
+fn is_numeric_ipv4_literal(host: &str) -> bool {
+    !host.is_empty()
+        && host.split('.').all(|seg| {
+            let decish = !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit());
+            let hexish = seg.len() > 2
+                && (seg.starts_with("0x") || seg.starts_with("0X"))
+                && seg[2..].bytes().all(|b| b.is_ascii_hexdigit());
+            decish || hexish
+        })
 }
 
 /* ---------------------------------------------------------------- */
@@ -160,12 +195,14 @@ fn private_host_refusal(uri: &Uri) -> Option<String> {
     }
 }
 
-/// IP-level mirror of `is_private_host`'s address policy, applied to
-/// RESOLVED socket addresses (the literal path cannot see these).
-/// Parity set: loopback, RFC1918 private, link-local, broadcast,
-/// unspecified — plus IPv6 loopback, ULA (fc00::/7), link-local
-/// (fe80::/10) and v4-mapped forms. CGNAT 100.64/10 and TEST-NET
-/// documentation ranges stay allowed (documented trade-off).
+/// The single IPv4/IPv6 address policy (BUG-002 made `is_private_host`
+/// delegate to it, so the literal and resolved paths can never drift).
+/// Applied to RESOLVED socket addresses by the resolver veto (the
+/// literal path cannot see these). Parity set: loopback, RFC1918
+/// private, link-local, broadcast, unspecified — plus IPv6 loopback,
+/// ULA (fc00::/7), link-local (fe80::/10) and v4-mapped forms. CGNAT
+/// 100.64/10 and TEST-NET documentation ranges stay allowed
+/// (documented trade-off).
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -785,6 +822,33 @@ mod tests {
         }
         validate_web_url("https://example.com/page?q=1").unwrap();
         validate_web_url("http://example.com").unwrap();
+    }
+
+    #[test]
+    fn noncanonical_ipv4_literals_are_refused() {
+        /* BUG-002: decimal/partial/hex/octal spellings of private
+         * addresses (and letterless garbage getaddrinfo might resolve)
+         * must not pass the literal private-host block. */
+        for bad in [
+            "http://2130706433/",
+            "http://127.1/",
+            "http://0x7f.0.0.1/",
+            "http://0177.0.0.1/",
+            "http://2130706433:8080/",
+            "http://127.1:80/",
+            "http://0x7f.1:80/",
+            "http://999.1.1.1/",
+            "http://localhost:8018/",
+            "http://[::ffff:127.0.0.1]/",
+        ] {
+            assert!(validate_web_url(bad).is_err(), "must reject {bad}");
+        }
+        /* Word hosts that merely look numeric-adjacent stay allowed,
+         * and public quad/IPv6 literals keep working. */
+        validate_web_url("http://007.com/").unwrap();
+        validate_web_url("http://example.com/").unwrap();
+        validate_web_url("http://8.8.8.8/").unwrap();
+        validate_web_url("http://[2606:4700::1111]/").unwrap();
     }
 
     #[test]
