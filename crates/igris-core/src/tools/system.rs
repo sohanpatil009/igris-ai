@@ -212,8 +212,12 @@ fn audio_endpoint() -> Result<IAudioEndpointVolume, String> {
 /* ================================================================ */
 
 pub(crate) fn run_screenshot(args: &Value) -> Result<String, String> {
+    let mut used_default = false;
     let path: PathBuf = match args.get("path") {
-        None | Some(Value::Null) => default_screenshot_path()?,
+        None | Some(Value::Null) => {
+            used_default = true;
+            default_screenshot_path()?
+        }
         Some(Value::String(s)) => {
             let s = s.trim();
             if s.is_empty() {
@@ -248,12 +252,66 @@ pub(crate) fn run_screenshot(args: &Value) -> Result<String, String> {
     image::save_buffer(&path, &rgb, w, h, image::ColorType::Rgb8)
         .map_err(|e| format!("screenshot: saving {} failed: {e}", path.display()))?;
     let mut msg = format!("Screenshot saved to {} ({}x{}).", path.display(), w, h);
+    if used_default {
+        /* BUG-007: default-named screenshots used to accumulate without
+         * bound (and OneDrive syncs the Pictures folder). Rotate: after
+         * saving into the default location, drop the oldest beyond
+         * SCREENSHOT_KEEP. Explicit user paths are never pruned. */
+        let folder = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let pruned = prune_old_screenshots(&folder, &path);
+        if pruned > 0 {
+            msg.push_str(&format!(" (pruned {pruned} older screenshot(s).)"));
+        }
+    }
     if open {
         if let Err(e) = launch_default_viewer(&path) {
             msg.push_str(&format!(" (could not open viewer: {e})"));
         }
     }
     Ok(msg)
+}
+
+/// Keep at most this many default-named screenshots in the Pictures
+/// folder (BUG-007).
+const SCREENSHOT_KEEP: usize = 20;
+
+/// BUG-007 rotation: delete the oldest default-named screenshots
+/// (`igris_screenshot_*.png` in `dir`) beyond [`SCREENSHOT_KEEP`]. The
+/// stamp inside the default name (YYYY-MM-DD_HH-MM-SS) sorts
+/// chronologically, so name order is age order — no mtime races.
+/// `protect` (the file just saved) is never deleted even if a backwards
+/// clock put it among the oldest. Failures to delete are ignored:
+/// pruning is hygiene, and a locked file must not fail the screenshot.
+/// Only the default-named prefix is touched — user-chosen paths and
+/// unrelated files in the folder are left alone. Returns how many files
+/// were deleted.
+fn prune_old_screenshots(dir: &Path, protect: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut shots: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            name.starts_with("igris_screenshot_") && name.ends_with(".png")
+        })
+        .collect();
+    let excess = shots.len().saturating_sub(SCREENSHOT_KEEP);
+    if excess == 0 {
+        return 0;
+    }
+    shots.sort();
+    let mut deleted = 0usize;
+    for p in shots.iter().filter(|p| p.as_path() != protect).take(excess) {
+        if fs::remove_file(p).is_ok() {
+            deleted += 1;
+        }
+    }
+    deleted
 }
 
 fn default_screenshot_path() -> Result<PathBuf, String> {
@@ -383,6 +441,61 @@ mod tests {
             .read_exact(&mut head)
             .expect("readable");
         assert_eq!(&head, &[0x89, b'P', b'N', b'G'], "not a PNG signature");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn screenshot_rotation_drops_oldest_default_named_only() {
+        /* BUG-007: beyond SCREENSHOT_KEEP the oldest default-named
+         * screenshots are pruned; decoys and explicit-looking files
+         * must be untouched. */
+        let dir = temp_root("shotrotate");
+        for i in 0..25 {
+            let name = format!("igris_screenshot_2026-01-01_00-{i:02}-00.png");
+            fs::write(dir.join(&name), "x").unwrap();
+        }
+        fs::write(dir.join("igris_screenshot_2026-01-01_00-99-00.jpg"), "x").unwrap();
+        fs::write(dir.join("my_vacation.png"), "x").unwrap();
+        let protect = dir.join("igris_screenshot_2026-01-01_00-24-00.png");
+        let deleted = prune_old_screenshots(&dir, &protect);
+        assert_eq!(deleted, 5, "25 shots, keep 20 → 5 oldest go");
+        for i in 0..5 {
+            let name = format!("igris_screenshot_2026-01-01_00-{i:02}-00.png");
+            assert!(!dir.join(&name).exists(), "{name} should be pruned");
+        }
+        for i in 5..25 {
+            let name = format!("igris_screenshot_2026-01-01_00-{i:02}-00.png");
+            assert!(dir.join(&name).exists(), "{name} should stay");
+        }
+        assert!(dir.join("igris_screenshot_2026-01-01_00-99-00.jpg").exists());
+        assert!(dir.join("my_vacation.png").exists());
+        /* Even if the just-saved file sorts among the oldest (backwards
+         * clock), it is protected. */
+        let dir = temp_root("shotrotate2");
+        for i in 0..22 {
+            let name = format!("igris_screenshot_2026-01-01_00-{i:02}-00.png");
+            fs::write(dir.join(&name), "x").unwrap();
+        }
+        let protect = dir.join("igris_screenshot_2026-01-01_00-00-00.png");
+        let deleted = prune_old_screenshots(&dir, &protect);
+        assert_eq!(deleted, 2, "22 shots, keep 20 → 2 go, skipping protect");
+        assert!(protect.exists(), "protected file survives");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn screenshot_rotation_below_keep_deletes_nothing() {
+        let dir = temp_root("shotrotate3");
+        for i in 0..5 {
+            let name = format!("igris_screenshot_2026-01-01_00-{i:02}-00.png");
+            fs::write(dir.join(&name), "x").unwrap();
+        }
+        let deleted = prune_old_screenshots(
+            &dir,
+            &dir.join("igris_screenshot_2026-01-01_00-04-00.png"),
+        );
+        assert_eq!(deleted, 0);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 5);
         fs::remove_dir_all(&dir).ok();
     }
 
