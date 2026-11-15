@@ -31,6 +31,21 @@
 //!   alternation, because GBNF cannot correlate a dynamic name choice
 //!   with a separately-chosen arguments rule.
 //!
+//! A second root cause was found the same day after the constrained
+//! rounds still failed live: in GBNF, `"text"` is a literal whose
+//! *emitted output* is `text` — the quote characters are syntax, not
+//! content. The first builder produced literals like `"activity_log"`,
+//! so the grammar forced the model to write the tool name BARE
+//! (`activity_log , arguments : ...`), which is not JSON and which the
+//! parser rightly rejects as malformed. The model was obeying the
+//! constraint perfectly; the constraint described the wrong shape.
+//! Every JSON string in the envelope — the `"name"` key, the tool name,
+//! `"arguments"`, argument keys, and enum values — is now emitted by a
+//! literal whose content CARRIES the quote characters (`"\"name\""` in
+//! GBNF spelling), and the envelope follows the canonical protocol form
+//! `{"name": "tool_name", "arguments": {...}}` that
+//! `tool_call_protocol_instructions` teaches.
+//!
 //! The builder is deterministic (specs arrive sorted, so rule indices are
 //! stable), and the source carries no raw tag text: tag literals come
 //! from `toolparse::TOOL_CALL_OPEN`/`TOOL_CALL_CLOSE` at runtime.
@@ -92,8 +107,10 @@ pub fn tool_calls_grammar(specs: &[ToolSpec]) -> Option<String> {
             sel.push_str(" |");
         }
         sel.push_str(&format!(
-            " {} ws \",\" ws \"arguments\" ws \":\" ws {args_rule}",
-            lit(&spec.name),
+            " {} ws \":\" ws {} ws \",\" ws {} ws \":\" ws {args_rule}",
+            qlit("name"),
+            qlit(&spec.name),
+            qlit("arguments"),
         ));
     }
     g.push_str(&sel);
@@ -155,9 +172,10 @@ fn args_rule_text(schema: &Value) -> String {
     s
 }
 
-/// `name ws ":" ws value` for one property.
+/// `name ws ":" ws value` for one property. The key is emitted as a
+/// quoted JSON string (see [`qlit`]).
 fn pair(name: &str, schema: &Value, out: &mut String) {
-    out.push_str(&lit(name));
+    out.push_str(&qlit(name));
     out.push_str(" ws \":\" ws ");
     out.push_str(&value_rule(schema));
 }
@@ -205,7 +223,7 @@ fn value_rule(schema: &Value) -> String {
         .map(|a| {
             a.iter()
                 .filter_map(Value::as_str)
-                .map(lit)
+                .map(qlit)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -259,6 +277,18 @@ fn lit(s: &str) -> String {
     out
 }
 
+/// A GBNF literal whose *emitted output* is a double-quoted JSON string:
+/// the quote characters are part of the output, so the grammar forces
+/// the model to actually write them. In GBNF spelling this is
+/// `"\"text\""` — a literal whose content is `"text"`. Used for every
+/// JSON string in the envelope (the `"name"` key, tool names,
+/// `"arguments"`, argument keys, enum values); bare `lit` would force
+/// the text WITHOUT quotes, which is not JSON (root cause of the
+/// 2026-11-15 constrained-round failures).
+fn qlit(s: &str) -> String {
+    lit(&format!("\"{s}\""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,9 +338,39 @@ mod tests {
         eprintln!("DEBUG-GRAMMAR:\n{g}");
         assert!(g.contains("a0 ::= \"{\" ws \"}\""));
         assert!(g.contains(&format!(
-            "sel ::= {} ws \",\" ws \"arguments\" ws \":\" ws a0",
-            lit("get_time")
+            "sel ::= {} ws \":\" ws {} ws \",\" ws {} ws \":\" ws a0",
+            qlit("name"),
+            qlit("get_time"),
+            qlit("arguments")
         )));
+    }
+
+    #[test]
+    fn sel_forces_the_canonical_name_key_form() {
+        /* The parser reads a `"name"` KEY: `{"name": "tool", "arguments":
+         * {...}}`. The grammar must force exactly that shape, with the
+         * quote characters part of the emitted text (GBNF `"\"name\""`).
+         * Root cause of the 2026-11-15 bare-name failures. */
+        let g = tool_calls_grammar(&[spec(
+            "delete_file",
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        )])
+        .unwrap();
+        let sel = g.lines().find(|l| l.starts_with("sel ::= ")).unwrap();
+        let expected = format!(
+            "sel ::= {} ws \":\" ws {} ws \",\" ws {} ws \":\" ws a0",
+            qlit("name"),
+            qlit("delete_file"),
+            qlit("arguments")
+        );
+        assert_eq!(sel, expected, "canonical envelope form: {sel}");
+        /* and the name literal itself carries quote characters in its
+         * content, so the model must emit them */
+        assert!(sel.contains("\\\"delete_file\\\""), "{sel}");
     }
 
     #[test]
@@ -330,11 +390,18 @@ mod tests {
         /* content before due_at: the required array order wins over the
          * property-declaration order */
         let a0 = g.lines().find(|l| l.starts_with("a0 ::= ")).unwrap();
-        let content_pos = a0.find("\"content\"").expect("content pair");
-        let due_pos = a0.find("\"due_at\"").expect("due_at pair");
+        let content_pos = a0.find("\\\"content\\\"").expect("content pair");
+        let due_pos = a0.find("\\\"due_at\\\"").expect("due_at pair");
         assert!(content_pos < due_pos, "required order: {a0}");
         /* two mandatory props are joined by a plain comma (no optionality) */
-        assert!(a0.contains("\"content\" ws \":\" ws str ws \",\" ws \"due_at\""));
+        assert!(
+            a0.contains(&format!(
+                "{} ws \":\" ws str ws \",\" ws {}",
+                qlit("content"),
+                qlit("due_at")
+            )),
+            "{a0}"
+        );
     }
 
     #[test]
@@ -352,7 +419,13 @@ mod tests {
         )])
         .unwrap();
         let a0 = g.lines().find(|l| l.starts_with("a0 ::= ")).unwrap();
-        assert!(a0.contains("( \",\" ws \"count\" ws \":\" ws int ws )?"), "{a0}");
+        assert!(
+            a0.contains(&format!(
+                "( \",\" ws {} ws \":\" ws int ws )?",
+                qlit("count")
+            )),
+            "{a0}"
+        );
         /* and with two optionals each trailing one nests in its own group */
         let g2 = tool_calls_grammar(&[spec(
             "tool_b",
@@ -369,7 +442,11 @@ mod tests {
         .unwrap();
         let a0 = g2.lines().find(|l| l.starts_with("a0 ::= ")).unwrap();
         assert!(
-            a0.contains("( \",\" ws \"o1\" ws \":\" ws str ws ( \",\" ws \"o2\" ws \":\" ws int ws )? )?"),
+            a0.contains(&format!(
+                "( \",\" ws {} ws \":\" ws str ws ( \",\" ws {} ws \":\" ws int ws )? )?",
+                qlit("o1"),
+                qlit("o2")
+            )),
             "{a0}"
         );
     }
@@ -385,7 +462,11 @@ mod tests {
             }),
         )])
         .unwrap();
-        assert!(g.contains("( \"play_pause\" | \"stop\" )"));
+        assert!(g.contains(&format!(
+            "( {} | {} )",
+            qlit("play_pause"),
+            qlit("stop")
+        )));
     }
 
     #[test]
