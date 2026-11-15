@@ -166,8 +166,14 @@ bigger local model) for the planning step.
 
 - **Allowlists**: apps, commands, and writable paths are hardcoded consts —
   never free-form.
-- **Read-only by default**: anything that changes the system is gated behind
-  explicit confirmation (spoken "haan karo" or hotkey hold).
+- **Read-only by default; writes are additive or gated**: reads need no
+  confirmation. The only writes an early-phase IGRIS performs without a
+  confirmation are additive-only and bounded: `download_file` saves into
+  the Downloads folder only, and the allowlisted dev scaffolding
+  (`cargo new` / `cargo init`) creates a project folder where the user
+  points it — neither modifies or deletes anything that already exists.
+  Any write that changes or removes existing state is confirmation-gated
+  (spoken "haan karo" or hotkey hold, machinery lands in v2.5).
 - **Destructive ops** (`delete`, `shutdown`, messaging) always require a
   two-step confirm; IGRIS states what it is about to do first.
 - **Voice sandbox**: no arbitrary shell in the early phases; `run_command`

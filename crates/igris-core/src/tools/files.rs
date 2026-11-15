@@ -228,10 +228,13 @@ pub(crate) fn run_create_folder(args: &Value) -> Result<String, String> {
 /* web_fetch · download_file · web_search                           */
 /*                                                                  */
 /* Safety policy: run_command is a curated program+subcommand        */
-/* allowlist (no shell, argv direct); download_file writes only into */
-/* the user's Downloads folder; web tools block loopback/private     */
-/* literal hosts so a fetched page cannot send the assistant after   */
-/* local services; every web read is byte-capped.                   */
+/* allowlist (no shell, argv direct) whose write-shaped entries      */
+/* (cargo new/init) only CREATE new files/folders, never modify or   */
+/* delete existing state — destructive writes stay v2.5-gated;       */
+/* download_file writes only into the user's Downloads folder; web   */
+/* tools block loopback/private literal hosts so a fetched page      */
+/* cannot send the assistant after local services; every web read is */
+/* byte-capped.                                                      */
 /* ================================================================ */
 
 /* ---------------------------------------------------------------- */
