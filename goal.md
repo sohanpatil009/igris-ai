@@ -159,7 +159,7 @@ bigger local model) for the planning step.
 | **v1.1 — system & files** | `set_volume`, `screenshot`, `sys_stats`, `media_key`, `file_search`, `read_file`, `create_folder`, `open_url` | 1, 3, 5, 7 (read-only) |
 | **v1.2 — memory** | persistent memory store + reminders + activity log | 8 |
 | **v2 — developer & browser** | allowlisted `run_command` (cargo…), `web_search`, `web_fetch`, `download_file` | 4, 5 |
-| **v2.5 — gated actions** | `close_app`, `delete_file`, `shutdown`, power control — each behind spoken confirmation | 1, 3, 7 (write) |
+| **v2.5 — gated actions** (DONE 2026-11-15, gate 375/0/1) | `close_app`, `delete_file`, `shutdown`, `power_mode` + ungated `shutdown_abort` — each gated tool arms a plan on the first call (`NOT EXECUTED — CONFIRMATION REQUIRED`) and only executes after a confirmed re-call in a later turn or process | 1, 3, 7 (write) |
 | **v3 — integrations & agentic** | Spotify/WhatsApp/email integrations, window control, multi-tool planning chains (stronger planner) | 2, 6, 9 |
 
 ## Safety rules (all phases)

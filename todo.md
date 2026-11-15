@@ -393,13 +393,50 @@ vendoring was rejected; see v1.2).
       only, gate stays 319/0/1); toolparse.rs → mechanical split
       keeping the vendored-notice header and per-part origin markers
       (upstream diffing gets harder — accepted).
-- [ ] **v2.5 — gated actions** (goal.md §1/§3 safety rows): two-step spoken
-      confirm UX in the agent loop (state intent → wait for spoken yes →
-      execute; barge-in interplay) · `close_app` (live-learned 2026-11-13:
-      graceful WM_CLOSE can silently no-op across session/elevation
-      boundaries, force-kill is the fallback, NEVER force unsaved-data apps
-      like Notepad blind) · `delete_file`, `shutdown` · activity log wired
-      into gated actions
+- [x] **v2.5 — gated actions** (goal.md §1/§3 safety rows): two-step
+      confirmation, machinery + four gated tools (2026-11-15, commits
+      `1adf26d` core + `9e38253` tools, gate **375 passed / 0 failed /
+      1 ignored**):
+      - **Core** (`crates/igris-core/src/gating.rs`): file-backed pending
+        store `%APPDATA%\igris\pending.json` (atomic tmp+rename, survives
+        restarts → cross-process CLI arm+confirm works); cap 8
+        evict-oldest, expiry 120 s, one pending slot per tool (drifted
+        args replace → old intent unexecutable); freshness = armed in a
+        strictly earlier turn of the same process OR by another process
+        (turn counter bumped once per utterance at `agent_turn` entry —
+        the single choke point voice+CLI share); consumed pending is
+        spent even on execution failure. First call validates + arms and
+        returns a loud `NOT EXECUTED — CONFIRMATION REQUIRED` plan
+        (status stays "ok"); confirmed re-call (exact canonicalized args)
+        executes. `Registry::dispatch` runs the flow; activity log lines
+        `requested: <plan>` / `executed <tool>: <detail>` / `FAILED` are
+        written automatically (tags `gated` + tool name). Config-defined
+        tools stay ungated and may not shadow a gated builtin name.
+      - **Tools** (`src/tools/gated.rs`): `close_app` (WM_CLOSE sweep via
+        window enumeration → 4.5 s bounded wait → force-kill fallback,
+        except notepad which is NEVER force-closed) · `delete_file`
+        (Recycle Bin via SHFileOperationW `FOF_ALLOWUNDO`; protected
+        subtrees: Windows/Program Files/ProgramData/exe dir, profile root
+        exact, drive roots; folders refused; everything re-validated in
+        the executor) · `shutdown` (`shutdown.exe /s /t 30`, cancelable)
+        · `shutdown_abort` (UNGATED safe counterpart, harmless when
+        nothing is pending) · `power_mode` (powercfg /setactive over the
+        well-known scheme GUIDs, **availability verified at plan time
+        against `powercfg /list`** — live-learned 2026-11-15: Windows 11
+        ships only Balanced, so saver/performance are refused with a
+        clear plan-time error instead of failing after confirmation).
+        Executor re-validates everything the plan validated.
+      - **Live e2e** (via new `examples/gated_e2e.rs` probe, one process
+        arms, another confirms — the file-backed store's cross-process
+        flow): close_app notepad arm→confirm → process gone; delete_file
+        temp file arm→confirm → recycled, dead doubled-path intent then
+        errors at plan time (`file not found`); power_mode saver
+        plan-refused live, balanced arm→confirm → `Power plan set to
+        Balanced.` (original scheme never left, nothing to restore);
+        shutdown arm-only (`shutdown.exe /a` → error 1116 proves nothing
+        was scheduled) + shutdown_abort live (`No shutdown was in
+        progress`); activity log shows the full
+        requested/executed/FAILED trail.
 - [ ] **v3 — integrations & agentic** (goal.md §2/§8/§9): `spotify_play`
       (OAuth + token refresh over ureq) · window control (`focus_window`,
       `list_windows`) · planner-model decision (bigger GGUF vs cloud

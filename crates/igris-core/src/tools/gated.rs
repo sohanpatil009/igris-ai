@@ -442,7 +442,10 @@ pub(crate) fn run_shutdown_abort(_args: &Value) -> Result<String, String> {
     }
 }
 
-/// Well-known power scheme GUIDs (present on every Windows install).
+/// Well-known power scheme GUIDs (the standard Windows schemes). They
+/// are NOT guaranteed to exist on every install — Windows 11 ships only
+/// Balanced by default — so [`plan_power_mode`] verifies availability
+/// against `powercfg /list` before arming.
 const POWER_SAVER: &str = "a1841308-3541-42a9-bfd1-a4e5e19da1f4";
 const POWER_BALANCED: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
 const POWER_PERFORMANCE: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
@@ -458,9 +461,30 @@ fn power_scheme(mode: &str) -> Result<(&'static str, &'static str), String> {
     }
 }
 
+/// Is this scheme GUID listed in a `powercfg /list` output? Pure text
+/// check on the GUID itself — the surrounding labels are localized.
+fn guid_listed(guid: &str, list_output: &str) -> bool {
+    let needle = guid.to_lowercase();
+    list_output.to_lowercase().contains(&needle)
+}
+
+/// The schemes powercfg currently offers (their GUIDs, extracted
+/// locale-independently).
+fn available_schemes() -> Result<String, String> {
+    let exe = system32_exe("powercfg.exe");
+    let (_, text) = run_system32(&exe, &["/list"])?;
+    Ok(text)
+}
+
 pub(crate) fn plan_power_mode(args: &Value) -> Result<String, String> {
     let mode = required_str(args, "mode", "power_mode")?;
     let (label, guid) = power_scheme(mode)?;
+    let listing = available_schemes()?;
+    if !guid_listed(guid, &listing) {
+        return Err(format!(
+            "the {label} plan is not configured on this machine — powercfg /list does not offer it (no plan was switched)"
+        ));
+    }
     Ok(format!("Switch the power plan to {label} ({guid})."))
 }
 
@@ -628,9 +652,40 @@ mod tests {
         assert_eq!(power_scheme("balanced").unwrap().1, POWER_BALANCED);
         assert_eq!(power_scheme("performance").unwrap().1, POWER_PERFORMANCE);
         assert!(power_scheme("turbo").is_err());
-        let plan = plan_power_mode(&json!({"mode": "performance"})).unwrap();
-        assert!(plan.contains("High performance"), "{plan}");
         assert!(plan_power_mode(&json!({})).is_err());
         assert!(plan_power_mode(&json!({"mode": 7})).is_err());
+    }
+
+    #[test]
+    fn guid_listed_is_a_locale_independent_text_check() {
+        let listing = "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced) *\n\
+                       Power Scheme GUID: A1841308-3541-42A9-BFD1-A4E5E19DA1F4  (Energy saver)\n";
+        /* case-insensitive GUID match, labels ignored (localized) */
+        assert!(guid_listed(POWER_BALANCED, listing));
+        assert!(guid_listed(POWER_SAVER, listing));
+        assert!(!guid_listed(POWER_PERFORMANCE, listing));
+        assert!(!guid_listed("00000000-0000-0000-0000-000000000000", listing));
+    }
+
+    #[test]
+    fn plan_power_mode_refuses_unlisted_schemes_and_accepts_listed_ones() {
+        /* Machine-adaptive: /list always offers at least the active
+         * scheme; each well-known mode must plan Ok iff its GUID is
+         * listed. */
+        let listing = available_schemes().expect("powercfg /list must work on Windows");
+        let mut available = 0;
+        for mode in ["saver", "balanced", "performance"] {
+            let (_, guid) = power_scheme(mode).unwrap();
+            let plan = plan_power_mode(&json!({"mode": mode}));
+            if guid_listed(guid, &listing) {
+                available += 1;
+                let plan = plan.expect("listed scheme must plan");
+                assert!(plan.contains("Switch the power plan"), "{plan}");
+            } else {
+                let err = plan.unwrap_err();
+                assert!(err.contains("not configured"), "{err}");
+            }
+        }
+        assert!(available >= 1, "powercfg /list must offer at least one scheme");
     }
 }
