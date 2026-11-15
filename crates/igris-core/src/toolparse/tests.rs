@@ -2796,6 +2796,88 @@ Let me check the result."#;
         assert_eq!(released, "A:  well done");
     }
 
+    /* ---- BUG-003: bare fake tool-result JSON hold-back ---- */
+
+    #[test]
+    fn stream_filter_drops_fake_tool_result_json() {
+        /* The observed live leak: a bare inline tool_result JSON after a
+         * clean final answer must never reach display/TTS. */
+        let mut f = StreamFilter::new();
+        assert_eq!(f.feed("Done, opened the file."), "Done, opened the file.");
+        assert_eq!(f.feed("{\"name\": \"file_write\", "), "");
+        assert_eq!(f.feed("\"result\": \"written\", "), "");
+        assert_eq!(f.feed("\"status\": \"ok\"}"), "");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn stream_filter_releases_non_machinery_json_verbatim() {
+        let mut f = StreamFilter::new();
+        let mut released = String::new();
+        released.push_str(&f.feed("Count: "));
+        released.push_str(&f.feed("{\"a\": 1}"));
+        released.push_str(&f.feed(" plus"));
+        released.push_str(&f.finish());
+        assert_eq!(released, "Count: {\"a\": 1} plus");
+        /* a bare "name" key without result/status is prose, not machinery */
+        let mut g = StreamFilter::new();
+        assert_eq!(
+            g.feed("{\"name\": \"my variable\"}"),
+            "{\"name\": \"my variable\"}"
+        );
+    }
+
+    #[test]
+    fn stream_filter_unclosed_json_decides_at_finish() {
+        /* machinery-shaped: suppressed */
+        let mut f = StreamFilter::new();
+        assert_eq!(f.feed("ok {\"name\": \"x\", \"status\""), "ok ");
+        assert_eq!(f.finish(), "");
+        /* not machinery: released verbatim (never lose text) */
+        let mut g = StreamFilter::new();
+        assert_eq!(g.feed("ok {\"a\": 1"), "ok ");
+        assert_eq!(g.finish(), "{\"a\": 1");
+    }
+
+    #[test]
+    fn stream_filter_drops_json_holding_a_protocol_span() {
+        /* a think span inside the held object is machinery noise: the
+         * whole object is suppressed at its close regardless of keys */
+        let mut f = StreamFilter::new();
+        let obj = format!(
+            "{{\"a\": \"x{}y{}\", \"name\": \"t\"}}",
+            THINK_OPEN, THINK_CLOSE
+        );
+        let mut released = String::new();
+        released.push_str(&f.feed(&obj));
+        released.push_str(&f.finish());
+        assert_eq!(released, "");
+    }
+
+    #[test]
+    fn stream_filter_drops_pretty_printed_fake_tool_result() {
+        /* the trigger skips whitespace after the brace, so the
+         * pretty-printed hallucination is held too */
+        let mut f = StreamFilter::new();
+        let mut released = String::new();
+        released.push_str(&f.feed("A: {\n"));
+        released.push_str(&f.feed("  \"name\": \"calc\",\n"));
+        released.push_str(&f.feed("  \"result\": \"4\"\n"));
+        released.push_str(&f.feed("}\n"));
+        released.push_str(&f.finish());
+        assert_eq!(released, "A: \n");
+    }
+
+    #[test]
+    fn stream_filter_trailing_brace_chunking_releases_prose_braces() {
+        /* a `{` at a chunk boundary that turns out to be prose must not
+         * be lost: the brace is held back, then released with the rest */
+        let mut f = StreamFilter::new();
+        assert_eq!(f.feed("use {"), "use ");
+        assert_eq!(f.feed("quick} braces"), "{quick} braces");
+        assert_eq!(f.finish(), "");
+    }
+
     /* ---- LFM3 function-attribute bodies (our addition) ---- */
 
     #[test]
