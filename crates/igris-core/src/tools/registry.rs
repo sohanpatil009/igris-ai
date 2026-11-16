@@ -320,31 +320,43 @@ impl Registry {
                 Err(e) => outcomes[slot] = Some(Err(e)),
             }
         }
-        /* phase 2: concurrent executions; each worker owns its data and
-         * reports back through the channel (a panic drops its sender) */
-        let (tx, rx) = std::sync::mpsc::channel();
-        let spawned = deferred.len();
-        for d in deferred {
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                let res = exec_run(d.run, &d.name, &d.args, d.timeout);
-                let _ = tx.send((d.slot, d.name, d.gated, res));
-            });
-        }
-        drop(tx);
-        let mut done = 0usize;
-        while done < spawned {
-            match rx.recv() {
-                Ok((slot, name, gated, res)) => {
-                    done += 1;
-                    if gated {
-                        if let Some(def) = self.tools.iter().find(|t| t.name == name) {
-                            self.log_gated_step(def, &Ok(GatedOutcome::Executed(res.clone())));
+        /* phase 2: concurrent executions with a bounded fan-out — a
+         * degenerate reply with dozens of web calls must not open that
+         * many sockets against one backend at once (DuckDuckGo
+         * rate-limits). Chunks keep global call order: chunk i's
+         * results are all collected before chunk i+1 spawns (a panic
+         * drops its sender). */
+        const BATCH_MAX_CONCURRENCY: usize = 4;
+        while !deferred.is_empty() {
+            let take = deferred.len().min(BATCH_MAX_CONCURRENCY);
+            let chunk: Vec<Deferred> = deferred.drain(..take).collect();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = chunk.len();
+            for d in chunk {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let res = exec_run(d.run, &d.name, &d.args, d.timeout);
+                    let _ = tx.send((d.slot, d.name, d.gated, res));
+                });
+            }
+            drop(tx);
+            let mut done = 0usize;
+            while done < spawned {
+                match rx.recv() {
+                    Ok((slot, name, gated, res)) => {
+                        done += 1;
+                        if gated {
+                            if let Some(def) = self.tools.iter().find(|t| t.name == name) {
+                                self.log_gated_step(
+                                    def,
+                                    &Ok(GatedOutcome::Executed(res.clone())),
+                                );
+                            }
                         }
+                        outcomes[slot] = Some(res);
                     }
-                    outcomes[slot] = Some(res);
+                    Err(_) => break, /* all senders gone; missing slots crashed */
                 }
-                Err(_) => break, /* all senders gone; missing slots crashed */
             }
         }
         /* workers that panicked never sent: report crashed, keep order */
@@ -1176,6 +1188,43 @@ mod tests {
         assert!(elapsed < Duration::from_millis(700), "elapsed {elapsed:?}");
         assert_eq!(out[0].result.as_deref(), Ok("done batch_slow_a"));
         assert_eq!(out[1].result.as_deref(), Ok("done batch_slow_b"));
+    }
+
+    #[test]
+    fn batch_bounds_concurrent_workers() {
+        static LIVE: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        static PEAK: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let mut r = Registry::new();
+        r.register(ToolDef {
+            name: "batch_capped_probe".to_string(),
+            desc: "peak-tracker tenant".to_string(),
+            schema: json!({"type": "object", "properties": {}, "required": []}),
+            gated: false,
+            plan: None,
+            run: Arc::new(|_a: &Value| -> Result<String, String> {
+                let live = LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                PEAK.fetch_max(live, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(60));
+                LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("ok".to_string())
+            }),
+        });
+        /* 7 calls against a cap of 4: two chunks, so the peak can never
+         * exceed the cap even though every call would overlap without
+         * one. */
+        let batch: Vec<_> = (0..7)
+            .map(|_| ("batch_capped_probe".to_string(), json!({})))
+            .collect();
+        let out = r.dispatch_batch(&batch);
+        assert_eq!(out.len(), 7);
+        assert!(out.iter().all(|o| o.result.is_ok()));
+        assert!(
+            PEAK.load(std::sync::atomic::Ordering::SeqCst) <= 4,
+            "peak concurrent workers: {}",
+            PEAK.load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 
     #[test]

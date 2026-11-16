@@ -779,7 +779,8 @@ pub fn agent_turn(
         let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
         (sink.on_tool_round)(&names);
         /* one call takes the plain path; several calls execute together
-         * on parallel workers (v3) with results in call order */
+         * on parallel workers (v3, bounded to 4 at a time) with results
+         * in call order */
         let t_tools = Instant::now();
         let outcomes: Vec<ToolOutcome> = if calls.len() == 1 {
             let call = &calls[0];
@@ -818,10 +819,11 @@ pub fn agent_turn(
         };
         if timed {
             eprintln!(
-                "[timing] round {} tools {}ms over {} call(s)",
+                "[timing] round {} tools {}ms over {} call(s){}",
                 state.rounds,
                 t_tools.elapsed().as_millis(),
-                calls.len()
+                calls.len(),
+                if calls.len() > 1 { " parallel" } else { "" },
             );
         }
         /* the results message, plus the escalation-ladder verdict (v3
