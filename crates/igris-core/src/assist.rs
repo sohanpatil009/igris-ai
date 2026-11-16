@@ -372,7 +372,7 @@ fn turn_reply<'k, 'd>(
         if cut {
             println!();
         }
-        if matches!(end, llm::AgentTurnEnd::Exhausted) {
+        if matches!(end, llm::AgentTurnEnd::Exhausted { .. }) {
             if let Some(sp) = tts {
                 let _ = sp.speak("I could not finish that one.");
             }

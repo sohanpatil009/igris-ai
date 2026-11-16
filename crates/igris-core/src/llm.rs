@@ -740,8 +740,9 @@ pub enum AgentTurnEnd {
     Final,
     /// Barge-in cut the stream.
     Cut,
-    /// The iteration budget ran out while the model kept calling tools.
-    Exhausted,
+    /// The task's tool-round budget ran out while the model kept
+    /// calling tools; carries the rounds that ran.
+    Exhausted { rounds: usize },
 }
 
 /// One agent turn on `history` (which already holds the system seed and
@@ -1008,7 +1009,7 @@ pub fn agent_turn(
             "content": results_msg
         }));
     }
-    Ok(AgentTurnEnd::Exhausted)
+    Ok(AgentTurnEnd::Exhausted { rounds: state.rounds })
 }
 
 /* ================================================================ */
@@ -1764,8 +1765,8 @@ fn stream_persona(
         on_tool_round: &mut on_tool_round,
     };
     let end = agent_turn(&mut history, max_tokens, &mut sink)?;
-    if matches!(end, AgentTurnEnd::Exhausted) {
-        println!("\n(gave up after {MAX_TOOL_ITERATIONS} tool rounds)");
+    if let AgentTurnEnd::Exhausted { rounds } = end {
+        println!("\n(gave up after {rounds} tool rounds)");
     } else {
         println!();
     }
