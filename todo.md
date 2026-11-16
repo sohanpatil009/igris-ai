@@ -453,6 +453,16 @@ vendoring was rejected; see v1.2).
         fan-out now bounded at 4 at a time with global call order kept
         (7-call peak test). Live probe T1: 5 calls in one round at
         236 ms, timing marker `over 5 call(s) parallel`.
+  - [ ] Recycle-bin control + browser targeting (U1 real-world probe,
+        2026-11-16): `empty_recycle_bin` gated arm-confirm (shell folder
+        `shell:::{645FF040-5081-101B-9F08-00AA002F954E}` +
+        SHFileOperationW/IFileOperation) plus a way to list bin contents
+        (delete_file only moves INTO the bin; run_command is cargo/git-only -
+        U1 model hunted 5 rounds then honestly reported failure, bin
+        unchanged at 39 items); optional `browser` argument for
+        `open_url`/`play_song` so "in Brave" is capability, not registry
+        luck (https UserChoice missing on the benchmark host, fallback hit
+        Brave while http defaults to Firefox).
 - [ ] Optional someday: WASM/MCP plugin bridge (`zeroclaw-plugins`) — only
       as an `mcp_tool` client tenant type, never a dependency of the core
 

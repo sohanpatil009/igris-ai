@@ -654,3 +654,41 @@ S3-10"): 1.100.0 is correct; day-2's 1.99.1 was the artifact.
 - Unchanged: repo git tree clean (S5-20C wrote no source/report files); the duplicate pair
   in Downloads still present (nothing deleted); day-2 leftovers untouched.
 - Chrome was opened by S3-10C (open_app); it was already running beforehand.
+## 2026-11-16 - U-series: user real-world tasks (U1)
+
+New id family U: a genuine end-user request typed as-is, one-shot through the bench2
+driver, graded by external OS verification rather than the tool's own claims.
+
+### U1 - recycle bin + Brave + YouTube song + 30 percent volume
+
+Wall 226.0 s (LLM 154.5 s over 9 rounds, tools 69.0 s over 7 calls). No respawns, no
+transport errors; one context overflow at round 9 recovered by compaction (+38 s).
+Calls seen: list_dir, file_search "recycle", file_search "trash", play_song,
+set_volume, list_dir "Recycle Bin", find_duplicates. No gated call was ever armed.
+
+| Ask | Verdict | Evidence |
+|-----|---------|----------|
+| Empty the recycle bin | Miss (honest) | No capability exists: delete_file only moves files INTO the bin, run_command is cargo/git-only. The model hunted 5 rounds for a "Recycle Bin" folder (home list_dir, two file_search passes, list_dir on a guessed path, a whole-home find_duplicates at 61.3 s) - the bin is a virtual shell folder, invisible to list_dir - then honestly reported failure and asked for paths. External check: bin still holds exactly 39 items (baseline unchanged). No destructive call, no hallucinated success. Cost of the impossible subtask: ~100 s LLM + 65 s tools. |
+| Play the Rehbhara song | Partial | play_song "Rehbhara" opened the YouTube search results page (Brave window title verified: "Rehbhara - YouTube - Brave"). A search page, not a video - play_song is search-page-only by design, so nothing is actually playing. |
+| In the Brave browser | Pass, by luck | The https association has NO UserChoice on this box (reg query: key missing), so ShellExecuteW fell back to Brave; Firefox owns http only. IGRIS has no browser-targeting parameter - the outcome was registry state, not capability. 14 fresh brave.exe processes at 23:33:43-47 confirm the spawn. Recon had predicted Firefox (http check); the https gap flips it. |
+| System audio at 30 percent | Pass | set_volume 30 returned the endpoint read-back at 30%. Same read-back path externally verified in the v2.5 probes; no independent re-check this run (waveOutGetVolume is the legacy mixer API, not the endpoint). |
+
+Honesty: the final answer claims exactly what happened - volume set, search page
+opened, bin not emptied with a request for paths. No fake success anywhere.
+
+Efficiency findings (P3 item 9 evidence): round 1 was 39.0 s of pure deliberation whose
+monologue later helped trigger the round-9 context overflow; the model retried 5
+different search strategies against a structurally absent capability instead of
+stopping at the first definitive "not supported" signal.
+
+### Roadmap items this probe adds
+
+1. empty_recycle_bin - gated tool, arm-then-confirm like delete_file: enumerate via the
+   shell folder (shell:::{645FF040-5081-101B-9F08-00AA002F954E}) and delete through
+   SHFileOperationW/IFileOperation. The U1 requester explicitly authorized deletion;
+   the tool's own confirm gate remains the consent mechanism.
+2. Make the bin visible to the model - list_recycle_bin, or the confirm prompt listing
+   the targets: the model burned 5 rounds looking for a folder list_dir cannot see.
+3. Browser targeting for open_url/play_song - optional browser argument that spawns the
+   named browser with the URL as argv, so "in Brave" becomes a capability instead of a
+   registry accident.
