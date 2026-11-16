@@ -380,3 +380,80 @@ Method: every command = one fresh `igris-ai.exe chat "<command>"` process (fresh
 
 ### Advanced S1–S5
 Not run yet — will be appended in a later pass.
+
+---
+
+## Results — continued run (2026-11-16)
+
+Same method as the partial run: one fresh `igris-ai.exe chat` process per test, warm llama-server, wall time from send to final answer. Day-2 additions: driver waits on the IGRIS process itself (Chrome's inherited output pipes can no longer stall it) with a 30-min per-test safety timeout, and 6 diagnostic reruns for tests that failed on infrastructure or context limits.
+
+### Core benchmark 18 + test 17 clean rerun
+
+| # | Test | Seconds | Result |
+|---|------|---------|--------|
+| 17 | Open Chrome, then YouTube (clean rerun) | 18.8 | Pass — 6 rounds; recovered from the open_app parameter error on its own (first-attempt time of 36.8 s was polluted by Chrome's profile picker) |
+| 18 | Search latest Rust release + summarize | 35.1 | Pass — summarized "Rust 1.100.0 (Nov 12, 2026)"; web_search timed out once and was retried (17.8 s of the 35.1 s was tool time) |
+
+### Advanced S1 — multi-tool system intelligence (seconds)
+
+| # | Test | Seconds | Result |
+|---|------|---------|--------|
+| 1 | 5+ tool system health report | 14.2 | Pass — full report; honestly notes sys_stats has no CPU temperature reading |
+| 2 | Battery < 30% -> battery saver | 6.6 | Pass — 94% > 30%, correctly skipped battery saver (no hour estimate given though) |
+| 3 | CPU > 70% -> find top processes | 8.5 | Pass — 1% < 70%, correctly declined to hunt processes, noted RAM 90% separately |
+| 4 | Top-5 RAM apps + recommendations | 36.1 | Miss — sys_stats is aggregate-only, no per-process tool; stated the limitation and gave Task Manager advice instead |
+
+### Advanced S2 — file management & chained ops (seconds)
+
+| # | Test | Seconds | Result |
+|---|------|---------|--------|
+| 5 | PDFs: count + total size + 5 largest | 165.3 | Miss — 162.5 s of pure LLM deliberation over 3 rounds; answer truncated before the final count/total/top-5 |
+| 6 | Images -> ImagesBackup copy | 96.2 | Miss — extension-based image search returned nothing; run ended after list_dir, no copy performed |
+| 7 | IGRIS project text files w/ tool-exec refs | 71.6 (rerun 44.5) | Miss — "my IGRIS project" is not reachable from the home-directory sandbox (found Pictures/IGRIS photos instead); answer truncated at the round cap |
+| 8 | Duplicate files report (no delete) | 37.7 (rerun 47.3) | Miss — no hashing/comparison tool; honestly said it can't detect duplicates reliably, then truncated |
+| 9 | IgrisReport + system_report.txt | 92.0 | Miss — folder created, then correctly discovered the toolset has no file-write tool; system_report.txt never created (IgrisReport left empty) |
+
+### Advanced S3 — browser & internet automation (seconds)
+
+| # | Test | Seconds | Result |
+|---|------|---------|--------|
+| 10 | Chrome + Rust release site + what's new | 225.5 | Pass — opened Chrome, fetched the official Rust blog, delivered structured 1.99.1 highlights (open_app schema confusion burned several rounds; 218.9 s was LLM) |
+| 11 | 3 Rust AI frameworks, stars, comparison file | 149.1 | Partial — research succeeded via best-of-ml-rust (candle ~16K, mistral.rs ~4.6K, linfa ~3.8K stars) but no comparison file (no write tool) and the answer truncated mid-analysis |
+| 12 | Latest llama.cpp release summary | 65.2 (rerun 41.4) | Fail x2 — StatusCode(400): accumulated web_fetch pages overflowed the model context; reproducible on rerun |
+| 13 | Candle docs: load a quantized model | 59.2 (rerun 73.7) | Pass on rerun — full quantized-model loading guide with code (GGUF/GGML, quantized_llama); first attempt hit the same 400 (transient there) |
+
+### Advanced S4 — complex chained reasoning (seconds)
+
+| # | Test | Seconds | Result |
+|---|------|---------|--------|
+| 14 | System diagnosis + health report file | 47.3 | Miss — aggregate sys_stats only, no per-process tool; answer truncated mid-deliberation, no file |
+| 15 | IGRIS architecture investigation + report | 114.2 | Miss — explored the home sandbox (source/repos), never found the actual project; gave up after the 10-round cap |
+| 16 | Candle vs mistral.rs vs llama.cpp comparison | 54.9 (rerun 49.8) | Fail x2 — 400 context overflow (8 web_search calls + fetches accumulated); reproducible on rerun |
+| 17 | Files > 100 MB grouped by extension | 54.2 | Partial — correctly identified the two >100 MB files visible in the listing; answer truncated before grouping/report |
+| 18 | Chrome + Rust release + Markdown summary | 56.3 | Miss — again no write tool for the Markdown file; open_app schema confusion wasted rounds |
+
+### Stress S5 — long chained tasks (seconds)
+
+| # | Test | Seconds | Result |
+|---|------|---------|--------|
+| 19 | Full workstation audit + Markdown report | 47.1 (rerun 47.6) | Fail x2 — round-2 deliberation hits the max-token cap mid-sentence both times; no report file |
+| 20 | IGRIS self-analysis + optimization report | 106.6 | Miss — 10 rounds exploring home dirs; source lives outside the sandbox; no report |
+
+### Findings (what the numbers actually say)
+
+1. **Latency is ~100% model generation.** Tool execution is milliseconds-fast (0.0-17.8 s per test, most under 1 s). A single-tool Q&A is ~5 s end-to-end; everything above that is the 1.7B model thinking out loud.
+2. **The toolset has no file-write tool** (write_file exists only as a name-normalization alias in the parser). Every "save a report to a file" test is structurally impossible — S2-9, S4-15/16/18, S5-19/20. The model discovers this and flails. Adding a gated write_file would likely flip ~5 results.
+3. **Context overflow -> HTTP 400**: accumulated web_fetch/web_search payloads blew the context window mid-run (S3-12 and S4-16 reproducibly; S3-13 transiently). Web results need trimming/truncation before they enter history.
+4. **Max-token truncation mid-deliberation**: long thinking rounds get cut mid-sentence and become the final answer (S5-19 twice, plus S2-5, S2-7R, S2-8R, S4-14, S4-17).
+5. **open_app schema confusion**: the model reads the JSON-schema metadata and wraps the argument wrong ("properties.app"), then self-corrects — costs 2-4 extra rounds every time Chrome is involved.
+6. **Sandbox reachability**: "my IGRIS project" (and any absolute path outside the user home) is invisible to file tools, so the project-investigation tests (S2-7, S4-15, S5-20) cannot succeed as specified.
+7. **What works well**: single-tool Q&A, honest conditional reasoning (S1-2/3 correctly refused the unnecessary branch), and multi-round web research when context stays under the limit (S3-10 at 225 s and S3-13R at 74 s both delivered real, structured answers).
+8. **Infra note**: the reused llama-server died once mid-batch (S2-7/S2-8 first attempts: "Peer disconnected"); IGRIS respawned a server and later tests ran normally. Also: web answers disagree across runs (Rust "1.100.0" in test 18 vs "1.99.1" in S3-10) — one of the two summaries is a search-result/hallucination artifact worth a manual check.
+
+### Totals (both days)
+
+- Day 1 (2026-11-15): 16 attempts (corrected from 17), 4 min 39 s execution, ~16 min wall including the Chrome profile-picker stall.
+- Day 2 (2026-11-16): 28 executions (22 tests + 6 reruns), 31 min 7 s execution, 38.1 min wall (16:55:57-17:34:02, including warmup and one aborted spec call).
+- Combined execution time: ~35 min 46 s across 44 timed IGRIS runs.
+- Final score per test id: **17 pass / 3 partial / 16 miss-or-fail / 1 skipped** (test 8, lock, by policy). Passes cluster in single-tool and short-chain work; misses cluster in file-writing (no tool), context overflow (web-heavy), token-cap truncation (long deliberation), and sandbox reachability (project tests).
+- Machine leftovers: Notepad open, several Chrome windows/tabs from tests 17R/10/18, screenshot in OneDrive Pictures, volume at 40%, `IgrisBenchmark` on Desktop, an empty `IgrisReport` on Desktop, and stray test artifacts under the home folder (`~/IgrisBenchmark/test.txt` folder). No user files were deleted or modified.
