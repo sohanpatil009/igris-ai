@@ -1703,6 +1703,7 @@ Gated tools: their first call only validates the action and announces the plan Ã
         let df = block.find("**delete_file**").unwrap();
         let di = block.find("**disk_stats**").unwrap();
         let dl = block.find("**download_file**").unwrap();
+        let erb = block.find("**empty_recycle_bin**").unwrap();
         let fm = block.find("**file_metadata**").unwrap();
         let fd = block.find("**find_duplicates**").unwrap();
         let fw = block.find("**focus_window**").unwrap();
@@ -1719,6 +1720,7 @@ Gated tools: their first call only validates the action and announces the plan Ã
         let pm = block.find("**power_mode**").unwrap();
         let ps = block.find("**process_stats**").unwrap();
         let rf = block.find("**read_file**").unwrap();
+        let rb = block.find("**recycle_bin**").unwrap();
         let rs = block.find("**reminder_set**").unwrap();
         let rp = block.find("**replace_file**").unwrap();
         let rc = block.find("**run_command**").unwrap();
@@ -1740,7 +1742,8 @@ Gated tools: their first call only validates the action and announces the plan Ã
                 && cn < df
                 && df < di
                 && di < dl
-                && dl < fm
+                && dl < erb
+                && erb < fm
                 && fm < fs
                 && fs < fd
                 && fd < fw
@@ -1756,7 +1759,8 @@ Gated tools: their first call only validates the action and announces the plan Ã
                 && ou < pm
                 && pm < ps
                 && ps < rf
-                && rf < rs
+                && rf < rb
+                && rb < rs
                 && rs < rp
                 && rp < rc
                 && rc < sc
@@ -1772,7 +1776,7 @@ Gated tools: their first call only validates the action and announces the plan Ã
         // Every entry carries ONE canonical call-arguments example (plan
         // P0): the raw schema dump made the model echo "properties"
         // shapes as data (the open_app defect class).
-        assert_eq!(block.matches("Call arguments: `").count(), 38);
+        assert_eq!(block.matches("Call arguments: `").count(), 40);
         assert!(!block.contains("\"required\""));
         assert!(!block.contains("properties"));
         // The calculate tenant's function enum is enumerated in its

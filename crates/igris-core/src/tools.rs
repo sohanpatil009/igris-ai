@@ -77,6 +77,15 @@
 //! not shadow a gated built-in name (see
 //! `Registry::register_ungated_guarded`).
 //!
+//! v3 (2026-11-16) — recycle bin (U1 real-world follow-up): `recycle_bin`
+//! (ungated, read-only indexed listing) and `empty_recycle_bin` (gated
+//! permanent removal — `action=delete` with 1-based indices from the
+//! listing, or `action=empty` for everything). Entries are the bin's own
+//! `$I`/`$R` metadata pairs, walked with plain `std::fs` over every
+//! drive's `$Recycle.Bin`; invisible `$I` remnants are swept by
+//! `action=empty`, unindexed files in the bin folders are counted in
+//! readbacks and never touched.
+//!
 //! Dynamism ladder: v1 code-registered → v1.1 `tools.toml` config-defined
 //! tools (name/desc/schema + allowlisted command template, no recompile —
 //! `register` replaces a same-name tenant to make overrides possible) → v3
@@ -102,6 +111,7 @@ mod dev;
 mod files;
 mod gated;
 mod memory_tools;
+mod recycle;
 mod registry;
 mod shared;
 #[cfg(test)]
@@ -130,6 +140,9 @@ use crate::tools::gated::{
 };
 use crate::tools::memory_tools::{
     run_activity_log, run_create_note, run_memory_recall, run_memory_save, run_reminder_set,
+};
+use crate::tools::recycle::{
+    plan_empty_recycle_bin, run_empty_recycle_bin, run_recycle_bin,
 };
 use crate::tools::system::{run_disk_stats, run_process_stats, run_set_volume, run_screenshot, run_sys_stats};
 use crate::tools::web::{run_download_file, run_web_fetch, run_web_search};
@@ -960,6 +973,46 @@ pub fn seed_registry() -> Registry {
         gated: true,
         plan: Some(Arc::new(plan_delete_file)),
         run: Arc::new(run_delete_file),
+    });
+    r.register(ToolDef {
+        name: "recycle_bin".to_string(),
+        desc: "List the Recycle Bin: one line per item with a 1-based index, \
+               original name, size, deletion time and original location, \
+               newest first. Read-only; use it to answer 'what is in the \
+               recycle bin' and to pick indices before empty_recycle_bin."
+            .to_string(),
+        schema: json!({"type": "object", "properties": {}, "required": []}),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_recycle_bin),
+    });
+    r.register(ToolDef {
+        name: "empty_recycle_bin".to_string(),
+        desc: "Permanently remove Recycle Bin items — there is no undo. \
+               action=delete removes just the indices given (take them \
+               from the recycle_bin listing); action=empty removes every \
+               item. Gated: nothing is removed until the user confirms \
+               the exact list."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["delete", "empty"],
+                    "description": "delete = only the indices given; empty = every item"
+                },
+                "indices": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                    "description": "delete only: 1-based indices from the recycle_bin listing"
+                }
+            },
+            "required": ["action"]
+        }),
+        gated: true,
+        plan: Some(Arc::new(plan_empty_recycle_bin)),
+        run: Arc::new(run_empty_recycle_bin),
     });
     r.register(ToolDef {
         name: "power_mode".to_string(),
