@@ -529,9 +529,11 @@ fn is_transport_error(msg: &str) -> bool {
 
 /// The server rejected the request outright (HTTP 400): in practice the
 /// rendered prompt outgrew the model context after heavy web rounds
-/// (benchmark 2026-11-16, S3-12/S4-16, reproducible).
+/// (benchmark 2026-11-16, S3-12/S4-16, reproducible). Matched in two
+/// shapes: our own formatter's and ureq's Error::StatusCode Display —
+/// the latter only if a call site ever bypasses the status checks.
 fn is_context_overflow(msg: &str) -> bool {
-    msg.starts_with("llama-server error 400")
+    msg.starts_with("llama-server error 400") || msg.contains("http status: 400")
 }
 
 /// One-shot recovery for a prompt that outgrew the model context (plan
@@ -847,6 +849,12 @@ fn agent() -> &'static ureq::Agent {
     AGENT.get_or_init(|| {
         ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(300)))
+            /* Non-200s must reach chat_stream/complete's own status
+             * checks, which format "llama-server error {status}: {body}"
+             * — ureq's default Err(Error::StatusCode(n)) hides the body
+             * and dodges the recovery ladder's overflow matcher
+             * (benchmark 2026-11-16 rerun, S2-7A/S4-15A). */
+            .http_status_as_error(false)
             .build()
             .into()
     })
@@ -2145,7 +2153,11 @@ Gated tools: their first call only validates the action and announces the plan �
         assert!(is_context_overflow(
             "llama-server error 400: {\"error\":\"the request exceeds the available context size\"}"
         ));
+        /* ureq's own Error::StatusCode Display (the rerun's dying shape
+         * when a call site bypasses our status checks) */
+        assert!(is_context_overflow("http status: 400"));
         assert!(!is_context_overflow("llama-server error 500: boom"));
+        assert!(!is_context_overflow("http status: 502"));
         assert!(!is_context_overflow("Peer disconnected"));
     }
 
