@@ -457,3 +457,85 @@ Same method as the partial run: one fresh `igris-ai.exe chat` process per test, 
 - Combined execution time: ~35 min 46 s across 44 timed IGRIS runs.
 - Final score per test id: **17 pass / 3 partial / 16 miss-or-fail / 1 skipped** (test 8, lock, by policy). Passes cluster in single-tool and short-chain work; misses cluster in file-writing (no tool), context overflow (web-heavy), token-cap truncation (long deliberation), and sandbox reachability (project tests).
 - Machine leftovers: Notepad open, several Chrome windows/tabs from tests 17R/10/18, screenshot in OneDrive Pictures, volume at 40%, `IgrisBenchmark` on Desktop, an empty `IgrisReport` on Desktop, and stray test artifacts under the home folder (`~/IgrisBenchmark/test.txt` folder). No user files were deleted or modified.
+
+
+## Results â€” Phase A+B remediation rerun (2026-11-16, 19:23â€“20:31)
+
+The 17 remediation-relevant tests from the continued run, re-executed on the Phase A+B build
+(commit `097af53`, exe 19:15) with ids suffixed `A`. Same driver and method: one fresh `chat`
+process per test, warm llama-server, wall time from send to process exit. Day-2 raw evidence
+(`bench2_out_*`/`bench2_err_*`) untouched; this run only wrote `*A` files.
+
+### Execution context (read before the table)
+
+This run was hit by a llama-server stability storm the day-2 run did not have. The server
+(~1.4 GB working set on a 7.7 GB box running the IDE, two opencode processes and the test
+harness at 81â€“91% RAM) died mid-round at least eight times from S2-8A onward. IGRIS's Phase A
+recovery ladder behaved exactly as designed â€” logged the transport error, re-spawned a fresh
+server, retried the same round once, gave up bounded â€” but on this host the fresh servers died
+too, so eight tests ended as process deaths. Their "seconds" are death times, not task times;
+only the completed tests compare against day-2.
+
+A second, real finding: both context-overflow tests (S2-7A, S4-15A) died on
+`Error: StatusCode(400)` with no compaction attempt. Root cause: ureq 3 returns
+`Error::StatusCode(400)` (Display "http status: 400") from `send_json` itself, so
+`chat_stream`'s "llama-server error 400: â€¦" formatter never runs and `is_context_overflow`
+(written against that shape) never matches. Fix queued (`http_status_as_error(false)` plus a
+broadened classifier). A DNS outage window ("No such host is known") also swept S4-16A/S4-18A;
+`rust-lang.org` resolves again afterwards.
+
+### Per-test results (day-2 seconds â†’ rerun seconds)
+
+| # | Test | day-2 | A | Verdict (rerun) |
+|---|------|-------|---|-----------------|
+| S1-4 | Top-5 RAM apps + recommendations | 36.1 Miss | 30.4 | Pass â€” process_stats top-5 with pids + usable recommendations (was impossible with aggregate-only sys_stats) |
+| S2-5 | PDFs: count + total + 5 largest | 165.3 Miss | 403.5 | Partial â€” 12 PDFs and the exact five largest verified against ground truth; hand-summed total 30,561 KB vs actual 31,307 KB (~2% off, summing tool-rounded sizes) |
+| S2-6 | Images â†’ ImagesBackup copy | 96.2 Miss | 176.1 | Partial â€” create_folder + copy_files ran (2 images copied, never-overwrite intact) but sourced Downloads/Camera Roll instead of the Desktop (no loose images there; the one image under OneDrive Desktop was missed) |
+| S2-7 | IGRIS text files w/ tool-exec refs | 71.6 Miss | 222.7 | Miss â€” reachability FIXED ("my IGRIS project" resolves to the repo via IGRIS_WORKSPACE; found README/tool_calling_plan/todo + 8 more), then died on the StatusCode(400) gap after a 7-call parallel read_file round |
+| S2-8 | Duplicate files report | 37.7 Miss | 162.2 | Miss â€” find_duplicates correctly refused an unresolvable root, model pivoted to file_search/list_dir, server died round 4 |
+| S2-9 | IgrisReport + system_report.txt | 92.0 Miss | 98.1 | Miss â€” server died round 1 (Desktop IgrisReport still empty) |
+| S3-10 | Chrome + Rust release site | 225.5 Pass | 172.3 | Miss â€” server died round 1 (infra regression, not tool behavior) |
+| S3-11 | 3 AI frameworks + comparison file | 149.1 Partial | 123.9 | Miss â€” server died round 1 |
+| S3-12 | llama.cpp release summary | 65.2 Fail | 115.2 | Miss â€” server died round 1 (day-2's overflow cause never got the chance to recur) |
+| S3-13 | Candle docs quantized loading | 59.2 Pass (rerun) | 257.2 | Miss â€” eight productive web/file rounds, then server death round 9 |
+| S4-14 | System diagnosis + health file | 47.3 Miss | 264.1 | Pass â€” Desktop SystemHealthReport.txt written via write_file: metrics table, per-process top-3 via process_stats, bottleneck analysis |
+| S4-15 | IGRIS architecture + report | 114.2 Miss | 326.9 | Miss â€” found the real project (llm.rs, tools/registry.rs, igris-cli/main.rs), read them, died on the StatusCode(400) gap; no file |
+| S4-16 | Candle/mistral.rs/llama.cpp comparison | 54.9 Fail | 488.1 | Miss â€” 3 web_search calls failed fast (DNS window), model fell back to training data, rambled to the token cap mid-table, never saved |
+| S4-17 | Files >100 MB grouped | 54.2 Partial | 385.1 | Partial â€” grouping completed and verified (.exe: 128.4 + 109.7 = 238.1 MB) but delivered as a create_note instead of a report file |
+| S4-18 | Chrome + Rust release + .md | 56.3 Miss | 419.1 | Partial â€” web dead in the DNS window; honest fallback produced Desktop Rust_Latest_Release_Summary.md via write_file with an explicit "verify against the official page" note; version stale (1.78.0 from training data) |
+| S5-19 | Workstation audit + report | 47.1 Fail | 395.1 | Miss â€” sys_stats/process_stats/disk/battery all collected, content_search hunting GPU info, server died round 4 before the report |
+| S5-20 | IGRIS self-analysis + report | 106.6 Miss | 62.8 | Miss â€” server died round 1 |
+
+### What the remediation actually changed (completed tests only)
+
+1. Every completed test used the new Phase A+B tools as intended: process_stats for all three
+   top-processes asks, find_duplicates instead of "I can't detect duplicates", copy_files for
+   the batch copy, write_file for both delivered files, workspace_info to resolve
+   "my IGRIS project".
+2. Two day-2 misses flipped to passes (S1-4, S4-14); four more reached full content where
+   day-2 truncated or refused (S2-5, S2-6, S4-17, S4-18).
+3. Sandbox reachability is gone as a failure class â€” the project-investigation tests now find
+   the real repo; what kills them now is context size, not invisibility.
+4. The old overflow class (S3-12/S4-16-style 400s) is still unhandled â€” now proven to be a
+   recovery-ladder bug (error-shape mismatch), not model behavior.
+5. Day-2's speed pattern inverted: day-2's fast "misses" were early truncations; the rerun's
+   slow tests are slow because the model keeps working (S2-5A spent 403 s walking and
+   verifying where day-2 spent 165 s truncating).
+
+### Side effects on the machine
+
+- Created: `~/Desktop/SystemHealthReport.txt` (S4-14A), `~/Desktop/Rust_Latest_Release_Summary.md`
+  (S4-18A), `~/ImagesBackup/` with 2 images (S2-6A).
+- Unchanged/uncreated: `~/Desktop/IgrisReport/` still empty (S2-9A died first), repo root clean
+  (no stray .md), day-2 leftovers (`~/IgrisBenchmark/test.txt`, `~/Desktop/IgrisBenchmark/`)
+  untouched.
+- No user files were deleted or modified.
+
+### Rerun totals
+
+- 17 tests in 68.4 min wall (4,103 s timed). Verdicts: 2 pass / 4 partial / 11 miss
+  (8 by server death, 2 by the 400 ladder gap, 1 web failure + truncation).
+- Combined with day 2: the content progress is real, but this run under-measures it â€” the
+  server storm makes the miss column an infrastructure statement, not a toolset statement.
+  A clean re-run of the eight server-death tests on an idle host is the honest next
+  measurement.
