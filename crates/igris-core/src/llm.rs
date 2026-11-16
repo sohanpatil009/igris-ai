@@ -538,21 +538,29 @@ fn is_context_overflow(msg: &str) -> bool {
 
 /// One-shot recovery for a prompt that outgrew the model context (plan
 /// P1): keep the system seed (0) and the original user request (1)
-/// verbatim, shrink every middle message to a bounded digest, and leave
-/// the last four messages untouched (they hold the round actually in
-/// flight). Bounded no-op when the history is too short to compress
-/// safely.
+/// verbatim, shrink every middle message to a bounded digest, and bound
+/// the kept tail too. The tail's tool-result payloads (a parallel
+/// read_file batch, a fetched page) are usually the very mass that
+/// overflowed, so leaving the last four verbatim made the compacted
+/// retry overflow again (benchmark rerun 2026-11-16, S2-7F). Bounded
+/// no-op when there is nothing to compress.
 pub fn compact_history(history: &mut Vec<Value>) {
-    const COMPACT_KEEP_TAIL: usize = 4;
     const COMPACT_MIDDLE_CAP: usize = 600;
+    const COMPACT_TAIL_CAP: usize = 800;
     let n = history.len();
-    if n <= 2 + COMPACT_KEEP_TAIL {
+    if n <= 2 {
         return;
     }
-    for i in 2..n - COMPACT_KEEP_TAIL {
+    for i in 2..n {
+        /* the last four messages hold the round actually in flight â€”
+         * keep more of them than the middle, but never all of it */
+        let cap = if n - i > 4 {
+            COMPACT_MIDDLE_CAP
+        } else {
+            COMPACT_TAIL_CAP
+        };
         if let Some(content) = history[i].get("content").and_then(Value::as_str) {
-            let shrunk =
-                crate::tools::truncate_chars(content, COMPACT_MIDDLE_CAP);
+            let shrunk = crate::tools::truncate_chars(content, cap);
             history[i]["content"] = json!(shrunk);
         }
     }
@@ -2104,7 +2112,7 @@ Gated tools: their first call only validates the action and announces the plan Ã
     }
 
     #[test]
-    fn compact_history_preserves_seed_and_tail_and_shrinks_middle() {
+    fn compact_history_shrinks_middle_and_keeps_short_tail_verbatim() {
         let long = "x".repeat(2000);
         let mut history = vec![
             json!({"role": "system", "content": "SYSTEM"}),
@@ -2130,14 +2138,27 @@ Gated tools: their first call only validates the action and announces the plan Ã
     }
 
     #[test]
-    fn compact_history_leaves_short_histories_alone() {
+    fn compact_history_shrinks_giant_tail_payloads() {
+        /* the rerun's S2-7F shape: the round's giant tool-result batch
+         * sits in the kept tail â€” the compaction must bound it, or the
+         * retry overflows a second time and dies (StatusCode 400) */
         let mut history = vec![
             json!({"role": "system", "content": "S"}),
             json!({"role": "user", "content": "U"}),
-            json!({"role": "assistant", "content": "x".repeat(5000)}),
+            json!({"role": "user", "content": "x".repeat(5000)}),
         ];
         compact_history(&mut history);
-        assert_eq!(history[2]["content"].as_str().unwrap().len(), 5000);
+        /* seed and original request stay verbatim even in short
+         * histories */
+        assert_eq!(history[0]["content"], "S");
+        assert_eq!(history[1]["content"], "U");
+        let content = history[2]["content"].as_str().unwrap();
+        assert!(
+            content.contains("[truncated: showing first 800 of 5000"),
+            "{content}"
+        );
+        /* a short history is no longer a blanket exemption: only
+         * seed + request are, and they were never longer than the caps */
     }
 
     #[test]
