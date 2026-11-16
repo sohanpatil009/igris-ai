@@ -440,7 +440,7 @@ vendoring was rejected; see v1.2).
 - [ ] **v3 — integrations & agentic** (goal.md §2/§8/§9): `spotify_play`
       (OAuth + token refresh over ureq) · planner-model decision (bigger GGUF vs cloud
       fallback; grammar-constrained tool JSON via llama.cpp `json_schema`
-      evaluated here) · parallel tool execution · WhatsApp/email LAST,
+      evaluated here) · WhatsApp/email LAST,
       behind explicit consent (external-approval-bound)
   - [x] Window control — DONE 2026-11-16 (`list_windows`, `focus_window`,
         commit `31d5898`): z-order listing with pid→exe, ranked match
@@ -448,6 +448,11 @@ vendoring was rejected; see v1.2).
         SetForegroundWindow verified via GetForegroundWindow. Live probe
         W1–W4: all four paths honest, no hallucinated success; desktop
         Progman correctly filtered as a shell toolwindow.
+  - [x] Parallel tool execution — DONE 2026-11-16 (commit `d48d6d8`):
+        multi-call rounds run on concurrent workers (from `d54b3ac`),
+        fan-out now bounded at 4 at a time with global call order kept
+        (7-call peak test). Live probe T1: 5 calls in one round at
+        236 ms, timing marker `over 5 call(s) parallel`.
 - [ ] Optional someday: WASM/MCP plugin bridge (`zeroclaw-plugins`) — only
       as an `mcp_tool` client tenant type, never a dependency of the core
 
