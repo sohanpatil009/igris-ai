@@ -837,9 +837,14 @@ pub fn seed_registry() -> Registry {
     r.register(ToolDef {
         name: "web_fetch".to_string(),
         desc: "Fetch a public web page and return its readable text (HTML converted \
-              to plain text; JSON/other text returned as-is; size-capped). Use for \
-              'summarize this URL', 'read this page', or to read a result found by \
-              web_search. Binary files are refused — use download_file for those."
+              to plain text; JSON/other text returned as-is; size-capped). The \
+              result begins with Source/Retrieved/Last-Modified lines — carry \
+              the source URL and retrieval date into your answer, and prefer \
+              official project domains (docs, release notes, GitHub) for \
+              version or release questions; if sources conflict, say so \
+              instead of picking one silently. Use for 'summarize this URL', \
+              'read this page', or to read a result found by web_search. \
+              Binary files are refused — use download_file for those."
             .to_string(),
         schema: json!({
             "type": "object",
@@ -885,7 +890,10 @@ pub fn seed_registry() -> Registry {
         desc: "Search the public web with DuckDuckGo. Call this tool for ANY request \
               phrased like 'search the web for ...', 'look up ... online', 'find ... \
               on the internet', or whenever current/live information beyond your \
-              training is needed (news, versions, prices, docs). Returns ranked \
+              training is needed (news, versions, prices, docs). The header states \
+              the retrieval date — cite it and the source URLs in your answer; \
+              for version or release questions, prefer fetching the project's \
+              official site or GitHub over third-party snippets. Returns ranked \
               titles, URLs and snippets; follow up with web_fetch to read a page in \
               full."
             .to_string(),

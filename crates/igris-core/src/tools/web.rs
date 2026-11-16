@@ -408,6 +408,66 @@ fn is_binary_content_type(ctype: &str) -> bool {
         || main.contains("csv"))
 }
 
+/* ---------------------------------------------------------------- */
+/* freshness & source confidence (plan P3 item 10)                   */
+/* ---------------------------------------------------------------- */
+
+/// Every web tool result carries the wall-clock moment it was
+/// retrieved, so the model can date its claims instead of presenting
+/// fetched content as timeless truth. `%Y-%m-%d %H:%M` — minute
+/// precision is enough; seconds would churn prompts for nothing.
+fn retrieved_stamp() -> String {
+    retrieved_stamp_at(chrono::Local::now())
+}
+
+fn retrieved_stamp_at(now: chrono::DateTime<chrono::Local>) -> String {
+    now.format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// Fetch result header: source URL (post-redirect), retrieval time
+/// and — when the server volunteers it — the document's own
+/// modification date. The model can then say "retrieved 2026-11-16,
+/// page last modified 2024-03-01" instead of guessing freshness.
+fn format_fetch_result(
+    url: &str,
+    stamp: &str,
+    last_modified: Option<&str>,
+    content: &str,
+) -> String {
+    let mut out = format!("Source: {url}\nRetrieved: {stamp}");
+    if let Some(lm) = last_modified {
+        out.push_str(&format!("\nLast-Modified: {lm}"));
+    }
+    out.push_str("\n\n");
+    out.push_str(content);
+    out
+}
+
+/// The search header carries the retrieval stamp too — snippets are
+/// often the only thing read, and they age (versions, prices, news).
+fn format_search_results(
+    query: &str,
+    stamp: &str,
+    results: &[WebResult],
+    limit: usize,
+) -> String {
+    let shown = results.len().min(limit);
+    let mut out =
+        format!("Top {shown} web results for '{query}' (retrieved {stamp}):");
+    for (i, r) in results.iter().take(shown).enumerate() {
+        out.push_str(&format!("\n{}. {}\n   {}", i + 1, r.title, r.url));
+        if !r.snippet.is_empty() {
+            /* bounded snippets (plan P1): several search results share
+             * the context with everything else in history */
+            out.push_str(&format!(
+                "\n   {}",
+                truncate_chars(&r.snippet, SEARCH_SNIPPET_MAX_CHARS)
+            ));
+        }
+    }
+    out
+}
+
 pub(crate) fn run_web_fetch(args: &Value) -> Result<String, String> {
     use std::io::Read;
     let url = required_str(args, "url", "web_fetch")?;
@@ -431,6 +491,14 @@ pub(crate) fn run_web_fetch(args: &Value) -> Result<String, String> {
              download_file for files."
         ));
     }
+    /* provenance must be captured before into_body() consumes the
+     * response (plan P3 item 10) */
+    let last_modified = resp
+        .headers()
+        .get("last-modified")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let final_url = resp.get_uri().to_string();
     /* take(cap + 1): read at most the cap, and one extra byte flags a
      * bigger page without ever tripping the reader's own limit. */
     let mut reader = resp
@@ -455,7 +523,13 @@ pub(crate) fn run_web_fetch(args: &Value) -> Result<String, String> {
     if truncated {
         out.push_str("\n[page larger than the fetch cap; content truncated]");
     }
-    Ok(format!("Content of {url}:\n{out}"))
+    let stamp = retrieved_stamp();
+    Ok(format_fetch_result(
+        &final_url,
+        &stamp,
+        last_modified.as_deref(),
+        &out,
+    ))
 }
 
 /* ---------------------------------------------------------------- */
@@ -763,20 +837,8 @@ pub(crate) fn run_web_search(args: &Value) -> Result<String, String> {
                 .into(),
         );
     }
-    let shown = results.len().min(limit);
-    let mut out = format!("Top {shown} web results for '{query}':");
-    for (i, r) in results.iter().take(shown).enumerate() {
-        out.push_str(&format!("\n{}. {}\n   {}", i + 1, r.title, r.url));
-        if !r.snippet.is_empty() {
-            /* bounded snippets (plan P1): several search results share
-             * the context with everything else in history */
-            out.push_str(&format!(
-                "\n   {}",
-                truncate_chars(&r.snippet, SEARCH_SNIPPET_MAX_CHARS)
-            ));
-        }
-    }
-    Ok(out)
+    let stamp = retrieved_stamp();
+    Ok(format_search_results(query, &stamp, &results, limit))
 }
 
 
@@ -812,6 +874,79 @@ mod tests {
         assert_eq!(truncate_chars("hello", 10), "hello");
         let t = truncate_chars("hello world", 5);
         assert!(t.starts_with("hello") && t.contains("[truncated"), "{t}");
+    }
+
+    /* ---- freshness & source confidence (P3 item 10) ---- */
+
+    #[test]
+    fn retrieved_stamp_format_is_stable() {
+        use chrono::TimeZone;
+        let dt = chrono::Local
+            .with_ymd_and_hms(2026, 11, 16, 21, 7, 33)
+            .unwrap();
+        assert_eq!(retrieved_stamp_at(dt), "2026-11-16 21:07");
+        /* live stamp: minute precision, "YYYY-MM-DD HH:MM" */
+        let s = retrieved_stamp();
+        assert_eq!(s.len(), 16, "{s}");
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[10..11], " ");
+        assert_eq!(&s[13..14], ":");
+    }
+
+    #[test]
+    fn fetch_result_carries_source_and_optional_last_modified() {
+        let plain = format_fetch_result(
+            "https://example.com/final",
+            "2026-11-16 21:07",
+            None,
+            "BODY",
+        );
+        assert_eq!(
+            plain,
+            "Source: https://example.com/final\nRetrieved: 2026-11-16 21:07\n\nBODY"
+        );
+        let with_lm = format_fetch_result(
+            "https://example.com/final",
+            "2026-11-16 21:07",
+            Some("Mon, 16 Nov 2026 12:00:00 GMT"),
+            "BODY",
+        );
+        assert!(
+            with_lm.contains("\nLast-Modified: Mon, 16 Nov 2026 12:00:00 GMT\n"),
+            "{with_lm}"
+        );
+    }
+
+    #[test]
+    fn search_results_header_dates_and_limits_rows() {
+        let results = vec![
+            WebResult {
+                title: "t1".into(),
+                url: "u1".into(),
+                snippet: "s1".into(),
+            },
+            WebResult {
+                title: "t2".into(),
+                url: "u2".into(),
+                snippet: String::new(),
+            },
+            WebResult {
+                title: "t3".into(),
+                url: "u3".into(),
+                snippet: "s3".into(),
+            },
+        ];
+        let out = format_search_results("rust async", "2026-11-16 21:07", &results, 2);
+        assert!(
+            out.starts_with(
+                "Top 2 web results for 'rust async' (retrieved 2026-11-16 21:07):"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("1. t1\n   u1\n   s1"), "{out}");
+        /* empty snippets add no line */
+        assert!(out.contains("2. t2\n   u2"), "{out}");
+        assert!(!out.contains("3. t3"), "limit must cap rows: {out}");
     }
 
     /* ---- web tools: pure helpers + validation (live network is e2e) ---- */
