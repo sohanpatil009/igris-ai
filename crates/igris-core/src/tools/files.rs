@@ -459,6 +459,427 @@ pub(crate) fn run_workspace_info(_args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/* ================================================================ */
+/* list_files · file_metadata · find_duplicates · copy_files (P2)    */
+/*                                                                  */
+/* Deterministic file analysis: the model must never sort, count or  */
+/* hash by hand (benchmark 2026-11-16: S2-5/6/8, S4-17 all lost      */
+/* arithmetic and grouping rounds). Walks reuse the file_search     */
+/* discipline: wall-time + entry caps, and dependency/system trees  */
+/* are never descended into. find_duplicates only ever REPORTS —    */
+/* no deletion capability exists in this family.                    */
+/* ================================================================ */
+
+/// One discovered file: absolute-ish path and its byte size.
+struct FoundFile {
+    path: PathBuf,
+    size: u64,
+}
+
+/// Bounded walk collecting files (optionally extension-filtered).
+/// Reuses the file_search skip list and budget constants. Returns the
+/// files and whether the walk hit a cap before finishing.
+fn walk_files(
+    root: &Path,
+    recursive: bool,
+    ext: Option<String>,
+    time_budget: Duration,
+    max_entries: usize,
+) -> (Vec<FoundFile>, bool) {
+    let want_ext = ext
+        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+        .filter(|e| !e.is_empty());
+    let mut files: Vec<FoundFile> = Vec::new();
+    let mut truncated = false;
+    let deadline = Instant::now() + time_budget;
+    let mut queue: Vec<PathBuf> = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    'walk: loop {
+        let Some(dir) = queue.pop() else { break };
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > max_entries || Instant::now() > deadline {
+                truncated = true;
+                break 'walk;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                if recursive {
+                    let name_lc = entry
+                        .file_name()
+                        .to_string_lossy()
+                        .to_lowercase();
+                    if !SEARCH_SKIP_DIRS.contains(&name_lc.as_str()) {
+                        queue.push(path);
+                    }
+                }
+                continue;
+            }
+            if let Some(ext) = &want_ext {
+                let path_ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_lowercase());
+                if path_ext.as_deref() != Some(ext.as_str()) {
+                    continue;
+                }
+            }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            files.push(FoundFile { path, size });
+        }
+    }
+    (files, truncated)
+}
+
+/// Shared root-directory validation for the walk family.
+fn walk_root(args: &Value) -> Result<PathBuf, String> {
+    let raw = args
+        .get("root")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("~");
+    let root = PathBuf::from(expand_home_path(raw));
+    if !root.is_dir() {
+        return Err(format!("'{raw}' is not a directory"));
+    }
+    Ok(root)
+}
+
+pub(crate) fn run_list_files(args: &Value) -> Result<String, String> {
+    let root = walk_root(args)?;
+    let recursive = args.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+    let ext = args
+        .get("extension")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(e) = &ext {
+        if e.trim().is_empty() {
+            return Err("extension is empty".into());
+        }
+    }
+    let limit = optional_u64(args, "limit", 20, 1, 100) as usize;
+    let (mut files, truncated) =
+        walk_files(&root, recursive, ext, SEARCH_TIME_BUDGET, SEARCH_MAX_ENTRIES);
+    /* the tool sorts, never the model (plan P2) */
+    files.sort_by(|a, b| b.size.cmp(&a.size).then(a.path.cmp(&b.path)));
+    let total = files.len();
+    let mut out = if total == 0 {
+        format!("No files under {}{}", root.display(), if truncated { " (scan truncated)" } else { "" })
+    } else {
+        format!(
+            "{} file(s) under {} — top {} by size{}:",
+            total,
+            root.display(),
+            limit.min(total),
+            if truncated { " (scan truncated)" } else { "" }
+        )
+    };
+    for f in files.into_iter().take(limit) {
+        out.push_str(&format!("\n  {}  {}", fmt_bytes(f.size), f.path.display()));
+    }
+    Ok(out)
+}
+
+pub(crate) fn run_file_metadata(args: &Value) -> Result<String, String> {
+    let raw = required_str(args, "path", "file_metadata")?;
+    if raw.trim().is_empty() {
+        return Err("path is empty".into());
+    }
+    let path = PathBuf::from(expand_home_path(raw));
+    let md = fs::metadata(&path).map_err(|e| format!("Could not stat '{raw}': {e}"))?;
+    let kind = if md.is_dir() { "directory" } else { "file" };
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("(none)");
+    let fmt_time = |st: Option<std::time::SystemTime>| -> String {
+        st.map(|t| {
+            chrono::DateTime::<chrono::Local>::from(t)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| "(unknown)".into())
+    };
+    Ok(format!(
+        "Path: {}\nType: {}\nSize: {}\nExtension: {}\nCreated: {}\nModified: {}\nAccessed: {}\nRead-only: {}",
+        path.display(),
+        kind,
+        fmt_bytes(md.len()),
+        ext,
+        fmt_time(md.created().ok()),
+        fmt_time(md.modified().ok()),
+        fmt_time(md.accessed().ok()),
+        if md.permissions().readonly() { "yes" } else { "no" },
+    ))
+}
+
+pub(crate) fn run_find_duplicates(args: &Value) -> Result<String, String> {
+    let root = walk_root(args)?;
+    let limit = optional_u64(args, "limit", 20, 1, 100) as usize;
+    let (mut files, truncated) =
+        walk_files(&root, true, None, Duration::from_secs(10), SEARCH_MAX_ENTRIES);
+    let total_scanned = files.len();
+    /* size prefilter (plan P2): only same-size groups can be true
+     * duplicates — the cheap check happens before any hashing */
+    let mut by_size: std::collections::HashMap<u64, Vec<PathBuf>> =
+        std::collections::HashMap::new();
+    for f in files.drain(..) {
+        by_size.entry(f.size).or_default().push(f.path);
+    }
+    let candidates: Vec<(u64, Vec<PathBuf>)> = by_size
+        .into_iter()
+        .filter(|(_, v)| v.len() >= 2)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(format!(
+            "No same-size files under {}{} — no duplicates possible. Nothing was deleted.",
+            root.display(),
+            if truncated { " (scan truncated)" } else { "" }
+        ));
+    }
+    /* hash budget: 60 s and 512 MB total, single files over 256 MB are
+     * skipped — a report must always come back within the tool budget */
+    const HASH_FILE_CAP: u64 = 256 * 1024 * 1024;
+    const HASH_BYTE_BUDGET: u64 = 512 * 1024 * 1024;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut hashed = 0usize;
+    let mut hashed_bytes = 0u64;
+    let mut budget_hit = false;
+    let mut groups: Vec<(u64, String, Vec<PathBuf>)> = Vec::new();
+    for (size, paths) in candidates {
+        if budget_hit {
+            break;
+        }
+        let mut digests: std::collections::HashMap<String, Vec<PathBuf>> =
+            std::collections::HashMap::new();
+        for p in paths {
+            if size > HASH_FILE_CAP
+                || Instant::now() > deadline
+                || hashed_bytes + size > HASH_BYTE_BUDGET
+            {
+                budget_hit = true;
+                break;
+            }
+            let Ok(bytes) = fs::read(&p) else { continue };
+            hashed += 1;
+            hashed_bytes += size;
+            digests.entry(sha256_hex(&bytes)).or_default().push(p);
+        }
+        for (hex, ps) in digests {
+            if ps.len() >= 2 {
+                groups.push((size, hex, ps));
+            }
+        }
+    }
+    if groups.is_empty() {
+        return Ok(format!(
+            "No duplicate files under {} ({} files scanned, {} hashed{}). Nothing was deleted.",
+            root.display(),
+            total_scanned,
+            hashed,
+            if budget_hit || truncated { ", budget reached — report may be partial" } else { "" }
+        ));
+    }
+    groups.sort_by(|a, b| b.0.cmp(&a.0).then(b.2.len().cmp(&a.2.len())));
+    let shown = groups.len().min(limit);
+    let mut out = format!(
+        "Found {} duplicate group(s) under {} ({} files scanned, {} hashed{}). Nothing was deleted.",
+        groups.len(),
+        root.display(),
+        total_scanned,
+        hashed,
+        if budget_hit || truncated {
+            ", budget reached — report may be partial"
+        } else {
+            ""
+        }
+    );
+    for (i, (size, hex, paths)) in groups.iter().take(shown).enumerate() {
+        out.push_str(&format!(
+            "\n{}. {} file(s) × {} — sha256 {}…",
+            i + 1,
+            paths.len(),
+            fmt_bytes(*size),
+            &hex[..16]
+        ));
+        for p in paths.iter().take(10) {
+            out.push_str(&format!("\n     {}", p.display()));
+        }
+        if paths.len() > 10 {
+            out.push_str(&format!("\n     … and {} more", paths.len() - 10));
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn run_copy_files(args: &Value) -> Result<String, String> {
+    let sources = args
+        .get("sources")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Missing required parameter: sources (tool copy_files)".to_string())?;
+    if sources.is_empty() {
+        return Err("sources is empty".into());
+    }
+    if sources.len() > 50 {
+        return Err(format!(
+            "too many sources ({}) — at most 50 per call",
+            sources.len()
+        ));
+    }
+    let dest_raw = required_str(args, "dest_dir", "copy_files")?;
+    if dest_raw.trim().is_empty() {
+        return Err("dest_dir is empty".into());
+    }
+    let dest = PathBuf::from(expand_home_path(dest_raw));
+    if !dest.is_absolute() {
+        return Err(format!(
+            "dest_dir '{dest_raw}' is relative — give an absolute path (or one starting with ~)"
+        ));
+    }
+    if dest.is_file() {
+        return Err(format!("'{dest_raw}' exists as a file, not a folder"));
+    }
+    /* the destination is a write: the same root policy as write_file */
+    check_protected(&dest).map_err(|e| e.replace("deleted", "written"))?;
+    if !write_root_allowed(&dest) {
+        return Err(format!(
+            "'{dest_raw}' is outside the writable roots — see workspace_info"
+        ));
+    }
+    fs::create_dir_all(&dest).map_err(|e| format!("Could not create destination: {e}"))?;
+    let mut copied = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for s in sources {
+        let Some(sraw) = s.as_str() else {
+            errors.push(format!("source entry is not a string: {s}"));
+            continue;
+        };
+        let spath = PathBuf::from(expand_home_path(sraw));
+        if !spath.is_file() {
+            errors.push(format!("not a file: {sraw}"));
+            continue;
+        }
+        let Some(fname) = spath.file_name() else {
+            errors.push(format!("no file name: {sraw}"));
+            continue;
+        };
+        let target = dest.join(fname);
+        if target.exists() {
+            skipped.push(format!(
+                "{} (already exists — nothing overwritten)",
+                target.display()
+            ));
+            continue;
+        }
+        match fs::copy(&spath, &target) {
+            Ok(_) => copied += 1,
+            Err(e) => errors.push(format!("copy {sraw} failed: {e}")),
+        }
+    }
+    let mut out = format!(
+        "Copied {copied} file(s) into {} (nothing overwritten).",
+        dest.display()
+    );
+    let mut notes = |label: &str, list: &[String]| {
+        if list.is_empty() {
+            return;
+        }
+        out.push_str(&format!("\n{label} {}:", list.len()));
+        for item in list.iter().take(10) {
+            out.push_str(&format!("\n  {item}"));
+        }
+        if list.len() > 10 {
+            out.push_str(&format!("\n  … and {} more", list.len() - 10));
+        }
+    };
+    notes("Skipped", &skipped);
+    notes("Errors", &errors);
+    Ok(out)
+}
+
+/* ---- pure-Rust SHA-256 (plan P2) --------------------------------- */
+/* Self-contained: adding a hashing crate is an offline-build risk on */
+/* this machine, and the known vectors pin correctness in tests.      */
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+    0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+    0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+    0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+    0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+    0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+    0xc67178f2,
+];
+
+/// SHA-256 of one byte slice, lowercase hex. Single-shot: the duplicate
+/// finder caps file sizes at 256 MB before reading.
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
+        0x1f83d9ab, 0x5be0cd19,
+    ];
+    /* padding: message + 0x80 + zeros + 64-bit big-endian bit length */
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    h.iter().map(|x| format!("{x:08x}")).collect()
+}
+
 
 /* ================================================================ */
 /* v2 — dev & browser (goal.md §4/§5/§6)                             */
@@ -1206,4 +1627,171 @@ mod tests {
         assert!(out.contains("user profile"), "{out}");
     }
 
+    /* ---- list_files / file_metadata / find_duplicates / copy_files (P2) ---- */
+
+    #[test]
+    fn list_files_sorts_by_size_and_filters_extension() {
+        let root = temp_root("lf_sort");
+        fs::write(root.join("big.txt"), "x".repeat(300)).unwrap();
+        fs::write(root.join("small.txt"), "y".repeat(30)).unwrap();
+        fs::write(root.join("note.md"), "z".repeat(100)).unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub").join("nested.md"), "n".repeat(500)).unwrap();
+        /* non-recursive default: only the root's own files */
+        let out = reg()
+            .dispatch("list_files", &json!({"root": root.to_string_lossy()}))
+            .unwrap();
+        assert!(out.contains("3 file(s)"), "{out}");
+        assert!(!out.contains("nested.md"), "{out}");
+        /* recursive: the sub folder is descended into */
+        let out = reg()
+            .dispatch(
+                "list_files",
+                &json!({"root": root.to_string_lossy(), "recursive": true}),
+            )
+            .unwrap();
+        assert!(out.contains("4 file(s)"), "{out}");
+        /* extension filter + deterministic sort: nested.md (500 B) beats
+         * note.md (100 B) — the tool sorts, never the model */
+        let out = reg()
+            .dispatch(
+                "list_files",
+                &json!({
+                    "root": root.to_string_lossy(),
+                    "recursive": true,
+                    "extension": ".md"
+                }),
+            )
+            .unwrap();
+        assert!(out.contains("2 file(s)"), "{out}");
+        let nested = out.find("nested.md").unwrap();
+        let note = out.find("note.md").unwrap();
+        assert!(nested < note, "{out}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn file_metadata_reports_shape_and_errors() {
+        let root = temp_root("fm_shape");
+        let f = root.join("report.txt");
+        fs::write(&f, "hello").unwrap();
+        let out = reg()
+            .dispatch("file_metadata", &json!({"path": f.to_string_lossy()}))
+            .unwrap();
+        assert!(out.contains("Type: file"), "{out}");
+        assert!(out.contains("Size: 5 B"), "{out}");
+        assert!(out.contains("Extension: txt"), "{out}");
+        assert!(out.contains("Created: "), "{out}");
+        assert!(out.contains("Read-only: "), "{out}");
+        let out = reg()
+            .dispatch("file_metadata", &json!({"path": root.to_string_lossy()}))
+            .unwrap();
+        assert!(out.contains("Type: directory"), "{out}");
+        let err = reg()
+            .dispatch(
+                "file_metadata",
+                &json!({"path": root.join("missing.bin").to_string_lossy()}),
+            )
+            .unwrap_err();
+        assert!(err.contains("Could not stat"), "{err}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn find_duplicates_groups_by_hash_and_never_deletes() {
+        let root = temp_root("fd_groups");
+        let a = root.join("a.bin");
+        let b = root.join("b.bin");
+        let c = root.join("c.bin");
+        fs::write(&a, "identical content").unwrap();
+        fs::write(&b, "identical content").unwrap();
+        fs::write(&c, "different").unwrap();
+        let out = reg()
+            .dispatch("find_duplicates", &json!({"root": root.to_string_lossy()}))
+            .unwrap();
+        assert!(out.contains("Found 1 duplicate group(s)"), "{out}");
+        assert!(out.contains("2 file(s)"), "{out}");
+        assert!(out.contains("Nothing was deleted"), "{out}");
+        /* report-only: every file still on disk */
+        assert!(a.is_file() && b.is_file() && c.is_file());
+        /* the no-duplicates case is an honest empty report */
+        let root2 = temp_root("fd_none");
+        fs::write(root2.join("solo.txt"), "only one").unwrap();
+        let out = reg()
+            .dispatch("find_duplicates", &json!({"root": root2.to_string_lossy()}))
+            .unwrap();
+        assert!(out.contains("Nothing was deleted"), "{out}");
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(root2).ok();
+    }
+
+    #[test]
+    fn sha256_known_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        /* the 448-bit standard vector crosses a block boundary */
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        /* padding boundary: 55 bytes fit one block's message area, 56 do
+         * not — both must hash differently */
+        assert_ne!(
+            sha256_hex("a".repeat(55).as_bytes()),
+            sha256_hex("a".repeat(56).as_bytes())
+        );
+    }
+
+    #[test]
+    fn copy_files_copies_and_never_overwrites() {
+        let src = temp_root("cf_src");
+        let dst = temp_root("cf_dst");
+        fs::write(src.join("one.txt"), "111").unwrap();
+        fs::write(src.join("two.txt"), "222").unwrap();
+        fs::write(dst.join("one.txt"), "original").unwrap();
+        let out = reg()
+            .dispatch(
+                "copy_files",
+                &json!({
+                    "sources": [
+                        src.join("one.txt").to_string_lossy(),
+                        src.join("two.txt").to_string_lossy()
+                    ],
+                    "dest_dir": dst.to_string_lossy()
+                }),
+            )
+            .unwrap();
+        assert!(out.contains("Copied 1 file(s)"), "{out}");
+        assert!(out.contains("Skipped 1:"), "{out}");
+        assert_eq!(fs::read_to_string(dst.join("one.txt")).unwrap(), "original");
+        assert_eq!(fs::read_to_string(dst.join("two.txt")).unwrap(), "222");
+        /* a missing source lands in Errors but the tool still reports */
+        let out = reg()
+            .dispatch(
+                "copy_files",
+                &json!({
+                    "sources": ["Z:\\definitely\\missing.txt"],
+                    "dest_dir": dst.to_string_lossy()
+                }),
+            )
+            .unwrap();
+        assert!(out.contains("Copied 0 file(s)"), "{out}");
+        assert!(out.contains("Errors 1:"), "{out}");
+        /* empty source list is rejected outright */
+        let err = reg()
+            .dispatch(
+                "copy_files",
+                &json!({"sources": [], "dest_dir": dst.to_string_lossy()}),
+            )
+            .unwrap_err();
+        assert!(err.contains("sources is empty"), "{err}");
+        fs::remove_dir_all(src).ok();
+        fs::remove_dir_all(dst).ok();
+    }
 }

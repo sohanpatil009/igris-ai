@@ -1679,19 +1679,25 @@ Gated tools: their first call only validates the action and announces the plan Ã
         let c = block.find("**calculate**").unwrap();
         let ca = block.find("**close_app**").unwrap();
         let cs = block.find("**content_search**").unwrap();
+        let cop = block.find("**copy_files**").unwrap();
         let cf = block.find("**create_folder**").unwrap();
         let cn = block.find("**create_note**").unwrap();
         let df = block.find("**delete_file**").unwrap();
+        let di = block.find("**disk_stats**").unwrap();
         let dl = block.find("**download_file**").unwrap();
+        let fm = block.find("**file_metadata**").unwrap();
+        let fd = block.find("**find_duplicates**").unwrap();
         let fs = block.find("**file_search**").unwrap();
         let g = block.find("**get_time**").unwrap();
         let ld = block.find("**list_dir**").unwrap();
+        let lfi = block.find("**list_files**").unwrap();
         let mk = block.find("**media_key**").unwrap();
         let mr = block.find("**memory_recall**").unwrap();
         let ms = block.find("**memory_save**").unwrap();
         let o = block.find("**open_app**").unwrap();
         let ou = block.find("**open_url**").unwrap();
         let pm = block.find("**power_mode**").unwrap();
+        let ps = block.find("**process_stats**").unwrap();
         let rf = block.find("**read_file**").unwrap();
         let rs = block.find("**reminder_set**").unwrap();
         let rp = block.find("**replace_file**").unwrap();
@@ -1708,20 +1714,26 @@ Gated tools: their first call only validates the action and announces the plan Ã
         assert!(
             c < ca
                 && ca < cs
-                && cs < cf
+                && cs < cop
+                && cop < cf
                 && cf < cn
                 && cn < df
-                && df < dl
-                && dl < fs
+                && df < di
+                && di < dl
+                && dl < fm
+                && fm < fs
+                && fs < fd
                 && fs < g
                 && g < ld
-                && ld < mk
+                && ld < lfi
+                && lfi < mk
                 && mk < mr
                 && mr < ms
                 && ms < o
                 && o < ou
                 && ou < pm
-                && pm < rf
+                && pm < ps
+                && ps < rf
                 && rf < rs
                 && rs < rp
                 && rp < rc
@@ -1738,7 +1750,7 @@ Gated tools: their first call only validates the action and announces the plan Ã
         // Every entry carries ONE canonical call-arguments example (plan
         // P0): the raw schema dump made the model echo "properties"
         // shapes as data (the open_app defect class).
-        assert_eq!(block.matches("Call arguments: `").count(), 30);
+        assert_eq!(block.matches("Call arguments: `").count(), 36);
         assert!(!block.contains("\"required\""));
         assert!(!block.contains("properties"));
         // The calculate tenant's function enum is enumerated in its

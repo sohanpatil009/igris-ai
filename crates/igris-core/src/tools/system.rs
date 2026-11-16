@@ -2,13 +2,13 @@
 //! (COM endpoint volume), screenshot (GDI capture to PNG).
 
 use crate::tools::basic::{extract_i64, shell_open, to_wide};
-use crate::tools::shared::expand_home_path;
+use crate::tools::shared::{expand_home_path, fmt_bytes, optional_u64};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::FILETIME;
+use windows::Win32::Foundation::{CloseHandle, FILETIME};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
     DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDeviceCaps, HGDIOBJ, HORZRES,
@@ -22,11 +22,17 @@ use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::System::SystemInformation::{
     GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
 };
-use windows::Win32::System::Threading::GetSystemTimes;
+use windows::Win32::System::Threading::{
+    GetProcessTimes, GetSystemTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 /* ================================================================ */
 /* sys_stats — CPU / RAM / disk / battery / uptime snapshot           */
@@ -387,6 +393,199 @@ fn capture_screen_rgb() -> Result<(u32, u32, Vec<u8>), String> {
 }
 
 
+/* ================================================================ */
+/* process_stats · disk_stats (plan P2) — deterministic system        */
+/* analysis: the model must never rank processes or add up drive      */
+/* sizes by hand (benchmark 2026-11-16: S2-8, S4-16).                 */
+/* ================================================================ */
+
+/// One sampled process: identity, working set and the CPU% measured
+/// over the sampling window.
+struct ProcSample {
+    pid: u32,
+    name: String,
+    working_set: u64,
+    cpu_pct: f64,
+}
+
+/// Every visible process (pid, image name) via the Toolhelp snapshot.
+fn enumerate_processes() -> Result<Vec<(u32, String)>, String> {
+    /* SAFETY: snapshot handle closed below; PROCESSENTRY32W carries
+     * dwSize before the first call as the API requires. */
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            .map_err(|e| format!("process_stats: snapshot failed: {e}"))?;
+        let mut out: Vec<(u32, String)> = Vec::new();
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut entry);
+        while ok.is_ok() {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            out.push((
+                entry.th32ProcessID,
+                String::from_utf16_lossy(&entry.szExeFile[..len]),
+            ));
+            ok = Process32NextW(snap, &mut entry);
+        }
+        let _ = CloseHandle(snap);
+        Ok(out)
+    }
+}
+
+/// Cumulative CPU time and working set for one pid. None when the
+/// process is gone or denies PROCESS_QUERY_LIMITED_INFORMATION —
+/// counted as skipped, never an error.
+fn sample_process(pid: u32) -> Option<(u64, u64)> {
+    /* SAFETY: handle closed on scope exit; out-pointers to our own
+     * locals; pmc.cb set before the call as the API requires. */
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut pmc = PROCESS_MEMORY_COUNTERS::default();
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let mem_ok = GetProcessMemoryInfo(handle, &mut pmc, pmc.cb).is_ok();
+        let (mut create, mut exit, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        let times_ok =
+            GetProcessTimes(handle, &mut create, &mut exit, &mut kernel, &mut user).is_ok();
+        let _ = CloseHandle(handle);
+        if !mem_ok || !times_ok {
+            return None;
+        }
+        let cpu_time = filetime_u64(&kernel).wrapping_add(filetime_u64(&user));
+        Some((cpu_time, pmc.WorkingSetSize as u64))
+    }
+}
+
+pub(crate) fn run_process_stats(args: &Value) -> Result<String, String> {
+    let by_cpu = match args.get("sort").and_then(Value::as_str).unwrap_or("memory") {
+        "memory" => false,
+        "cpu" => true,
+        other => {
+            return Err(format!("unknown sort '{other}' — use \"memory\" or \"cpu\""));
+        }
+    };
+    let limit = optional_u64(args, "limit", 10, 1, 50) as usize;
+
+    let procs = enumerate_processes()?;
+    /* pass 1: cumulative CPU times; pass 2 after a fixed window gives
+     * the per-process CPU% (plan P2: the tool computes, never the
+     * model) */
+    let mut first: Vec<(u32, String, u64)> = Vec::new();
+    let mut skipped = 0usize;
+    for (pid, name) in procs {
+        match sample_process(pid) {
+            Some((cpu, _)) => first.push((pid, name, cpu)),
+            None => skipped += 1,
+        }
+    }
+    let window = std::time::Instant::now();
+    std::thread::sleep(Duration::from_millis(400));
+    let elapsed_100ns = window.elapsed().as_millis() as f64 * 10_000.0;
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1) as f64;
+
+    let mut samples: Vec<ProcSample> = Vec::new();
+    for (pid, name, cpu1) in first {
+        let Some((cpu2, ws)) = sample_process(pid) else {
+            skipped += 1;
+            continue;
+        };
+        let delta = cpu2.wrapping_sub(cpu1);
+        let pct = if elapsed_100ns > 0.0 {
+            (delta as f64) * 100.0 / (elapsed_100ns * cpus)
+        } else {
+            0.0
+        };
+        samples.push(ProcSample {
+            pid,
+            name,
+            working_set: ws,
+            cpu_pct: pct,
+        });
+    }
+    let n = samples.len();
+    if n == 0 {
+        return Err("no readable process information found".into());
+    }
+    if by_cpu {
+        samples.sort_by(|a, b| {
+            b.cpu_pct
+                .partial_cmp(&a.cpu_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.name.cmp(&b.name))
+        });
+    } else {
+        samples.sort_by(|a, b| b.working_set.cmp(&a.working_set).then(a.name.cmp(&b.name)));
+    }
+    let shown = limit.min(n);
+    let mut out = format!(
+        "Top {shown} of {n} processes by {}\n",
+        if by_cpu { "CPU" } else { "memory" }
+    );
+    for s in samples.iter().take(shown) {
+        out.push_str(&format!(
+            "  {} (pid {}) — {}, {:.1}% CPU\n",
+            s.name,
+            s.pid,
+            fmt_bytes(s.working_set),
+            s.cpu_pct
+        ));
+    }
+    let listed: u64 = samples.iter().take(shown).map(|s| s.working_set).sum();
+    out.push_str(&format!(
+        "Total working set of listed processes: {} ({} process(es) skipped/unreadable)",
+        fmt_bytes(listed),
+        skipped
+    ));
+    Ok(out)
+}
+
+/// Total / free / used space for every ready local drive, one row per
+/// drive letter (plan P2: deterministic — the model never adds).
+pub(crate) fn run_disk_stats(_args: &Value) -> Result<String, String> {
+    let mut rows: Vec<String> = Vec::new();
+    for letter in b'C'..=b'Z' {
+        let dir = format!("{}:\\", letter as char);
+        let wide = to_wide(&dir);
+        let (mut free, mut total) = (0u64, 0u64);
+        /* SAFETY: NUL-terminated wide string built above; two out u64s. */
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free), Some(&mut total), None)
+        }
+        .is_ok();
+        if !ok || total == 0 {
+            continue; /* card reader / no media / not ready */
+        }
+        let used_pct = (((total - free) as f64) * 100.0 / (total as f64)).round() as u32;
+        rows.push(format!(
+            "  {}: {} total, {} free ({}% used)",
+            letter as char,
+            fmt_bytes(total),
+            fmt_bytes(free),
+            used_pct
+        ));
+    }
+    if rows.is_empty() {
+        return Err("no ready drives found".into());
+    }
+    let mut out = String::from("Disk usage:");
+    for row in rows {
+        out.push('\n');
+        out.push_str(&row);
+    }
+    Ok(out)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +696,28 @@ mod tests {
         assert_eq!(deleted, 0);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 5);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /* ---- process_stats · disk_stats (plan P2) ---------------------- */
+
+    #[test]
+    fn disk_stats_lists_ready_drives() {
+        let out = run_disk_stats(&json!({})).expect("disk_stats succeeds");
+        assert!(out.contains("Disk usage:"), "{out}");
+        assert!(out.contains("C:"), "{out}");
+        assert!(out.contains("% used"), "{out}");
+    }
+
+    #[test]
+    fn process_stats_sort_validation_and_smoke() {
+        let err = run_process_stats(&json!({"sort": "guess"})).unwrap_err();
+        assert!(err.contains("unknown sort"), "{err}");
+        let out = run_process_stats(&json!({"limit": 3})).expect("process_stats succeeds");
+        assert!(out.contains("Top 3 of "), "{out}");
+        assert!(out.contains("Total working set"), "{out}");
+        let out = run_process_stats(&json!({"limit": 2, "sort": "cpu"}))
+            .expect("cpu sort succeeds");
+        assert!(out.contains("by CPU"), "{out}");
     }
 
     /* ---- v1.2 memory: validation path only ------------------------ */

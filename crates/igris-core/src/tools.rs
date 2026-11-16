@@ -119,8 +119,9 @@ use crate::tools::basic::{run_calculate, run_get_time, run_media_key, run_open_a
 use crate::tools::config_tools::CONFIG_TOOLS;
 use crate::tools::dev::run_run_command;
 use crate::tools::files::{
-    plan_replace_file, run_content_search, run_create_folder, run_file_search, run_list_dir,
-    run_read_file, run_replace_file, run_workspace_info, run_write_file,
+    plan_replace_file, run_content_search, run_copy_files, run_create_folder, run_file_metadata,
+    run_file_search, run_find_duplicates, run_list_dir, run_list_files, run_read_file,
+    run_replace_file, run_workspace_info, run_write_file,
 };
 use crate::tools::gated::{
     plan_close_app, plan_delete_file, plan_power_mode, plan_shutdown, run_close_app,
@@ -129,7 +130,7 @@ use crate::tools::gated::{
 use crate::tools::memory_tools::{
     run_activity_log, run_create_note, run_memory_recall, run_memory_save, run_reminder_set,
 };
-use crate::tools::system::{run_set_volume, run_screenshot, run_sys_stats};
+use crate::tools::system::{run_disk_stats, run_process_stats, run_set_volume, run_screenshot, run_sys_stats};
 use crate::tools::web::{run_download_file, run_web_fetch, run_web_search};
 use serde_json::json;
 use std::sync::{Arc, LazyLock};
@@ -339,6 +340,107 @@ pub fn seed_registry() -> Registry {
         run: Arc::new(run_workspace_info),
     });
     r.register(ToolDef {
+        name: "list_files".to_string(),
+        desc: "List files under a folder sorted by size, largest first. Set recursive to \
+              descend into subfolders and extension to filter (e.g. 'pdf'). Use this \
+              instead of guessing file names or counting by hand."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "root": {
+                    "type": "string",
+                    "description": "Folder to list (default: your home folder)"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Also descend into subfolders (default false)"
+                },
+                "extension": {
+                    "type": "string",
+                    "description": "Only list files with this extension, e.g. 'pdf' or '.md'"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many files to show (default 20, max 100)"
+                }
+            },
+            "required": []
+        }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_list_files),
+    });
+    r.register(ToolDef {
+        name: "file_metadata".to_string(),
+        desc: "Report a file or folder's type, size, extension, creation/modification/\
+              access timestamps and read-only flag. Call this instead of guessing a \
+              file's size or kind."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File or folder path (absolute or ~ based)"
+                }
+            },
+            "required": ["path"]
+        }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_file_metadata),
+    });
+    r.register(ToolDef {
+        name: "find_duplicates".to_string(),
+        desc: "Find duplicate files under a folder: same-size prefilter, then SHA-256 \
+              hashing. Report-only — nothing is ever deleted. Large scans are \
+              budget-limited and say so in the result."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "root": {
+                    "type": "string",
+                    "description": "Folder to scan (default: your home folder)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many duplicate groups to show (default 20, max 100)"
+                }
+            },
+            "required": []
+        }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_find_duplicates),
+    });
+    r.register(ToolDef {
+        name: "copy_files".to_string(),
+        desc: "Copy up to 50 files into one destination folder. Never overwrites: files \
+              that already exist in the destination are skipped and reported. The \
+              destination follows the same path rules as write_file."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "sources": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Absolute paths of the files to copy"
+                },
+                "dest_dir": {
+                    "type": "string",
+                    "description": "Destination folder (absolute or ~ based)"
+                }
+            },
+            "required": ["sources", "dest_dir"]
+        }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_copy_files),
+    });
+    r.register(ToolDef {
         name: "open_url".to_string(),
         desc: "Open a web URL (http or https) in the default browser.".to_string(),
         schema: json!({
@@ -385,6 +487,41 @@ pub fn seed_registry() -> Registry {
         gated: false,
         plan: None,
         run: Arc::new(run_sys_stats),
+    });
+    r.register(ToolDef {
+        name: "process_stats".to_string(),
+        desc: "List the top system processes by memory or CPU usage, measured live over \
+              a 400 ms window. Deterministic ranking with sizes and percentages \
+              computed by the tool."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "sort": {
+                    "type": "string",
+                    "enum": ["memory", "cpu"],
+                    "description": "Rank by memory (default) or cpu"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many processes to show (default 10, max 50)"
+                }
+            },
+            "required": []
+        }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_process_stats),
+    });
+    r.register(ToolDef {
+        name: "disk_stats".to_string(),
+        desc: "Report total, free and used space for every ready local drive. Call this \
+              instead of estimating disk capacity from memory."
+            .to_string(),
+        schema: json!({"type": "object", "properties": {}, "required": []}),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_disk_stats),
     });
     r.register(ToolDef {
         name: "set_volume".to_string(),
