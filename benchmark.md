@@ -593,3 +593,64 @@ header paths were exercised in one fetch.)
   to anchor it.
 - Release-summary tasks (S3-12/S3-13 family) can state "retrieved
   <date>, page last modified <date>" instead of undated content.
+
+
+## Results â€” clean rerun of the 8 server-death tests (2026-11-16, 22:14â€“22:39)
+
+The eight tests the Phase A+B rerun lost to llama-server deaths, re-executed on the current
+build (`43cf26d`, incl. the overflow-ladder fixes `cefc0ae`/`7be10eb` and the P3 provenance
+step `c381602`), ids suffixed `C`. Same driver and method: one fresh `chat` process per test,
+warm llama-server, wall time from send to process exit. Two chunks (4+4) with a health check
+between them.
+
+### Execution context
+
+The host was **not** lab-idle â€” 73â€“82% RAM with the IDE and two opencode processes running â€”
+but it was far enough from the A-run storm that **no test died from infrastructure**. All 8
+completed. One transport error did occur (S3-11C, round 10): the recovery ladder re-spawned
+the server, retried the round, and the test continued â€” the first benchmark evidence of the
+respawn ladder carrying a test to completion after a mid-run death (previously that shape
+always ended the process).
+
+### Per-test results (day-2 â†’ A-run â†’ C-run seconds)
+
+| # | Test | day-2 | A | C | Verdict (C-run) |
+|---|------|-------|---|---|-----------------|
+| S2-8 | Duplicate files report | 37.7 Partial | 162.2 death | 61.5 | Pass â€” find_duplicates + file_metadata; exactly the ground truth (1 group: `ECOSYSTEM(1).pptx` + `ECOSYSTEM.pptx`, 1.61 MB each, identical SHA-256), nothing deleted; report inline |
+| S2-9 | IgrisReport + system_report.txt | 92.0 Miss | 98.1 death | 28.8 | Pass â€” `Desktop/IgrisReport/system_report.txt` created with real values (CPU 9%, RAM 5.5/7.7 GB, C: 27.8 of 219.1 GB free); the day-2 structurally-impossible test now passes in under half a minute |
+| S3-10 | Chrome + Rust release site | 225.5 Pass | 172.3 death | 40.1 | Partial â€” Rust **1.100.0** (2026-11-12) with four compatibility highlights, all verbatim-true against the release notes; but it answered from search results with links instead of opening the official site (3 of 4 chain steps) |
+| S3-11 | 3 AI frameworks + comparison file | 149.1 Partial | 123.9 death | 206.0 | Miss â€” gave up after 10 tool rounds; early rounds burned reading local source for "AI framework references", star data polluted (litellm framed as a Rust AI framework, `qiluo_admin` junk); no file created |
+| S3-12 | llama.cpp release summary | 65.2 Fail (overflow) | 115.2 death | 47.1 | Pass â€” llama.cpp **v1.0.0** (2026-11-13), changelog points verified against the release notes (deprecated API removal incl. `llama_set_warmup` + 35 fns + `defrag_thold`; FP8 KV caches; server security hardening); day-2's overflow class is gone |
+| S3-13 | Candle docs quantized loading | 59.2 Pass (day-2 rerun) | 257.2 death | 59.5 | Miss â€” 10 tool rounds (web_search/fetch, file_search/read_file, one run_command), none wrong, budget exhausted before an answer |
+| S5-19 | Workstation audit + report | 47.1 Fail | 395.1 death | 309.1 | Pass â€” Desktop `report.md`: summary/findings/recommendations, top-5 processes with pids (post-respawn llama-server 1.3 GB), all four drives, battery, uptime; GPU honestly flagged unavailable with a manual-workaround recommendation |
+| S5-20 | IGRIS self-analysis + report | 106.6 Miss | 62.8 death | 103.4 | Miss â€” reachability is fixed (all 10 rounds spent reading the real repo), but the round budget exhausted before any report was written; git tree stayed clean as demanded |
+
+### Ground truth used for grading
+
+- llama.cpp latest release: GitHub API â€” `v1.0.0`, published 2026-11-13.
+- Rust latest stable: GitHub API â€” `1.100.0`, published 2026-11-12.
+- Downloads duplicates: independently re-hashed (SHA-256, all 35 top-level files) â€” exactly
+  one group of 2, matching S2-8C's report byte-for-byte in names, sizes and hash prefix.
+
+This run also **closes the day-2 discrepancy note** ("Rust 1.100.0 in test 18 vs 1.99.1 in
+S3-10"): 1.100.0 is correct; day-2's 1.99.1 was the artifact.
+
+### C-run totals
+
+- 8 tests, 14.2 min wall (855.8 s timed). Verdicts: **4 pass / 1 partial / 3 miss**.
+- Every miss is the **10-round tool cap** (S3-11C, S3-13C, S5-20C) â€” zero infrastructure
+  deaths, zero context overflows, zero argument-shape flails. P3 item 9 (planner round
+  budget) now has four data points: S4-15F, S3-11C, S3-13C, S5-20C.
+- Comparison with day-2 on the same 8 tests: 2 pass / 2 partial / 4 fail-or-miss â†’
+  4 pass / 1 partial / 3 miss, with the three misses now bounded (they fail in ~1â€“3.5 min
+  with an explicit gave-up line instead of rambling to the token cap).
+- Completed passes are faster than day-2's bests: S2-9 92 â†’ 28.8 s, S3-10 225.5 â†’ 40.1 s,
+  S3-12 65.2 (Fail) â†’ 47.1 (Pass) â€” fewer wasted rounds now that argument shapes work the
+  first time and web payloads no longer overflow the context.
+
+### Side effects on the machine
+
+- Created: `~/Desktop/IgrisReport/system_report.txt` (S2-9C), `~/Desktop/report.md` (S5-19C).
+- Unchanged: repo git tree clean (S5-20C wrote no source/report files); the duplicate pair
+  in Downloads still present (nothing deleted); day-2 leftovers untouched.
+- Chrome was opened by S3-10C (open_app); it was already running beforehand.
