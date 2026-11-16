@@ -745,3 +745,84 @@ Notes:
 U1 verdicts this closes: "empty the recycle bin" is now a real capability (was an
 honest miss), and the bin is visible to the model (roadmap item 2). Remaining from
 that roadmap: browser targeting for open_url/play_song.
+## P3 item 9 - task-class round budget + github_repo_info (2026-11-17)
+
+Shipped in commit `b0c8819` (core: task-class budget with delivery deadlines
+and github_repo_info); gate 455 passed / 0 failed / 1 ignored (+13 tests:
+6 in budget.rs, 4 in web.rs, 3 in llm.rs). Closes plan P3 item 9's round-budget
+scope, which had stayed deferred with four data points (S4-15F, S3-11C,
+S3-13C, S5-20C) - every one a miss by the 10-round cap exhausting before any
+deliverable.
+
+### What changed
+
+- New `crates/igris-core/src/budget.rs`: every agent turn classifies its
+  newest user utterance into a task class - Simple (default and benchmark
+  baseline), Research (web asks), Report (file-deliverable asks) - by cheap
+  keyword matching with a safe bias: Report is the loosest class, so a false
+  match only adds headroom, and only Report raises the round cap (12).
+  Caps: Simple 10 rounds / 12 tool calls / 4 web calls, Research 10/24/6,
+  Report 12/32/8. Simple's max_rounds must equal the historical
+  MAX_TOOL_ITERATIONS (asserted by test), so unclassified turns behave
+  exactly as the whole measured suite.
+- Delivery-deadline notices (the actual anti-investigation-to-the-wall
+  mechanism): at 2 rounds left and at the last round, a BUDGET user message
+  is injected into history once each, telling the model to stop gathering
+  and deliver.
+- Deterministic budget refusals: a call past the web budget or the tool-call
+  budget gets an error tool_result without running (phase Invalid), so a
+  spent turn can never page-stream its context into an overflow.
+- Stop-retrying-after-definitive-unsupported-error: a tool that returns an
+  error starting with the new `unsupported: ` marker is blocked for the rest
+  of the turn; the first block adds one corrective note. Two sites marked:
+  power_mode (plan not in powercfg /list) and set_volume (no default audio
+  device). Non-prefixed errors never block.
+- `github_repo_info`: one public GitHub repository's facts (description,
+  language, stars, forks, open issues, license, default branch, last push,
+  latest release) straight from the GitHub REST API - deterministic data for
+  framework/library comparison and version questions, no page fetch. It is
+  deliberately NOT counted as a web tool (small structured payload; counts
+  against the tool-call budget only). owner/name is charset-validated
+  (A-Za-z0-9._- per segment) so path injection dies at parse time; the
+  /releases/latest hop is best-effort.
+- AgentTurnEnd::Exhausted now carries the round count, and the CLI's
+  gave-up message prints the task's real cap instead of the old constant.
+
+### Live re-run of the four data points (bench2 driver, B-suffixed ids)
+
+Same prompts as the C-run, llama-server reused on :8081. Wall (C-run -> B-run):
+
+| Id | Prompt shape | Wall | Verdict | Evidence |
+|----|--------------|------|---------|----------|
+| S3-11B | 3 Rust AI frameworks + comparison report on Desktop | 206.0 -> 350.9 | Miss -> **Pass** (delivered) | `~/Desktop/Rust_AI_Framework_Comparison.md` (1811 B, real file). 4 github_repo_info + 4 web_search calls; the model echoed the deadline notice in its reasoning ("I have 2 tool rounds left and must deliver now") and wrote the file instead of giving up at round 10. Honest gaps: its third candidate (`ml-rust/ml-rust`) 404ed and the report says so instead of inventing stars. |
+| S3-13B | Candle docs + quantized model loading | 59.5 -> 78.6 | Miss -> **Pass** (answered) | 7 tool calls (search, 2 fetches, local file checks) then a structured answer: correct formats (safetensors/npz/ggml), llama.cpp quantized types, quantized_qwen2/quantized_t5 module names; the blocked doc page honestly reported as rate-limited. Notices never needed (finished before round 8). |
+| S5-20B | IGRIS self-analysis + optimization report | 103.4 -> 314.0 | Miss -> **Miss** (different cause now) | 12 rounds ran (Report cap honored, up from 10), 9 honest investigation rounds (16 calls incl. parallel batches) - then two context overflows (rounds 10, 11) compacted the accumulated evidence out of history; round 10 and the final round 12 (80 s + 91 s of streaming) released no text at all. No report file written; git tree stayed clean (as demanded). The round cap is no longer the binding constraint here - the budget did NOT flip this one. |
+| S4-15B | IGRIS architecture report | n/a (F-run miss) -> 229.4 | Miss -> **Pass** (delivered) | `architecture_report.md` (2794 B) at the workspace root: entry point (igris-cli main.rs), LLM implementation (llm.rs, LFM3-1.7B), registry (registry.rs with the 5 s budget table), request flow, key-file table - all five asked components. 10 investigation rounds + write at round 11. |
+
+3 of 4 flipped. Side effects: the two report files above; S4-15B's file is a
+new untracked file in the repo root (the prompt asked for the workspace's
+architecture report - noted, kept out of git).
+
+### github_repo_info direct probe
+
+One-shot ask for huggingface/candle through the CLI: Stars 21,339 / Forks
+1,873 - one star above what S3-11B's run had seen an hour earlier (21,338),
+i.e. live API data, not cache. The latest-release line is absent when the
+/releases/latest hop fails (best-effort by design); the readback stays
+complete without it.
+
+### Observations
+
+- The deadline notices are what flipped S3-11B: the transcript shows the
+  model quoting the 2-rounds-left notice verbatim in its reasoning and
+  pivoting to write_file the same round. S3-13B never reached its notices.
+- S5-20B's residual failure is a compaction-eats-evidence problem, not a
+  budget problem: the investigation is real (16 correct calls) but two
+  overflows drop it, and the final round burned 91 s on a reply that
+  released nothing (think-span + an envelope that never parsed -> Final with
+  empty text). A future fix belongs to compaction (keep the BUDGET notices
+  and a running evidence digest), not to more rounds.
+- Round-11's [tools] line is missing from S5-20B's captured stdout while the
+  err log shows its dispatch (1 call, 23 ms); all other rounds print. Read
+  as a stdout capture artifact, not a dispatch difference - err's timing
+  lines are authoritative for what ran.

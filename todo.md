@@ -470,6 +470,26 @@ vendoring was rejected; see v1.2).
         Explorer 0, 9 unrelated files untouched) - cross-process
         arm->execute worked first try for both pairs. Evidence:
         benchmark.md V-series 2026-11-17.
+  - [x] Task-class round budget (plan P3 item 9) - DONE 2026-11-17
+        (commit `b0c8819`): `budget.rs` classifies each turn Simple /
+        Research / Report by keyword with a safe bias (misclassification
+        only loosens; Simple keeps the historical 10-round default) and
+        caps rounds / tool calls / web calls (Simple 10/12/4,
+        Research 10/24/6, Report 12/32/8). Delivery-deadline notices are
+        injected at 2-rounds-left and last-round (once each); spent web
+        or tool-call budgets give deterministic refusal tool_results;
+        tools that report a definitive `unsupported: ` error are blocked
+        for the rest of the turn (power_mode plan-missing, no default
+        audio device). New `github_repo_info` (GitHub REST, not
+        web-budgeted) gives deterministic repo facts. Gate 455/0/1
+        (+13 tests). Live re-run of the four cap-exhaustion data points:
+        S3-11 Miss -> delivered Desktop comparison file via
+        github_repo_info; S3-13 Miss -> answer delivered in ~7 rounds;
+        S4-15 Miss -> architecture_report.md written; S5-20 Miss ->
+        still a miss (12 rounds ran, two context overflows compacted the
+        investigation away, final round released nothing) - the round
+        cap is no longer the binding constraint there. Evidence:
+        benchmark.md P3 item 9 section 2026-11-17.
   - [ ] Browser targeting (U1 probe remainder): optional `browser`
         argument for `open_url`/`play_song` so "in Brave" is capability,
         not registry luck (https UserChoice missing on the benchmark host,
