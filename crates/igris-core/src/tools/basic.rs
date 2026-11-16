@@ -269,6 +269,40 @@ fn app_candidates(app: &str) -> Option<Vec<String>> {
     Some(candidates)
 }
 
+/// Chrome launches into its profile picker when several profiles exist
+/// and the command line pins none — the user then sees a selector, not
+/// the usable browser `open_app` claims to have launched (observed on
+/// the benchmark host, S3-10 family). Pick the profile Chrome itself
+/// used last, from its own Local State. Pure over the file's text so
+/// the JSON shape is testable hermetically.
+fn chrome_profile_dir(local_state: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(local_state).ok()?;
+    v.get("profile")?.get("last_used")?.as_str().and_then(|s| {
+        (!s.is_empty()).then(|| s.to_string())
+    })
+}
+
+/// The launch arguments that open Chrome straight into a usable
+/// window: the last-used profile (falling back to the classic Default
+/// profile when Local State is unreadable) and no first-run wizard.
+fn chrome_launch_args() -> Vec<String> {
+    let dir = std::env::var("LOCALAPPDATA")
+        .ok()
+        .and_then(|l| {
+            std::fs::read_to_string(
+                std::path::PathBuf::from(l)
+                    .join(r"Google\Chrome\User Data\Local State"),
+            )
+            .ok()
+        })
+        .and_then(|s| chrome_profile_dir(&s))
+        .unwrap_or_else(|| "Default".to_string());
+    vec![
+        "--no-first-run".to_string(),
+        format!("--profile-directory={dir}"),
+    ]
+}
+
 /// Spawns the GUI process detached (the Child handle is dropped, the app
 /// keeps running). Note for tests: no unit test dispatches an allowed
 /// name ΓÇö actually launching an app is Phase 5 e2e territory.
@@ -282,7 +316,13 @@ pub(crate) fn run_open_app(args: &Value) -> Result<String, String> {
     };
     let mut last_err = String::new();
     for candidate in candidates {
-        match std::process::Command::new(&candidate).spawn() {
+        let mut cmd = std::process::Command::new(&candidate);
+        if app == "chrome" {
+            for a in chrome_launch_args() {
+                cmd.arg(a);
+            }
+        }
+        match cmd.spawn() {
             Ok(_child) => return Ok(format!("Launched {app}.")),
             Err(e) => last_err = format!("{candidate}: {e}"),
         }
@@ -555,6 +595,25 @@ mod tests {
             .dispatch("open_app", &json!({"app": "terminal"}))
             .unwrap_err();
         assert!(err.contains("not an allowed app"), "{err}");
+    }
+
+    #[test]
+    fn chrome_profile_dir_reads_last_used_else_falls_back() {
+        assert_eq!(
+            chrome_profile_dir(r#"{"profile":{"last_used":"Profile 1"}}"#).as_deref(),
+            Some("Profile 1")
+        );
+        /* this host's real shape */
+        assert_eq!(
+            chrome_profile_dir(r#"{"profile":{"last_used":"Default"}}"#).as_deref(),
+            Some("Default")
+        );
+        /* missing, empty or broken Local State -> caller falls back to
+         * "Default"; never an empty --profile-directory= */
+        assert!(chrome_profile_dir("{}").is_none());
+        assert!(chrome_profile_dir(r#"{"profile":{"last_used":""}}"#).is_none());
+        assert!(chrome_profile_dir("not json").is_none());
+        assert!(chrome_profile_dir(r#"{"profile":"notanobject"}"#).is_none());
     }
 
     #[test]
