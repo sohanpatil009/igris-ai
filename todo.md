@@ -453,16 +453,27 @@ vendoring was rejected; see v1.2).
         fan-out now bounded at 4 at a time with global call order kept
         (7-call peak test). Live probe T1: 5 calls in one round at
         236 ms, timing marker `over 5 call(s) parallel`.
-  - [ ] Recycle-bin control + browser targeting (U1 real-world probe,
-        2026-11-16): `empty_recycle_bin` gated arm-confirm (shell folder
-        `shell:::{645FF040-5081-101B-9F08-00AA002F954E}` +
-        SHFileOperationW/IFileOperation) plus a way to list bin contents
-        (delete_file only moves INTO the bin; run_command is cargo/git-only -
-        U1 model hunted 5 rounds then honestly reported failure, bin
-        unchanged at 39 items); optional `browser` argument for
-        `open_url`/`play_song` so "in Brave" is capability, not registry
-        luck (https UserChoice missing on the benchmark host, fallback hit
-        Brave while http defaults to Firefox).
+  - [x] Recycle-bin control - DONE 2026-11-17 (commit `5acfaa9`, probes
+        V1-V3): `recycle_bin` (ungated read-only indexed listing, newest
+        first) + `empty_recycle_bin` (gated arm-confirm; action=delete with
+        1-based indices from the listing, action=empty for all).
+        Enumeration/deletion is plain std::fs over the bin's own $I/$R
+        metadata pairs across every drive's $Recycle.Bin\<SID> - no COM
+        data path; the only unsafe code is the SHChangeNotify
+        view-refresh nudge. Only paired entries are listed (55 $I files ->
+        39 paired = Explorer's count, validated live); orphan $I remnants
+        are swept by action=empty; unindexed files in the bin folders are
+        counted in readbacks, never touched. Gate 442 passed / 0 failed /
+        1 ignored (+15 tests). Live probes: V1 listing (42 rows rendered
+        correctly), V2/V2B index-1 delete (42 -> 41, payload verified
+        gone), V3/V3B full empty (41 deleted + 16 metadata remnants swept,
+        Explorer 0, 9 unrelated files untouched) - cross-process
+        arm->execute worked first try for both pairs. Evidence:
+        benchmark.md V-series 2026-11-17.
+  - [ ] Browser targeting (U1 probe remainder): optional `browser`
+        argument for `open_url`/`play_song` so "in Brave" is capability,
+        not registry luck (https UserChoice missing on the benchmark host,
+        fallback hit Brave while http defaults to Firefox).
 - [ ] Optional someday: WASM/MCP plugin bridge (`zeroclaw-plugins`) — only
       as an `mcp_tool` client tenant type, never a dependency of the core
 

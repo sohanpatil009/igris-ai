@@ -692,3 +692,56 @@ stopping at the first definitive "not supported" signal.
 3. Browser targeting for open_url/play_song - optional browser argument that spawns the
    named browser with the URL as argv, so "in Brave" becomes a capability instead of a
    registry accident.
+
+## 2026-11-17 - V-series: recycle-bin listing and gated emptying (U1 follow-up)
+
+Commit 5acfaa9 (core: add recycle-bin listing and gated empty_recycle_bin) closes the
+U1 bin gap with two tools:
+
+- recycle_bin - ungated, read-only: one line per item with a 1-based index, original
+  name, size, deletion time and original location, newest first (listing capped at 200).
+- empty_recycle_bin - gated arm-then-confirm like delete_file: action=delete removes
+  just the listed indices, action=empty removes every item.
+
+Implementation shape (details in crate::tools::recycle):
+
+- Enumeration and deletion are plain std::fs over the bin's own $I/$R metadata format
+  (v1 fixed 260-wchar buffer, v2 u32-length UTF-16), walked across every drive's
+  $Recycle.Bin\<SID> folder. No COM for the data path; the only unsafe code is the
+  post-delete SHChangeNotify(SHCNE_UPDATEDIR) nudge so Explorer bin views refresh.
+- Only paired entries ($I + $R sharing the token) are listed. Live validation on this
+  host: 55 $I files, 39 paired, Explorer's own count exactly 39. Orphan $I files are
+  invisible remnants Explorer never counts; action=empty sweeps them. Unindexed files
+  in the bin folders (orphan $R payloads, MZ-header binaries parked there) are counted
+  in readbacks and never touched.
+- Plan and executor each re-enumerate from scratch: the confirmation names exactly
+  what will go, drift becomes honest per-item failure, never a silent skip.
+- 15 new hermetic tests (fake bin trees; real-bin paths assert error handling only,
+  never arm). Gate: 442 passed / 0 failed / 1 ignored.
+
+### Live probes (V family, bench2 driver, llama-server reused on :8081)
+
+Bin counts taken fresh around each probe: three gated_e2e doomed.txt entries had grown
+the bin 39 -> 42 between the U1 recon and these runs.
+
+| Id | Ask | Wall | Behavior | External check |
+|----|-----|------|----------|----------------|
+| V1 | List everything that is in the recycle bin with index numbers. | 180.5 s | One recycle_bin call; the model re-rendered all 42 rows as a Markdown table (split into two parts, no truncation); indices, sizes, deletion times and original paths match the tool output. | Explorer count 42 before and after (read-only). |
+| V2 | Delete recycle bin item index 1 permanently. | 23.3 s | recycle_bin, then empty_recycle_bin action=delete indices=[1]: armed, NOT EXECUTED; the confirmation named the exact item (doomed.txt, 6 B, deleted 00:14:07, from D:\Temp\igris_gated_recycle_14328_700307500). | Arm only; bin still 42. |
+| V2B | Identical prompt, fresh IGRIS process. | 37.0 s | Identical re-call matched the cross-process pending and executed: permanently deleted 1 item, bin now holds 41. | Explorer 42 -> 41; that doomed.txt payload dir and its $I/$R pair gone. |
+| V3 | Empty the entire recycle bin. | 20.4 s | recycle_bin (41 items), then empty_recycle_bin action=empty: armed, NOT EXECUTED; confirmation named all 41 items, 1.6 GB total. | Arm only; bin still 41. |
+| V3B | Identical prompt, fresh IGRIS process. | 21.7 s | Executed: emptied the bin - 41 items permanently deleted, 16 unindexed metadata remnants removed, 9 unrelated files in the bin folders left untouched, bin now holds 0. | Explorer count 0; every $I file gone across all four drives' SID folders (16 orphans swept); 3 orphan $R payloads + 6 MZ-header binaries still on disk, untouched. |
+
+Notes:
+
+- Both cross-process arm -> execute pairs (V2/V2B, V3/V3B) worked first try: the fresh
+  process reproduced identical tool + args, so no re-arm retry was needed.
+- Each execute round re-lists the bin first (recycle_bin) - one extra tool round per
+  confirm in a fresh process; V1's 180 s vs V3B's 22 s shows the table render, not the
+  tool, dominates listing cost.
+- Activity log carries the executed empty_recycle_bin entries verbatim; pending store
+  empty after the runs; no stale pendings.
+
+U1 verdicts this closes: "empty the recycle bin" is now a real capability (was an
+honest miss), and the bin is visible to the model (roadmap item 2). Remaining from
+that roadmap: browser targeting for open_url/play_song.
