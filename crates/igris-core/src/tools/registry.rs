@@ -604,6 +604,7 @@ mod tests {
                 "power_mode",
                 "read_file",
                 "reminder_set",
+                "replace_file",
                 "run_command",
                 "screenshot",
                 "set_volume",
@@ -611,7 +612,9 @@ mod tests {
                 "shutdown_abort",
                 "sys_stats",
                 "web_fetch",
-                "web_search"
+                "web_search",
+                "workspace_info",
+                "write_file"
             ]
         );
     }

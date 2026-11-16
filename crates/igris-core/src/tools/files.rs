@@ -2,6 +2,7 @@
 //! list_dir + content_search (breadth-first bounded walk with skip
 //! lists for dependency trees and nested git clones).
 
+use crate::tools::gated::check_protected;
 use crate::tools::shared::{expand_home_path, fmt_bytes, home_dir_string, optional_u64, required_str};
 use serde_json::Value;
 use std::fs;
@@ -219,6 +220,243 @@ pub(crate) fn run_create_folder(args: &Value) -> Result<String, String> {
     fs::create_dir_all(&path)
         .map_err(|e| format!("Could not create '{}': {e}", path.display()))?;
     Ok(format!("Created folder: {}", path.display()))
+}
+
+/* ================================================================ */
+/* write_file · replace_file · workspace_info (plan P0)              */
+/*                                                                  */
+/* One write family, two confirmation levels: creating a NEW file    */
+/* under an allowed root is ungated and safe (worst case is a stray  */
+/* text file the user can delete); OVERWRITING an existing file is   */
+/* gated like the other destructive actions — the first call only    */
+/* announces the plan, a confirmed re-call executes it.              */
+/*                                                                  */
+/* Path policy: absolute paths only (or a leading ~), required to    */
+/* live strictly under the user profile, the OS temp directory, or   */
+/* the IGRIS workspace root (see workspace_root). System folders,    */
+/* the exe directory, drive roots and the profile root itself stay   */
+/* protected via gated::check_protected, and executable/script       */
+/* extensions are refused so a write can never manufacture something */
+/* launchable. Content is text, capped at WRITE_FILE_MAX_BYTES.      */
+/* ================================================================ */
+
+/// Content cap per write. A runaway model must not stream megabytes
+/// into a file; no legitimate report comes close to this.
+const WRITE_FILE_MAX_BYTES: usize = 256 * 1024;
+
+/// File extensions that must never be written: anything launchable or
+/// loadable. A text-only write tool only writes text documents.
+const WRITE_DENIED_EXTENSIONS: [&str; 12] =
+    ["exe", "dll", "sys", "msi", "com", "scr", "bat", "cmd", "ps1", "vbs", "js", "lnk"];
+
+/// How a write treats an existing file (see [`validate_write_target`]).
+enum WriteMode {
+    /// Refuse when the target exists — the ungated creator.
+    CreateNew,
+    /// Require the target to exist — the gated replacer.
+    ReplaceExisting,
+}
+
+/// The IGRIS workspace root — "my project" (plan P0): `IGRIS_WORKSPACE`
+/// when it points at a real directory, else the current directory when
+/// it contains a Cargo.toml. `None` when neither holds; workspace_info
+/// explains the situation to the model instead of leaving it guessing
+/// among home directories (benchmark 2026-11-16: S2-7, S4-15, S5-20).
+pub(crate) fn workspace_root() -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os("IGRIS_WORKSPACE") {
+        let p = PathBuf::from(v);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("Cargo.toml").is_file() {
+            return Some(cwd);
+        }
+    }
+    None
+}
+
+/// Normalize a path for case-insensitive Windows comparison: backslash
+/// separators, lowercased, trailing separators trimmed.
+fn normalize_path(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('/', "\\");
+    s.trim_end_matches('\\').to_lowercase()
+}
+
+/// True when `path` may be written: it must live strictly under one of
+/// the allowed roots. Compared on normalized strings with an explicit
+/// separator, so a sibling prefix ("sohan" vs "sohan2") cannot pass.
+fn write_root_allowed(path: &Path) -> bool {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        roots.push(PathBuf::from(home));
+    }
+    roots.push(std::env::temp_dir());
+    if let Some(ws) = workspace_root() {
+        roots.push(ws);
+    }
+    let target = normalize_path(path);
+    if target.is_empty() {
+        return false;
+    }
+    roots.iter().any(|r| {
+        let root = normalize_path(r);
+        !root.is_empty() && target != root && target.starts_with(&format!("{root}\\"))
+    })
+}
+
+/// One validated write target: the absolute path and the text to write.
+struct WriteTarget {
+    path: PathBuf,
+    content: String,
+}
+
+/// Validate a write call's arguments against the family policy. Shared
+/// by the ungated creator and the gated replacer so both paths enforce
+/// exactly the same rules; the mode decides how an existing file is
+/// treated. The executor re-validates (plan/run symmetry, TOCTOU-safe
+/// on a single-user machine).
+fn validate_write_target(
+    args: &Value,
+    mode: WriteMode,
+    tool: &str,
+) -> Result<WriteTarget, String> {
+    let raw = required_str(args, "path", tool)?;
+    if raw.trim().is_empty() {
+        return Err("path is empty".into());
+    }
+    let path = PathBuf::from(expand_home_path(raw));
+    if !path.is_absolute() {
+        return Err(format!(
+            "path '{raw}' is relative — give an absolute path (or one starting with ~), \
+             e.g. ~\\Desktop\\report.md; call workspace_info for the allowed roots"
+        ));
+    }
+    let content = required_str(args, "content", tool)?;
+    if content.len() > WRITE_FILE_MAX_BYTES {
+        return Err(format!(
+            "content is too large ({}) — the cap is {} bytes",
+            fmt_bytes(content.len() as u64),
+            WRITE_FILE_MAX_BYTES
+        ));
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext = ext.to_lowercase();
+        if WRITE_DENIED_EXTENSIONS.contains(&ext.as_str()) {
+            return Err(format!(
+                "refusing to write a .{ext} file — this tool writes text documents only"
+            ));
+        }
+    }
+    if path.is_dir() {
+        return Err(format!("'{raw}' is a directory, cannot write a file there"));
+    }
+    match mode {
+        WriteMode::CreateNew => {
+            if path.is_file() {
+                return Err(format!(
+                    "'{raw}' already exists — use the replace_file tool to overwrite it"
+                ));
+            }
+        }
+        WriteMode::ReplaceExisting => {
+            if !path.is_file() {
+                return Err(format!(
+                    "'{raw}' does not exist — use write_file to create a new file"
+                ));
+            }
+        }
+    }
+    check_protected(&path)
+        .map_err(|e| e.replace("deleted", "written"))?;
+    if !write_root_allowed(&path) {
+        return Err(format!(
+            "'{raw}' is outside the writable roots — write under the user profile ({}), \
+             the OS temp directory ({}), or the IGRIS workspace root (see workspace_info)",
+            std::env::var("USERPROFILE").unwrap_or_else(|_| "(unknown)".into()),
+            std::env::temp_dir().display()
+        ));
+    }
+    Ok(WriteTarget {
+        path,
+        content: content.to_string(),
+    })
+}
+
+/// Create missing parents, write the bytes, and report honestly.
+fn perform_write(target: &WriteTarget, replaced: bool) -> Result<String, String> {
+    if let Some(parent) = target.path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Could not create the parent folder for {}: {e}",
+                target.path.display()
+            )
+        })?;
+    }
+    let old_len = if replaced {
+        Some(fs::metadata(&target.path).map(|m| m.len()).unwrap_or(0))
+    } else {
+        None
+    };
+    fs::write(&target.path, &target.content)
+        .map_err(|e| format!("Could not write {}: {e}", target.path.display()))?;
+    let n = target.content.len();
+    Ok(match old_len {
+        Some(old) => format!(
+            "Replaced {} — {} written (was {}).",
+            target.path.display(),
+            fmt_bytes(n as u64),
+            fmt_bytes(old)
+        ),
+        None => format!(
+            "Wrote {} to {} (created).",
+            fmt_bytes(n as u64),
+            target.path.display()
+        ),
+    })
+}
+
+pub(crate) fn run_write_file(args: &Value) -> Result<String, String> {
+    let target = validate_write_target(args, WriteMode::CreateNew, "write_file")?;
+    perform_write(&target, false)
+}
+
+/// Plan (validator + narrator) for the gated overwrite: the executor
+/// re-validates everything below before touching disk.
+pub(crate) fn plan_replace_file(args: &Value) -> Result<String, String> {
+    let target = validate_write_target(args, WriteMode::ReplaceExisting, "replace_file")?;
+    let old = fs::metadata(&target.path).map(|m| m.len()).unwrap_or(0);
+    Ok(format!(
+        "Overwrite {} ({}) with {} of new text. The old contents are gone for good.",
+        target.path.display(),
+        fmt_bytes(old),
+        fmt_bytes(target.content.len() as u64)
+    ))
+}
+
+pub(crate) fn run_replace_file(args: &Value) -> Result<String, String> {
+    let target = validate_write_target(args, WriteMode::ReplaceExisting, "replace_file")?;
+    perform_write(&target, true)
+}
+
+pub(crate) fn run_workspace_info(_args: &Value) -> Result<String, String> {
+    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "(unknown)".into());
+    let mut out = format!(
+        "Writable roots for file tools: the user profile ({home}) and the OS temp directory ({}).",
+        std::env::temp_dir().display()
+    );
+    match workspace_root() {
+        Some(ws) => out.push_str(&format!(
+            "\nWorkspace root: {}\nTasks that mention 'my project' or 'the IGRIS project' mean this directory.",
+            ws.display()
+        )),
+        None => out.push_str(
+            "\nNo workspace root is configured — set the IGRIS_WORKSPACE environment \
+             variable or run igris-ai from a directory containing Cargo.toml.",
+        ),
+    }
+    Ok(out)
 }
 
 
@@ -832,5 +1070,140 @@ mod tests {
     }
 
     /* ---- run_command ---- */
+
+    /* ---- write_file / replace_file / workspace_info (plan P0) ---- */
+
+    #[test]
+    fn write_file_creates_file_and_parents() {
+        let root = temp_root("wf_create");
+        let target = root.join("sub").join("report.txt");
+        let out = reg()
+            .dispatch(
+                "write_file",
+                &json!({"path": target.to_string_lossy(), "content": "hello world"}),
+            )
+            .unwrap();
+        assert!(out.contains("Wrote 11 B"), "{out}");
+        assert!(out.contains("(created)"), "{out}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "hello world");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn write_file_refuses_existing_file_untouched() {
+        let root = temp_root("wf_exists");
+        let f = root.join("dup.txt");
+        fs::write(&f, "old").unwrap();
+        let err = reg()
+            .dispatch(
+                "write_file",
+                &json!({"path": f.to_string_lossy(), "content": "new"}),
+            )
+            .unwrap_err();
+        assert!(err.contains("replace_file"), "{err}");
+        assert_eq!(fs::read_to_string(&f).unwrap(), "old");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn write_file_rejects_relative_paths_and_bad_args() {
+        let root = temp_root("wf_args");
+        /* content is required */
+        assert!(reg()
+            .dispatch(
+                "write_file",
+                &json!({"path": root.join("a.txt").to_string_lossy()})
+            )
+            .is_err());
+        /* relative paths are refused outright: they would resolve
+         * against an unpredictable working directory */
+        let err = reg()
+            .dispatch("write_file", &json!({"path": "report.txt", "content": "x"}))
+            .unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+        /* oversize content */
+        let big = "x".repeat(256 * 1024 + 1);
+        let err = reg()
+            .dispatch(
+                "write_file",
+                &json!({"path": root.join("big.txt").to_string_lossy(), "content": big}),
+            )
+            .unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        /* launchable file types are refused */
+        let err = reg()
+            .dispatch(
+                "write_file",
+                &json!({"path": root.join("run.bat").to_string_lossy(), "content": "x"}),
+            )
+            .unwrap_err();
+        assert!(err.contains(".bat"), "{err}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn write_file_accepts_forward_slash_paths() {
+        let root = temp_root("wf_slash");
+        let target = root.join("slash.txt");
+        let forward = target.to_string_lossy().replace('\\', "/");
+        reg()
+            .dispatch("write_file", &json!({"path": forward, "content": "ok"}))
+            .unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "ok");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn replace_file_plans_then_replaces() {
+        let root = temp_root("rf_plan");
+        let f = root.join("report.md");
+        /* direct plan/run calls (never reg().dispatch) so the global
+         * pending store is not polluted with an armed action */
+        assert!(
+            plan_replace_file(&json!({"path": f.to_string_lossy(), "content": "new"})).is_err()
+        );
+        fs::write(&f, "old content").unwrap();
+        let plan =
+            plan_replace_file(&json!({"path": f.to_string_lossy(), "content": "new"})).unwrap();
+        assert!(plan.contains("Overwrite"), "{plan}");
+        assert!(plan.contains("11 B"), "{plan}");
+        let out =
+            run_replace_file(&json!({"path": f.to_string_lossy(), "content": "new"})).unwrap();
+        assert!(out.contains("Replaced"), "{out}");
+        assert!(out.contains("was 11 B"), "{out}");
+        assert_eq!(fs::read_to_string(&f).unwrap(), "new");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn write_root_allowed_scopes() {
+        let home = PathBuf::from(home_dir_string());
+        /* strictly under an allowed root */
+        assert!(write_root_allowed(&home.join("Desktop").join("x.txt")));
+        assert!(write_root_allowed(&std::env::temp_dir().join("x.txt")));
+        /* the roots themselves are not writable targets */
+        assert!(!write_root_allowed(&home));
+        assert!(!write_root_allowed(&std::env::temp_dir()));
+        /* drive roots are outside every allowed root */
+        assert!(!write_root_allowed(&PathBuf::from("C:\\")));
+        /* the sibling-prefix trap: sohan2 is NOT under sohan */
+        let sibling = home
+            .parent()
+            .unwrap_or(&home)
+            .join(format!(
+                "{}2",
+                home.file_name().and_then(|n| n.to_str()).unwrap_or("x")
+            ));
+        assert!(!write_root_allowed(&sibling));
+    }
+
+    #[test]
+    fn workspace_info_reports_the_roots() {
+        /* cargo runs tests with the package root as cwd, which contains
+         * a Cargo.toml, so a workspace root always resolves here */
+        let out = reg().dispatch("workspace_info", &json!({})).unwrap();
+        assert!(out.contains("Workspace root:"), "{out}");
+        assert!(out.contains("user profile"), "{out}");
+    }
 
 }

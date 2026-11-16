@@ -169,11 +169,62 @@ pub fn tools_protocol_block(specs: &[ToolSpec]) -> String {
     for spec in sorted {
         let _ = writeln!(
             s,
-            "**{}**: {}\nParameters: `{}`\n",
-            spec.name, spec.description, spec.parameters_schema
+            "**{}**: {}\nCall arguments: `{}`\n",
+            spec.name,
+            spec.description,
+            compact_args_example(&spec.parameters_schema)
         );
     }
     s
+}
+
+/// One compact example of a tool's call arguments, rendered from its
+/// JSON schema. Live evidence (benchmark 2026-11-15/16): the model reads
+/// a raw schema dump as DATA to echo back ("properties.app") and burns
+/// 2-4 rounds repairing the shape; a single canonical example removes
+/// the ambiguity. Required keys come first (schema/BTreeMap order among
+/// equals), then the optional ones.
+fn compact_args_example(schema: &Value) -> String {
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return "{}".to_string();
+    };
+    let required: std::collections::HashSet<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut entries: Vec<(bool, usize, &String)> = props
+        .keys()
+        .enumerate()
+        .map(|(i, k)| (required.contains(k.as_str()), i, k))
+        .collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let parts: Vec<String> = entries
+        .into_iter()
+        .map(|(_, _, k)| format!("\"{k}\": {}", placeholder_for(&props[k])))
+        .collect();
+    format!("{{{}}}", parts.join(", "))
+}
+
+/// The example value for one schema property: enum values joined with
+/// '|' inside a quoted string, strings as "...", numbers as 0,
+/// booleans as false, arrays as [], objects as {}. Unknown/absent types
+/// fall back to a string placeholder (the least surprising example for
+/// an LLM).
+fn placeholder_for(schema: &Value) -> String {
+    if let Some(vals) = schema.get("enum").and_then(Value::as_array) {
+        let joined: Vec<&str> = vals.iter().filter_map(Value::as_str).collect();
+        if !joined.is_empty() {
+            return format!("\"{}\"", joined.join("|"));
+        }
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("integer") | Some("number") => "0".to_string(),
+        Some("boolean") => "false".to_string(),
+        Some("array") => "[]".to_string(),
+        Some("object") => "{}".to_string(),
+        _ => "\"...\"".to_string(),
+    }
 }
 
 /// Tools are always on (open decision 4, resolved 2026-11-13); the
@@ -204,6 +255,12 @@ pub fn system_prompt_with_tools(base: &str, tools_on: bool) -> String {
 pub const MAX_TOOL_ITERATIONS: usize = 10;
 /// Malformed tool-call retries per turn (ZeroClaw's number).
 pub const MAX_MALFORMED_RETRIES: usize = 2;
+/// Token-cap continuations per turn (plan P1): a reply the server
+/// stopped at `finish_reason == "length"` with zero tool calls is a
+/// mid-sentence fragment, not an answer; one corrective continuation
+/// is allowed before the fragment becomes the (honest, capped) final
+/// reply instead of looping forever.
+pub const MAX_LENGTH_CONTINUATIONS: usize = 1;
 
 /// Loop bookkeeping for one agent turn: the iteration budget, the
 /// malformed-retry budget, and the validation-streak escalation (v3
@@ -223,6 +280,11 @@ pub struct AgentLoopState {
     /// noise (the prose is the answer), before one it is a failed tool
     /// attempt that must not silently become the final reply.
     pub executed_any: bool,
+    /// Token-cap continuations used this turn (plan P1): a reply the
+    /// server stopped at `finish_reason == "length"` with zero tool
+    /// calls is a mid-sentence fragment, not an answer; see
+    /// [`AgentLoopState::truncation_verdict`].
+    pub continuations: usize,
 }
 
 impl AgentLoopState {
@@ -232,6 +294,7 @@ impl AgentLoopState {
             retries: 0,
             invalid_streak: 0,
             executed_any: false,
+            continuations: 0,
         }
     }
 
@@ -294,6 +357,29 @@ impl AgentLoopState {
              cannot be dispatched here. Reply with exactly one JSON object \
              inside one tool-call tag pair, naming one of your available \
              tools, or answer in plain words."
+                .to_string(),
+        )
+    }
+
+    /// Verdict for a zero-call reply whose stream ended at the token cap
+    /// (`finish_reason == "length"`, plan P1). Live evidence (benchmark
+    /// 2026-11-16, S5-19 twice): the fragment streamed to the user as if
+    /// it were the final answer, mid-sentence, with the requested report
+    /// never produced. Checked AFTER the malformed and DSML verdicts in
+    /// the zero-calls path â€” a cut-off envelope is a parse issue first.
+    /// One corrective continuation per turn (`MAX_LENGTH_CONTINUATIONS`);
+    /// after that the fragment becomes the final reply so the turn stays
+    /// bounded.
+    pub fn truncation_verdict(&mut self, stop: Option<&str>) -> Option<String> {
+        if stop != Some("length") || self.continuations >= MAX_LENGTH_CONTINUATIONS {
+            return None;
+        }
+        self.continuations += 1;
+        Some(
+            "Your last response was cut off by the length limit before it finished. \
+             Continue exactly where it stopped: if a tool call was pending, emit the \
+             complete tool-call envelope now; otherwise end the answer in a few words. \
+             Do not repeat text you already wrote."
                 .to_string(),
         )
     }
@@ -408,6 +494,114 @@ pub fn dedup_tool_calls(calls: Vec<toolparse::ParsedToolCall>) -> Vec<toolparse:
     unique
 }
 
+/// What to do when a streamed round fails before producing usable text
+/// (plan P1 recovery ladder). One bounded recovery each for the two
+/// transport-level failure classes; anything else propagates.
+enum RoundRetry {
+    None,
+    /// The prompt outgrew the model context (HTTP 400): shrink the
+    /// middle history and retry the same round once.
+    Compact,
+    /// The connection to llama-server died ("Peer disconnected", etc.,
+    /// benchmark 2026-11-16, S2-7/S2-8): re-spawn the server and retry
+    /// the same round once.
+    Reconnect,
+}
+
+/// Transport-level failures between IGRIS and llama-server â€” the shared
+/// server died or the socket dropped. These warrant ONE
+/// `ensure_server(false)` retry. Deliberately NOT matched by "timed
+/// out": a slow stream is still making progress, and restarting it
+/// would replay the generation from scratch.
+fn is_transport_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    [
+        "peer disconnected",
+        "connection refused",
+        "connection reset",
+        "broken pipe",
+        "os error 10054",
+        "os error 10061",
+    ]
+    .iter()
+    .any(|s| m.contains(s))
+}
+
+/// The server rejected the request outright (HTTP 400): in practice the
+/// rendered prompt outgrew the model context after heavy web rounds
+/// (benchmark 2026-11-16, S3-12/S4-16, reproducible).
+fn is_context_overflow(msg: &str) -> bool {
+    msg.starts_with("llama-server error 400")
+}
+
+/// One-shot recovery for a prompt that outgrew the model context (plan
+/// P1): keep the system seed (0) and the original user request (1)
+/// verbatim, shrink every middle message to a bounded digest, and leave
+/// the last four messages untouched (they hold the round actually in
+/// flight). Bounded no-op when the history is too short to compress
+/// safely.
+pub fn compact_history(history: &mut Vec<Value>) {
+    const COMPACT_KEEP_TAIL: usize = 4;
+    const COMPACT_MIDDLE_CAP: usize = 600;
+    let n = history.len();
+    if n <= 2 + COMPACT_KEEP_TAIL {
+        return;
+    }
+    for i in 2..n - COMPACT_KEEP_TAIL {
+        if let Some(content) = history[i].get("content").and_then(Value::as_str) {
+            let shrunk =
+                crate::tools::truncate_chars(content, COMPACT_MIDDLE_CAP);
+            history[i]["content"] = json!(shrunk);
+        }
+    }
+}
+
+/// One streamed round with protocol hold-back: a fresh StreamFilter,
+/// tokens forwarded to the sink, and the `finish()` tail flushed after
+/// the stream ends (the closure-borrow scope trick: `on_tok` lives in
+/// an inner block so `filter` and `sink` are free again for the tail).
+/// Returns the raw text plus the server-reported stop reason, and
+/// whether the sink cut the stream (barge-in, or a cut tail).
+fn run_stream_round(
+    msgs: &[Value],
+    max_tokens: i64,
+    grammar: Option<&str>,
+    sink: &mut StreamSink,
+) -> (Result<(String, Option<String>), Box<dyn std::error::Error>>, bool) {
+    let mut filter = toolparse::StreamFilter::new();
+    let mut cut = false;
+    let stream = {
+        let mut on_tok = |tok: &str| -> bool {
+            let released = filter.feed(tok);
+            if released.is_empty() {
+                return true;
+            }
+            if (sink.on_released)(&released) {
+                true
+            } else {
+                cut = true;
+                false
+            }
+        };
+        chat_stream(msgs, max_tokens, &mut on_tok, grammar)
+    };
+    /* the first-token latency is terminal-only bookkeeping; the agent
+     * loop cares about the text and the stop reason */
+    let result = stream.map(|(raw, _first_ms, stop)| (raw, stop));
+    let tail_cut = if cut {
+        false
+    } else {
+        match &result {
+            Ok(_) => {
+                let tail = filter.finish();
+                !tail.is_empty() && !(sink.on_released)(&tail)
+            }
+            Err(_) => false,
+        }
+    };
+    (result, cut || tail_cut)
+}
+
 /// Surface callbacks for [`agent_turn`].
 pub struct StreamSink<'a> {
     /// Receives only released text (never a tool envelope, think span, or
@@ -454,28 +648,61 @@ pub fn agent_turn(
     let timed = std::env::var_os("MOON_TIMING").is_some();
     let mut state = AgentLoopState::new();
     while state.next_round() {
-        let msgs = history.clone();
-        let mut filter = toolparse::StreamFilter::new();
-        let mut cut = false;
-        let mut on_tok = |tok: &str| -> bool {
-            let released = filter.feed(tok);
-            if released.is_empty() {
-                return true;
-            }
-            if (sink.on_released)(&released) {
-                true
-            } else {
-                cut = true;
-                false
-            }
-        };
         let grammar_ref: Option<&str> = if constrained {
             grammar.as_deref()
         } else {
             None
         };
         let t_llm = Instant::now();
-        let (raw, _first_ms) = chat_stream(&msgs, max_tokens, &mut on_tok, grammar_ref)?;
+        /* Bounded recovery ladder (plan P1): one compaction retry for a
+         * context overflow, one re-spawn retry for a transport error,
+         * both retrying the SAME round on fresh state. Never a
+         * slow-stream restart â€” a still-generating stream must not be
+         * replayed from scratch. */
+        let mut compacted = false;
+        let mut reconnected = false;
+        let outcome = loop {
+            let msgs = history.clone();
+            let attempt = run_stream_round(&msgs, max_tokens, grammar_ref, sink);
+            let retry = match &attempt.0 {
+                Err(e) => {
+                    let msg = e.to_string();
+                    if is_context_overflow(&msg) && !compacted {
+                        compacted = true;
+                        RoundRetry::Compact
+                    } else if is_transport_error(&msg) && !reconnected {
+                        reconnected = true;
+                        RoundRetry::Reconnect
+                    } else {
+                        RoundRetry::None
+                    }
+                }
+                Ok(_) => RoundRetry::None,
+            };
+            match retry {
+                RoundRetry::Compact => {
+                    if timed {
+                        eprintln!(
+                            "[timing] round {} context overflow â€” compacting history, retrying",
+                            state.rounds
+                        );
+                    }
+                    compact_history(history);
+                }
+                RoundRetry::Reconnect => {
+                    if timed {
+                        eprintln!(
+                            "[timing] round {} transport error â€” re-spawning server, retrying",
+                            state.rounds
+                        );
+                    }
+                    let _ = ensure_server(false);
+                }
+                RoundRetry::None => break attempt,
+            }
+        };
+        let (raw, stop) = outcome.0?;
+        let cut = outcome.1;
         if timed {
             eprintln!(
                 "[timing] round {} llm {}ms",
@@ -498,10 +725,6 @@ pub fn agent_turn(
             }
             return Ok(AgentTurnEnd::Cut);
         }
-        let tail = filter.finish();
-        if !tail.is_empty() && !(sink.on_released)(&tail) {
-            return Ok(AgentTurnEnd::Cut);
-        }
 
         let (_cleaned, calls) = toolparse::parse_tool_calls(&raw);
         if calls.is_empty() {
@@ -517,6 +740,14 @@ pub fn agent_turn(
                 /* first-contact DSML drift: grammar-force the retry so
                  * the native envelope spelling becomes unrepresentable */
                 constrained = true;
+                history.push(json!({"role": "assistant", "content": raw}));
+                history.push(json!({"role": "user", "content": corrective}));
+                continue;
+            }
+            if let Some(corrective) = state.truncation_verdict(stop.as_deref()) {
+                /* token-cap fragment (plan P1): a mid-sentence reply is
+                 * not an answer â€” one corrective continuation, checked
+                 * after the malformed/DSML verdicts */
                 history.push(json!({"role": "assistant", "content": raw}));
                 history.push(json!({"role": "user", "content": corrective}));
                 continue;
@@ -1208,7 +1439,7 @@ pub fn chat_stream(
     max_tokens: i64,
     on_token: &mut impl FnMut(&str) -> bool,
     grammar: Option<&str>,
-) -> Result<(String, u128), Box<dyn std::error::Error>> {
+) -> Result<(String, u128, Option<String>), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let mut body = json!({
         "prompt": render_prompt(messages, true),
@@ -1244,6 +1475,7 @@ pub fn chat_stream(
     let mut reader = resp.into_body().into_reader();
     let mut out = String::new();
     let mut first_ms: Option<u128> = None;
+    let mut stop: Option<String> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 8192];
     'outer: loop {
@@ -1263,6 +1495,12 @@ pub fn chat_stream(
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            /* capture the terminal stop reason (both field spellings
+             * exist across llama.cpp builds) so the agent loop can tell
+             * a natural end from a token-cap truncation (plan P1) */
+            if let Some(reason) = stop_reason_from_chunk(&v) {
+                stop = Some(reason);
+            }
             if let Some(tok) = v["choices"][0]["text"].as_str()
                 && !tok.is_empty()
             {
@@ -1283,7 +1521,20 @@ pub fn chat_stream(
         }
     }
     let first = first_ms.unwrap_or_else(|| t0.elapsed().as_millis());
-    Ok((out, first))
+    Ok((out, first, stop))
+}
+
+/// finish_reason/stop_reason from one SSE completion chunk: raw
+/// /v1/completions chunks spell it `finish_reason`, some builds spell
+/// `stop_reason` â€” capture BOTH so a token-cap cut (`"length"`) is
+/// visible to the agent loop. Null/empty/absent means "no reason yet".
+fn stop_reason_from_chunk(v: &Value) -> Option<String> {
+    let c = &v["choices"][0];
+    c["finish_reason"]
+        .as_str()
+        .or_else(|| c["stop_reason"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /* ================================================================ */
@@ -1359,7 +1610,7 @@ pub fn cmd_chat(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     ensure_server(force_cpu)?;
 
     if !prompt.is_empty() {
-        return stream_persona(&prompt, 512, tools_on);
+        return stream_persona(&prompt, 1024, tools_on);
     }
 
     println!("Type a prompt (empty line or 'exit' to quit):");
@@ -1374,7 +1625,7 @@ pub fn cmd_chat(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if q.is_empty() || q.eq_ignore_ascii_case("exit") || q.eq_ignore_ascii_case("quit") {
             break;
         }
-        if let Err(e) = stream_persona(q, 512, tools_on) {
+        if let Err(e) = stream_persona(q, 1024, tools_on) {
             println!("  error: {e}");
         }
     }
@@ -1443,6 +1694,7 @@ Gated tools: their first call only validates the action and announces the plan Ã
         let pm = block.find("**power_mode**").unwrap();
         let rf = block.find("**read_file**").unwrap();
         let rs = block.find("**reminder_set**").unwrap();
+        let rp = block.find("**replace_file**").unwrap();
         let rc = block.find("**run_command**").unwrap();
         let sc = block.find("**screenshot**").unwrap();
         let sv = block.find("**set_volume**").unwrap();
@@ -1451,6 +1703,8 @@ Gated tools: their first call only validates the action and announces the plan Ã
         let ss = block.find("**sys_stats**").unwrap();
         let wf = block.find("**web_fetch**").unwrap();
         let ws = block.find("**web_search**").unwrap();
+        let wsi = block.find("**workspace_info**").unwrap();
+        let wri = block.find("**write_file**").unwrap();
         assert!(
             c < ca
                 && ca < cs
@@ -1469,7 +1723,8 @@ Gated tools: their first call only validates the action and announces the plan Ã
                 && ou < pm
                 && pm < rf
                 && rf < rs
-                && rs < rc
+                && rs < rp
+                && rp < rc
                 && rc < sc
                 && sc < sv
                 && sv < sd
@@ -1477,11 +1732,18 @@ Gated tools: their first call only validates the action and announces the plan Ã
                 && sda < ss
                 && ss < wf
                 && wf < ws
+                && ws < wsi
+                && wsi < wri
         );
-        // Every entry carries its schema on a Parameters line.
-        assert_eq!(block.matches("Parameters: `").count(), 27);
-        // The calculate tenant's structured schema is advertised.
-        assert!(block.contains("\"required\":[\"function\"]"));
+        // Every entry carries ONE canonical call-arguments example (plan
+        // P0): the raw schema dump made the model echo "properties"
+        // shapes as data (the open_app defect class).
+        assert_eq!(block.matches("Call arguments: `").count(), 30);
+        assert!(!block.contains("\"required\""));
+        assert!(!block.contains("properties"));
+        // The calculate tenant's function enum is enumerated in its
+        // example instead of advertising a schema.
+        assert!(block.contains("\"function\": \"add|subtract|multiply"));
     }
 
     #[test]
@@ -1749,8 +2011,148 @@ Gated tools: their first call only validates the action and announces the plan Ã
         let wrong = r#"{"model_path":"C:\\other\\Qwen2-0.5B.gguf"}"#;
         assert_eq!(parse_props_model_id(wrong).as_deref(), Some("qwen2-0.5b.gguf"));
         /* Foreign/404/garbage bodies carry no identity. */
-        assert_eq!(parse_props_model_id("<html>404</html>"), None);
+        assert_eq!(parse_props_model_id("\x3chtml\x3e404\x3c/html\x3e"), None);
         assert_eq!(parse_props_model_id(r#"{"total_slots":4}"#), None);
         assert_eq!(parse_props_model_id(""), None);
+    }
+
+    /* ---- compact tool catalog + recovery (plan P0/P1) ---- */
+
+    #[test]
+    fn compact_args_example_required_first_and_enums() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "optional cap"},
+                "mode": {"type": "string", "enum": ["fast", "slow"]},
+                "path": {"type": "string"}
+            },
+            "required": ["path"]
+        });
+        /* required keys first (BTreeMap order among equals), enums
+         * joined with '|', integers as 0, strings as "..." */
+        assert_eq!(
+            compact_args_example(&schema),
+            "{\"path\": \"...\", \"limit\": 0, \"mode\": \"fast|slow\"}"
+        );
+    }
+
+    #[test]
+    fn compact_args_example_handles_empty_and_shapeless_schemas() {
+        assert_eq!(
+            compact_args_example(&json!({"type": "object", "properties": {}, "required": []})),
+            "{}"
+        );
+        assert_eq!(compact_args_example(&json!({})), "{}");
+    }
+
+    #[test]
+    fn placeholder_for_covers_the_common_types() {
+        assert_eq!(placeholder_for(&json!({"type": "string"})), "\"...\"");
+        assert_eq!(placeholder_for(&json!({"type": "integer"})), "0");
+        assert_eq!(placeholder_for(&json!({"type": "number"})), "0");
+        assert_eq!(placeholder_for(&json!({"type": "boolean"})), "false");
+        assert_eq!(placeholder_for(&json!({"type": "array"})), "[]");
+        assert_eq!(placeholder_for(&json!({"type": "object"})), "{}");
+        assert_eq!(
+            placeholder_for(&json!({"type": "string", "enum": ["a", "b"]})),
+            "\"a|b\""
+        );
+        /* a non-string enum falls through to the type spelling */
+        assert_eq!(placeholder_for(&json!({"type": "integer", "enum": [1, 2]})), "0");
+    }
+
+    #[test]
+    fn truncation_verdict_allows_one_continuation_per_turn() {
+        let mut s = AgentLoopState::new();
+        let note = s
+            .truncation_verdict(Some("length"))
+            .expect("first token-cap cut must continue");
+        assert!(note.contains("cut off"), "{note}");
+        /* the budget is one: the second cut becomes the (honest) final
+         * reply instead of looping forever */
+        assert!(s.truncation_verdict(Some("length")).is_none());
+        /* other stop reasons are natural ends, never continuations */
+        let mut t = AgentLoopState::new();
+        assert!(t.truncation_verdict(Some("stop")).is_none());
+        assert!(t.truncation_verdict(Some("eos")).is_none());
+        assert!(t.truncation_verdict(None).is_none());
+    }
+
+    #[test]
+    fn compact_history_preserves_seed_and_tail_and_shrinks_middle() {
+        let long = "x".repeat(2000);
+        let mut history = vec![
+            json!({"role": "system", "content": "SYSTEM"}),
+            json!({"role": "user", "content": "USER REQUEST"}),
+            json!({"role": "assistant", "content": long.clone()}),
+            json!({"role": "user", "content": long}),
+            json!({"role": "assistant", "content": "tail one"}),
+            json!({"role": "user", "content": "tail two"}),
+            json!({"role": "assistant", "content": "tail three"}),
+            json!({"role": "user", "content": "tail four"}),
+        ];
+        compact_history(&mut history);
+        assert_eq!(history.len(), 8);
+        assert_eq!(history[0]["content"], "SYSTEM");
+        assert_eq!(history[1]["content"], "USER REQUEST");
+        let middle = history[2]["content"].as_str().unwrap();
+        assert!(middle.contains("[truncated"), "{middle}");
+        assert!(middle.len() < 700, "{}", middle.len());
+        assert_eq!(history[4]["content"], "tail one");
+        assert_eq!(history[5]["content"], "tail two");
+        assert_eq!(history[6]["content"], "tail three");
+        assert_eq!(history[7]["content"], "tail four");
+    }
+
+    #[test]
+    fn compact_history_leaves_short_histories_alone() {
+        let mut history = vec![
+            json!({"role": "system", "content": "S"}),
+            json!({"role": "user", "content": "U"}),
+            json!({"role": "assistant", "content": "x".repeat(5000)}),
+        ];
+        compact_history(&mut history);
+        assert_eq!(history[2]["content"].as_str().unwrap().len(), 5000);
+    }
+
+    #[test]
+    fn transport_and_overflow_matchers() {
+        assert!(is_transport_error("Peer disconnected"));
+        assert!(is_transport_error(
+            "error sending request: Connection refused (os error 10061)"
+        ));
+        assert!(is_transport_error("Broken pipe (os error 109)"));
+        /* a slow stream is NOT a transport error: never restart it */
+        assert!(!is_transport_error("request timed out"));
+        assert!(!is_transport_error("llama-server error 400: too long"));
+        assert!(is_context_overflow(
+            "llama-server error 400: {\"error\":\"the request exceeds the available context size\"}"
+        ));
+        assert!(!is_context_overflow("llama-server error 500: boom"));
+        assert!(!is_context_overflow("Peer disconnected"));
+    }
+
+    #[test]
+    fn stop_reason_from_chunk_reads_both_field_spellings() {
+        assert_eq!(
+            stop_reason_from_chunk(&json!({
+                "choices": [{"text": "x", "finish_reason": "length"}]
+            })),
+            Some("length".to_string())
+        );
+        assert_eq!(
+            stop_reason_from_chunk(&json!({
+                "choices": [{"text": "x", "stop_reason": "eos"}]
+            })),
+            Some("eos".to_string())
+        );
+        assert_eq!(
+            stop_reason_from_chunk(&json!({
+                "choices": [{"text": "x", "finish_reason": null}]
+            })),
+            None
+        );
+        assert_eq!(stop_reason_from_chunk(&json!({"choices": []})), None);
     }
 }

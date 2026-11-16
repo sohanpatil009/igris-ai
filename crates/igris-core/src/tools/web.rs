@@ -347,8 +347,11 @@ fn decode_entities(s: &str) -> String {
 
 /// Hard byte cap on the response body actually read.
 const FETCH_MAX_BYTES: usize = 512 * 1024;
-/// Ceiling fed to the model after conversion.
-const FETCH_MAX_CHARS: usize = 6_000;
+/// Ceiling fed to the model after conversion. 4000 chars (down from
+/// 6000, plan P1): several fetched pages plus search snippets must fit
+/// in the model context together — the S3-12/S4-16 HTTP 400 class came
+/// from accumulated page text.
+const FETCH_MAX_CHARS: usize = 4_000;
 
 static HTML_COMMENT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?is)\x3c!--.*?--\x3e").expect("static regex"));
@@ -625,6 +628,9 @@ pub(crate) fn run_download_file(args: &Value) -> Result<String, String> {
 const SEARCH_RESULTS_DEFAULT: u64 = 8;
 const SEARCH_RESULTS_MAX: u64 = 15;
 const SEARCH_PAGE_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// Per-snippet char cap fed to the model (plan P1): a page of search
+/// results stays bounded even when DuckDuckGo returns long excerpts.
+const SEARCH_SNIPPET_MAX_CHARS: usize = 280;
 
 #[derive(Debug)]
 pub struct WebResult {
@@ -762,7 +768,12 @@ pub(crate) fn run_web_search(args: &Value) -> Result<String, String> {
     for (i, r) in results.iter().take(shown).enumerate() {
         out.push_str(&format!("\n{}. {}\n   {}", i + 1, r.title, r.url));
         if !r.snippet.is_empty() {
-            out.push_str(&format!("\n   {}", r.snippet));
+            /* bounded snippets (plan P1): several search results share
+             * the context with everything else in history */
+            out.push_str(&format!(
+                "\n   {}",
+                truncate_chars(&r.snippet, SEARCH_SNIPPET_MAX_CHARS)
+            ));
         }
     }
     Ok(out)

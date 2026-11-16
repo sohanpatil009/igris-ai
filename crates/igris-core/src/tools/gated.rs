@@ -273,7 +273,7 @@ fn is_drive_root(path: &Path) -> bool {
 }
 
 /// The protection check, shared by plan and executor.
-fn check_protected(path: &Path) -> Result<(), String> {
+pub(crate) fn check_protected(path: &Path) -> Result<(), String> {
     if is_drive_root(path) {
         return Err(format!("refusing to delete a drive root ({})", path.display()));
     }

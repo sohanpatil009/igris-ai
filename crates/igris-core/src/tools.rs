@@ -111,12 +111,16 @@ mod web;
 
 pub use config_tools::{config_tools_path, load_config_tools};
 pub use registry::{DispatchPhase, Registry, ToolDef};
+/// Re-export for llm.rs's history compaction (the shared module itself
+/// stays private to the tool families).
+pub(crate) use shared::truncate_chars;
 
 use crate::tools::basic::{run_calculate, run_get_time, run_media_key, run_open_app, run_open_url};
 use crate::tools::config_tools::CONFIG_TOOLS;
 use crate::tools::dev::run_run_command;
 use crate::tools::files::{
-    run_content_search, run_create_folder, run_file_search, run_list_dir, run_read_file,
+    plan_replace_file, run_content_search, run_create_folder, run_file_search, run_list_dir,
+    run_read_file, run_replace_file, run_workspace_info, run_write_file,
 };
 use crate::tools::gated::{
     plan_close_app, plan_delete_file, plan_power_mode, plan_shutdown, run_close_app,
@@ -269,6 +273,70 @@ pub fn seed_registry() -> Registry {
         gated: false,
         plan: None,
         run: Arc::new(run_create_folder),
+    });
+    r.register(ToolDef {
+        name: "write_file".to_string(),
+        desc: "Create a NEW text file with the given content (missing parent folders are \
+              created). Paths must be absolute or start with ~, and must live under the \
+              user profile, the OS temp dir, or the IGRIS workspace root — call \
+              workspace_info to see them. Refuses to overwrite an existing file (use \
+              replace_file for that) and refuses executable/script file types. Content \
+              is capped at 256 KB."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path to create (absolute or ~ based)"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full text content to write into the file"
+                }
+            },
+            "required": ["path", "content"]
+        }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_write_file),
+    });
+    r.register(ToolDef {
+        name: "replace_file".to_string(),
+        desc: "Overwrite an EXISTING text file with new content. Gated: the first call \
+              only validates the arguments and announces the plan — it does NOT write. \
+              Tell the user exactly what will be replaced and wait for a clear yes; \
+              after the user confirms, call it again with identical arguments and it \
+              executes. Same path rules as write_file."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Existing file path to overwrite (absolute or ~ based)"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "New text content that replaces the file's contents"
+                }
+            },
+            "required": ["path", "content"]
+        }),
+        gated: true,
+        plan: Some(Arc::new(plan_replace_file)),
+        run: Arc::new(run_replace_file),
+    });
+    r.register(ToolDef {
+        name: "workspace_info".to_string(),
+        desc: "Report the IGRIS workspace root (the project directory) and the folders \
+              file tools can read and write. Call this when a task mentions 'my \
+              project', 'the IGRIS project', or any path you are unsure about."
+            .to_string(),
+        schema: json!({"type": "object", "properties": {}, "required": []}),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_workspace_info),
     });
     r.register(ToolDef {
         name: "open_url".to_string(),
