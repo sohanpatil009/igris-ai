@@ -539,3 +539,57 @@ broadened classifier). A DNS outage window ("No such host is known") also swept 
   server storm makes the miss column an infrastructure statement, not a toolset statement.
   A clean re-run of the eight server-death tests on an idle host is the honest next
   measurement.
+
+
+## P3 item 10 â€” freshness & source confidence (2026-11-16, 22:15)
+
+Shipped in commit `c381602`; gate 424 passed / 0 failed / 1 ignored
+(+3 hermetic tests). Closes plan item 10 of P3. P3 item 9 (planner
+round budget) stays deferred as an evaluation decision â€” S4-15F hit
+the 10-round cap mid-investigation, which is the evidence for it.
+
+### What changed
+
+- Every web tool result now carries provenance. `web_fetch` results
+  begin with `Source:` (post-redirect final URL, via ureq 3's
+  `ResponseExt::get_uri`), `Retrieved:` (local wall-clock stamp,
+  minute precision) and `Last-Modified:` (only when the server sends
+  it) lines before the page text. `web_search`'s header states the
+  retrieval time (`Top 8 web results for 'q' (retrieved 2026-11-16
+  22:15):`) because snippets are often the only thing read, and they
+  age (versions, prices, news).
+- Result assembly moved into pure formatters (`format_fetch_result`,
+  `format_search_results`), hermetically tested: stamp format
+  stability on a fixed local time, header shape with and without
+  Last-Modified, row limiting, empty-snippet behavior.
+- Both tool descriptions instruct the model to cite the source URL
+  and retrieval date in its answers, and to prefer official project
+  domains (docs, release notes, GitHub) for version/release questions.
+  "Prefer official sources" is guidance, not a hard domain sort â€” a
+  domain reputation table remains future work.
+- Per-result dates for search rows were skipped deliberately: the
+  DuckDuckGo lite markup carries no per-result dates, and honest
+  absence beats fabrication.
+
+### Live verification (probe P1, 12.4 s, warm llama-server)
+
+Prompt: use web_fetch on https://example.com and quote exactly the
+first three lines the tool returned. Model quoted verbatim:
+
+    Source: https://example.com/
+    Retrieved: 2026-11-16 22:15
+    Last-Modified: Mon, 16 Nov 2026 00:30:20 GMT
+
+(example.com is static and does send Last-Modified, so all three
+header paths were exercised in one fetch.)
+
+### Failure classes this addresses from the rerun
+
+- S4-16A-style stale claims: with web reachable, fetched claims now
+  arrive dated and attributed, and version/release questions are
+  steered to official domains; the stale-training-data fallback
+  ("1.78.0 as fact") remains possible when web is down, but the
+  S4-18A honest-verification note pattern now has the retrieval date
+  to anchor it.
+- Release-summary tasks (S3-12/S3-13 family) can state "retrieved
+  <date>, page last modified <date>" instead of undated content.

@@ -270,3 +270,39 @@ quits.
 - Moonshine expects 16 kHz mono f32 PCM; `audio::load_audio_for_transcription` decodes/converts most formats (WAV/MP3/AAC/FLAC/OGG/M4A).
 - `Transcriber::transcribe` is synchronous/CPU-bound; in async apps offload with `tokio::task::spawn_blocking`.
 - Both models ship on-device; no data leaves the machine once downloaded.
+
+## Agent web tools with provenance (P3)
+
+The chat/assist agent reads the public web through three tools in
+`crates/igris-core/src/tools/web.rs`: `web_search` (DuckDuckGo "lite"
+HTML backend, no API key), `web_fetch` (size-capped page reader, HTML
+converted to plain text) and `download_file` (streamed save into the
+user's Downloads folder only). Every HTTP hop runs through a hardened
+ureq agent whose resolver vetoes local/private addresses, so no request
+can target the machine's own network.
+
+As of the P3 "freshness & source confidence" step (plan item 10), every
+web result carries its provenance so the model can date its claims
+instead of presenting fetched text as timeless truth:
+
+- `web_fetch` results begin with `Source:` (the post-redirect final
+  URL), `Retrieved:` (local wall-clock, minute precision) and
+  `Last-Modified:` (when the server volunteers it) lines before the
+  page text.
+- `web_search` states the retrieval time in its header — snippets are
+  often the only thing read, and they age (versions, prices, news).
+- The tool descriptions instruct the model to cite the source URL and
+  retrieval date in its answers and to prefer official project domains
+  (docs, release notes, GitHub) for version/release questions.
+
+Verified live (`web_fetch https://example.com`):
+
+```
+Source: https://example.com/
+Retrieved: 2026-11-16 22:15
+Last-Modified: Mon, 16 Nov 2026 00:30:20 GMT
+```
+
+Result shapes are assembled by pure formatters with hermetic unit
+tests; the benchmark trail for this and earlier remediation phases
+lives in `benchmark.md`.
