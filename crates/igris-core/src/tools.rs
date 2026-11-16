@@ -108,6 +108,7 @@ mod shared;
 mod testkit;
 mod system;
 mod web;
+mod windows;
 
 pub use config_tools::{config_tools_path, load_config_tools};
 pub use registry::{DispatchPhase, Registry, ToolDef};
@@ -132,6 +133,7 @@ use crate::tools::memory_tools::{
 };
 use crate::tools::system::{run_disk_stats, run_process_stats, run_set_volume, run_screenshot, run_sys_stats};
 use crate::tools::web::{run_download_file, run_web_fetch, run_web_search};
+use crate::tools::windows::{run_focus_window, run_list_windows};
 use serde_json::json;
 use std::sync::{Arc, LazyLock};
 
@@ -522,6 +524,37 @@ pub fn seed_registry() -> Registry {
         gated: false,
         plan: None,
         run: Arc::new(run_disk_stats),
+    });
+    r.register(ToolDef {
+        name: "list_windows".to_string(),
+        desc: "List the visible top-level windows in front-to-back (z) order with each \
+              window's process name and pid. Call this to see what is open before \
+              acting on windows."
+            .to_string(),
+        schema: json!({"type": "object", "properties": {}, "required": []}),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_list_windows),
+    });
+    r.register(ToolDef {
+        name: "focus_window".to_string(),
+        desc: "Bring a window to the foreground. Match by title or application name \
+              (e.g. 'Spotify', 'main.rs - Notepad'). Call list_windows first if you are \
+              not sure of the exact title."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Window title or application name to focus"
+                }
+            },
+            "required": ["target"]
+        }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_focus_window),
     });
     r.register(ToolDef {
         name: "set_volume".to_string(),

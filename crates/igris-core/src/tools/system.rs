@@ -409,7 +409,7 @@ struct ProcSample {
 }
 
 /// Every visible process (pid, image name) via the Toolhelp snapshot.
-fn enumerate_processes() -> Result<Vec<(u32, String)>, String> {
+pub(crate) fn enumerate_processes() -> Result<Vec<(u32, String)>, String> {
     /* SAFETY: snapshot handle closed below; PROCESSENTRY32W carries
      * dwSize before the first call as the API requires. */
     unsafe {

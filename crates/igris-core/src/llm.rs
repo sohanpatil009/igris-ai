@@ -1687,10 +1687,12 @@ Gated tools: their first call only validates the action and announces the plan Ã
         let dl = block.find("**download_file**").unwrap();
         let fm = block.find("**file_metadata**").unwrap();
         let fd = block.find("**find_duplicates**").unwrap();
+        let fw = block.find("**focus_window**").unwrap();
         let fs = block.find("**file_search**").unwrap();
         let g = block.find("**get_time**").unwrap();
         let ld = block.find("**list_dir**").unwrap();
         let lfi = block.find("**list_files**").unwrap();
+        let lwi = block.find("**list_windows**").unwrap();
         let mk = block.find("**media_key**").unwrap();
         let mr = block.find("**memory_recall**").unwrap();
         let ms = block.find("**memory_save**").unwrap();
@@ -1723,10 +1725,12 @@ Gated tools: their first call only validates the action and announces the plan Ã
                 && dl < fm
                 && fm < fs
                 && fs < fd
-                && fs < g
+                && fd < fw
+                && fw < g
                 && g < ld
                 && ld < lfi
-                && lfi < mk
+                && lfi < lwi
+                && lwi < mk
                 && mk < mr
                 && mr < ms
                 && ms < o
@@ -1750,7 +1754,7 @@ Gated tools: their first call only validates the action and announces the plan Ã
         // Every entry carries ONE canonical call-arguments example (plan
         // P0): the raw schema dump made the model echo "properties"
         // shapes as data (the open_app defect class).
-        assert_eq!(block.matches("Call arguments: `").count(), 36);
+        assert_eq!(block.matches("Call arguments: `").count(), 38);
         assert!(!block.contains("\"required\""));
         assert!(!block.contains("properties"));
         // The calculate tenant's function enum is enumerated in its

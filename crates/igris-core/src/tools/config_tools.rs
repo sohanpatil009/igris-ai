@@ -388,7 +388,7 @@ command = ["notepad.exe", "{text}"]
         }
         let names: Vec<String> = r.specs().into_iter().map(|s| s.name).collect();
         assert!(names.contains(&"play_song".to_string()));
-        assert_eq!(names.len(), 37); /* 36 built-ins + 1 config tenant */
+        assert_eq!(names.len(), 39); /* 38 built-ins + 1 config tenant */
         /* register() replaces same-name tenants: an override of get_time. */
         let defs = parse_config_tools(
             r#"
