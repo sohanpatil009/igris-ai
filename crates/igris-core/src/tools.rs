@@ -86,6 +86,13 @@
 //! `action=empty`, unindexed files in the bin folders are counted in
 //! readbacks and never touched.
 //!
+//! P3 item 9 (2026-11-17) — `github_repo_info`: repository facts
+//! (stars, license, latest release, ...) straight from the GitHub API,
+//! so framework/library comparison and version questions get
+//! deterministic structured data instead of web rounds. The task-class
+//! budget machinery around it lives in `crate::budget` and
+//! `crate::llm`'s agent loop.
+//!
 //! Dynamism ladder: v1 code-registered → v1.1 `tools.toml` config-defined
 //! tools (name/desc/schema + allowlisted command template, no recompile —
 //! `register` replaces a same-name tenant to make overrides possible) → v3
@@ -145,7 +152,9 @@ use crate::tools::recycle::{
     plan_empty_recycle_bin, run_empty_recycle_bin, run_recycle_bin,
 };
 use crate::tools::system::{run_disk_stats, run_process_stats, run_set_volume, run_screenshot, run_sys_stats};
-use crate::tools::web::{run_download_file, run_web_fetch, run_web_search};
+use crate::tools::web::{
+    run_download_file, run_github_repo_info, run_web_fetch, run_web_search,
+};
 use crate::tools::windows::{run_focus_window, run_list_windows};
 use serde_json::json;
 use std::sync::{Arc, LazyLock};
@@ -927,6 +936,30 @@ pub fn seed_registry() -> Registry {
         gated: false,
         plan: None,
         run: Arc::new(run_web_search),
+    });
+    r.register(ToolDef {
+        name: "github_repo_info".to_string(),
+        desc: "Facts about one public GitHub repository, straight from the GitHub \
+               API: description, language, stars, forks, open issues, license, \
+               default branch, last push, and the latest release. Call this for \
+               'how many stars does X have', framework/library comparisons, and \
+               version questions - it is more reliable than web_search snippets \
+               and costs no page fetch. repo takes owner/name or a github.com \
+               repository URL."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "owner/name or a github.com repository URL"
+                }
+            },
+            "required": ["repo"]
+        }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_github_repo_info),
     });
     /* v2.5 — gated actions (goal.md): destructive actions that only run
      * after a confirmed re-call (crate::gating). shutdown_abort is the

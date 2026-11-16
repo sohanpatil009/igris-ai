@@ -1033,13 +1033,20 @@ mod tests {
         /* bad action never touches the bin */
         let err = plan_empty_recycle_bin(&json!({"action": "purge"})).unwrap_err();
         assert!(err.contains("'delete' or 'empty'"), "{err}");
-        /* the real bin on this host holds items; the delete path with a
-         * wild index is refused at plan time without arming anything */
+        /* the wild index is refused at plan time without arming anything.
+         * Host-state note: on a host whose bin is EMPTY (as after a full
+         * emptying probe), the already-empty refusal fires first; on a
+         * bin with items, the range check fires. Both are pre-arm
+         * refusals - which one appears depends only on the host, never
+         * on arming. */
         let err = plan_empty_recycle_bin(
             &json!({"action": "delete", "indices": [999_999_999]}),
         )
         .unwrap_err();
-        assert!(err.contains("out of range"), "{err}");
+        assert!(
+            err.contains("out of range") || err.contains("already empty"),
+            "{err}"
+        );
     }
 
     #[test]

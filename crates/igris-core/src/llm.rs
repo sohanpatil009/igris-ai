@@ -263,9 +263,9 @@ pub const MAX_MALFORMED_RETRIES: usize = 2;
 pub const MAX_LENGTH_CONTINUATIONS: usize = 1;
 
 /// Loop bookkeeping for one agent turn: the iteration budget, the
-/// malformed-retry budget, and the validation-streak escalation (v3
-/// hardening), kept pure so the caps are unit-testable without a live
-/// server.
+/// malformed-retry budget, the validation-streak escalation (v3
+/// hardening), and the task-class budget (plan P3 item 9), kept pure so
+/// the caps are unit-testable without a live server.
 pub struct AgentLoopState {
     pub rounds: usize,
     pub retries: usize,
@@ -285,6 +285,24 @@ pub struct AgentLoopState {
     /// calls is a mid-sentence fragment, not an answer; see
     /// [`AgentLoopState::truncation_verdict`].
     pub continuations: usize,
+    /// Task-class budget (plan P3 item 9): caps for rounds / tool
+    /// calls / web calls. [`crate::budget::Budget::simple`] is the
+    /// historical default, so a turn that never sets it behaves exactly
+    /// as before.
+    pub budget: crate::budget::Budget,
+    /// Tool calls dispatched this turn, parallel fan-out included.
+    pub tool_calls_used: usize,
+    /// Page-fetching calls (web_fetch + web_search) dispatched this
+    /// turn - the web budget's counter.
+    pub web_calls_used: usize,
+    /// Tools that reported a definitive unsupported-capability error
+    /// this turn: further calls get a deterministic refusal without
+    /// dispatch (plan P3 item 9's "stop retrying after a definitive
+    /// unsupported-capability error").
+    pub blocked_tools: Vec<String>,
+    /// Delivery-deadline notices already injected (2-rounds-left,
+    /// last-round); each fires at most once per turn.
+    pub deadline_notices_given: (bool, bool),
 }
 
 impl AgentLoopState {
@@ -295,17 +313,111 @@ impl AgentLoopState {
             invalid_streak: 0,
             executed_any: false,
             continuations: 0,
+            budget: crate::budget::Budget::simple(),
+            tool_calls_used: 0,
+            web_calls_used: 0,
+            blocked_tools: Vec::new(),
+            deadline_notices_given: (false, false),
         }
     }
 
     /// Start the next streamed round; `false` once the iteration budget
-    /// is exhausted.
+    /// is exhausted. The cap is the task class's `max_rounds` (the
+    /// default equals [`MAX_TOOL_ITERATIONS`]).
     pub fn next_round(&mut self) -> bool {
-        if self.rounds >= MAX_TOOL_ITERATIONS {
+        if self.rounds >= self.budget.max_rounds {
             return false;
         }
         self.rounds += 1;
         true
+    }
+
+    /// The delivery-deadline notice to inject at this round's start, if
+    /// any (plan P3 item 9). Live evidence (S3-11C, S3-13C, S5-20C): the
+    /// model investigates honestly to the round cap and never delivers.
+    /// Two rounds out it is told to start delivering; one round out,
+    /// that the next round is its last. Each notice fires at most once.
+    pub fn round_start_notice(&mut self) -> Option<String> {
+        let remaining = self.budget.max_rounds.saturating_sub(self.rounds);
+        if remaining == 2 && !self.deadline_notices_given.0 {
+            self.deadline_notices_given.0 = true;
+            return Some(
+                "BUDGET: 2 tool rounds left for this task. Stop gathering evidence; \
+                 start delivering - give the final answer or write the requested \
+                 file with what you already have."
+                    .to_string(),
+            );
+        }
+        if remaining == 1 && !self.deadline_notices_given.1 {
+            self.deadline_notices_given.1 = true;
+            return Some(
+                "BUDGET: this is your LAST tool round. Deliver the final answer \
+                 immediately after it - no new investigations."
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// Budget decision for one parsed tool call, BEFORE dispatch:
+    /// `Err(refusal_text)` = the call must not run (blocked tool, spent
+    /// web budget, spent tool-call budget) and the refusal becomes its
+    /// tool_result; `Ok(())` = dispatch, and the call is counted.
+    pub fn decide_call(&mut self, name: &str) -> Result<(), String> {
+        if self.blocked_tools.iter().any(|t| t == name) {
+            return Err(format!(
+                "{name} reported itself unavailable on this system and was already \
+                 reported once. Do not call it again - deliver the answer from \
+                 other evidence."
+            ));
+        }
+        let b = self.budget;
+        if crate::budget::is_web_tool(name) && self.web_calls_used >= b.max_web_calls {
+            return Err(format!(
+                "Web budget for this task is spent ({}/{} web calls). Work with \
+                 the evidence already collected and deliver the answer now.",
+                self.web_calls_used, b.max_web_calls
+            ));
+        }
+        if self.tool_calls_used >= b.max_tool_calls {
+            return Err(format!(
+                "Tool-call budget for this task is spent ({}/{} calls). Deliver \
+                 the final answer now.",
+                self.tool_calls_used, b.max_tool_calls
+            ));
+        }
+        self.tool_calls_used += 1;
+        if crate::budget::is_web_tool(name) {
+            self.web_calls_used += 1;
+        }
+        Ok(())
+    }
+
+    /// After a dispatched round: block every tool whose result was a
+    /// definitive unsupported-capability error and return one corrective
+    /// line naming them (None when nothing new was blocked). Blocking
+    /// takes effect from the NEXT round - a parallel batch already in
+    /// flight runs to completion.
+    pub fn unsupported_verdict(&mut self, outcomes: &[ToolOutcome]) -> Option<String> {
+        let mut newly: Vec<String> = Vec::new();
+        for o in outcomes {
+            if o.status == "error"
+                && o.output.starts_with(crate::budget::UNSUPPORTED_PREFIX)
+                && !self.blocked_tools.iter().any(|t| *t == o.name)
+                && !newly.iter().any(|t| *t == o.name)
+            {
+                newly.push(o.name.clone());
+            }
+        }
+        if newly.is_empty() {
+            return None;
+        }
+        self.blocked_tools.extend(newly.iter().cloned());
+        let names = newly.join(", ");
+        Some(format!(
+            "Note: {names} reported this capability as unavailable on this system. \
+             Do not call it again this task - answer from other evidence."
+        ))
     }
 
     /// Verdict for a streamed reply that parsed to zero tool calls.
@@ -657,7 +769,27 @@ pub fn agent_turn(
     let mut constrained = false;
     let timed = std::env::var_os("MOON_TIMING").is_some();
     let mut state = AgentLoopState::new();
+    /* Task-class budget (plan P3 item 9): the newest user utterance
+     * classifies the turn, and the class shapes the caps plus the
+     * delivery-deadline notices. The default (Simple) equals the
+     * historical constants, so unclassified-shape turns behave exactly
+     * as measured by the benchmark suite. */
+    let user_text = history
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|m| m.get("content").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    state.budget = crate::budget::budget_for(crate::budget::classify(&user_text));
     while state.next_round() {
+        /* delivery-deadline notices (plan P3 item 9): their own user
+         * message at round start, so the round's prompt ends with the
+         * deadline and the model delivers instead of investigating to
+         * the wall (the S3-11C/S3-13C/S5-20C failure shape) */
+        if let Some(notice) = state.round_start_notice() {
+            history.push(json!({"role": "user", "content": notice}));
+        }
         let grammar_ref: Option<&str> = if constrained {
             grammar.as_deref()
         } else {
@@ -782,54 +914,86 @@ pub fn agent_turn(
          * on parallel workers (v3, bounded to 4 at a time) with results
          * in call order */
         let t_tools = Instant::now();
-        let outcomes: Vec<ToolOutcome> = if calls.len() == 1 {
-            let call = &calls[0];
+        /* Task-class budget (plan P3 item 9): every call is decided
+         * before dispatch. Spent web/tool-call budgets and tools blocked
+         * for definitive unsupported-capability errors get a
+         * deterministic refusal tool_result without running; allowed
+         * calls dispatch exactly as before (one on the plain path,
+         * several on parallel workers), results stay in call order. */
+        let mut decisions: Vec<Result<(), String>> = Vec::with_capacity(calls.len());
+        for call in &calls {
+            decisions.push(state.decide_call(&call.name));
+        }
+        let mut slots: Vec<Option<ToolOutcome>> = Vec::with_capacity(calls.len());
+        let mut runnable: Vec<(usize, &toolparse::ParsedToolCall)> = Vec::new();
+        for (i, (call, decision)) in calls.iter().zip(&decisions).enumerate() {
+            match decision {
+                Ok(()) => {
+                    slots.push(None);
+                    runnable.push((i, call));
+                }
+                Err(refusal) => slots.push(Some(ToolOutcome {
+                    name: call.name.clone(),
+                    status: "error".to_string(),
+                    output: refusal.clone(),
+                    phase: crate::tools::DispatchPhase::Invalid,
+                })),
+            }
+        }
+        if runnable.len() == 1 {
+            let (i, call) = runnable[0];
             let (result, phase) = registry.dispatch_classified(&call.name, &call.arguments);
             let (status, output) = match result {
                 Ok(out) => ("ok", out),
                 Err(e) => ("error", e),
             };
-            vec![ToolOutcome {
+            slots[i] = Some(ToolOutcome {
                 name: call.name.clone(),
                 status: status.to_string(),
                 output,
                 phase,
-            }]
-        } else {
-            let batch: Vec<(String, Value)> = calls
+            });
+        } else if runnable.len() > 1 {
+            let batch: Vec<(String, Value)> = runnable
                 .iter()
-                .map(|c| (c.name.clone(), c.arguments.clone()))
+                .map(|(_, c)| (c.name.clone(), c.arguments.clone()))
                 .collect();
-            registry
-                .dispatch_batch(&batch)
-                .into_iter()
-                .map(|o| {
-                    let (status, output) = match o.result {
-                        Ok(out) => ("ok", out),
-                        Err(e) => ("error", e),
-                    };
-                    ToolOutcome {
-                        name: o.name,
-                        status: status.to_string(),
-                        output,
-                        phase: o.phase,
-                    }
-                })
-                .collect()
-        };
+            let results = registry.dispatch_batch(&batch);
+            for (i, o) in runnable.iter().map(|(i, _)| *i).zip(results) {
+                let (status, output) = match o.result {
+                    Ok(out) => ("ok", out),
+                    Err(e) => ("error", e),
+                };
+                slots[i] = Some(ToolOutcome {
+                    name: o.name,
+                    status: status.to_string(),
+                    output,
+                    phase: o.phase,
+                });
+            }
+        }
+        let outcomes: Vec<ToolOutcome> = slots.into_iter().flatten().collect();
         if timed {
             eprintln!(
                 "[timing] round {} tools {}ms over {} call(s){}",
                 state.rounds,
                 t_tools.elapsed().as_millis(),
-                calls.len(),
-                if calls.len() > 1 { " parallel" } else { "" },
+                runnable.len(),
+                if runnable.len() > 1 { " parallel" } else { "" },
             );
         }
         /* the results message, plus the escalation-ladder verdict (v3
          * hardening) which may append a corrective note or force the
          * next round to sample under the tool-call grammar */
         let mut results_msg = tool_results_user_message(&outcomes);
+        /* definitive unsupported-capability results (plan P3 item 9):
+         * block the tool for the rest of the turn and tell the model
+         * once, so it never spends rounds re-calling a missing
+         * capability */
+        if let Some(note) = state.unsupported_verdict(&outcomes) {
+            results_msg.push('\n');
+            results_msg.push_str(&note);
+        }
         match state.validation_verdict(&outcomes) {
             ValidationStep::None => constrained = false,
             ValidationStep::Corrective(note) => {
@@ -1709,6 +1873,7 @@ Gated tools: their first call only validates the action and announces the plan Ã
         let fw = block.find("**focus_window**").unwrap();
         let fs = block.find("**file_search**").unwrap();
         let g = block.find("**get_time**").unwrap();
+        let gri = block.find("**github_repo_info**").unwrap();
         let ld = block.find("**list_dir**").unwrap();
         let lfi = block.find("**list_files**").unwrap();
         let lwi = block.find("**list_windows**").unwrap();
@@ -1748,7 +1913,8 @@ Gated tools: their first call only validates the action and announces the plan Ã
                 && fs < fd
                 && fd < fw
                 && fw < g
-                && g < ld
+                && g < gri
+                && gri < ld
                 && ld < lfi
                 && lfi < lwi
                 && lwi < mk
@@ -1776,7 +1942,7 @@ Gated tools: their first call only validates the action and announces the plan Ã
         // Every entry carries ONE canonical call-arguments example (plan
         // P0): the raw schema dump made the model echo "properties"
         // shapes as data (the open_app defect class).
-        assert_eq!(block.matches("Call arguments: `").count(), 40);
+        assert_eq!(block.matches("Call arguments: `").count(), 41);
         assert!(!block.contains("\"required\""));
         assert!(!block.contains("properties"));
         // The calculate tenant's function enum is enumerated in its
@@ -1971,6 +2137,112 @@ Gated tools: their first call only validates the action and announces the plan Ã
         ];
         assert_eq!(s.validation_verdict(&mixed), ValidationStep::None);
         assert_eq!(s.invalid_streak, 0, "mixed rounds must not accumulate");
+    }
+
+    /* ---- task-class budget (plan P3 item 9) ---- */
+
+    #[test]
+    fn task_budget_shapes_rounds_and_deadline_notices() {
+        use crate::budget::{budget_for, TaskClass};
+        /* the default (Simple) keeps the historical 10-round budget */
+        let mut s = AgentLoopState::new();
+        assert_eq!(s.budget.max_rounds, MAX_TOOL_ITERATIONS);
+        for _ in 0..MAX_TOOL_ITERATIONS {
+            assert!(s.next_round());
+        }
+        assert!(!s.next_round());
+
+        /* report class: 12 rounds, notices fire once at 2 and 1 left */
+        let mut s = AgentLoopState::new();
+        s.budget = budget_for(TaskClass::Report);
+        for _ in 0..9 {
+            assert!(s.next_round());
+            assert_eq!(s.round_start_notice(), None);
+        }
+        assert!(s.next_round()); /* round 10 of 12: two remain */
+        let n2 = s.round_start_notice().unwrap();
+        assert!(n2.starts_with("BUDGET: 2 tool rounds left"), "{n2}");
+        assert_eq!(s.round_start_notice(), None, "each notice fires once");
+        assert!(s.next_round()); /* round 11: one remains */
+        let n1 = s.round_start_notice().unwrap();
+        assert!(n1.starts_with("BUDGET: this is your LAST tool round"), "{n1}");
+        assert!(s.next_round()); /* round 12 runs */
+        assert!(!s.next_round()); /* 13 is refused */
+
+        /* simple class: notices land at rounds 8 and 9 */
+        let mut s = AgentLoopState::new();
+        for _ in 0..7 {
+            assert!(s.next_round());
+            assert_eq!(s.round_start_notice(), None);
+        }
+        assert!(s.next_round()); /* round 8 of 10 */
+        assert!(s
+            .round_start_notice()
+            .unwrap()
+            .starts_with("BUDGET: 2 tool rounds left"));
+        assert!(s.next_round()); /* round 9 */
+        assert!(s
+            .round_start_notice()
+            .unwrap()
+            .starts_with("BUDGET: this is your LAST tool round"));
+    }
+
+    #[test]
+    fn task_budget_decides_calls_web_and_totals() {
+        use crate::budget::{budget_for, TaskClass};
+        let mut s = AgentLoopState::new();
+        s.budget = budget_for(TaskClass::Research); /* web 6, calls 24 */
+        for i in 0..6 {
+            assert!(s.decide_call("web_search").is_ok(), "web call {i}");
+        }
+        /* web budget spent: refusal, and the refused call is not counted */
+        let err = s.decide_call("web_fetch").unwrap_err();
+        assert!(err.contains("Web budget for this task is spent (6/6"), "{err}");
+        assert!(err.contains("deliver the answer now"), "{err}");
+        /* non-web tools still run until the total call budget is spent */
+        for _ in 0..18 {
+            assert!(s.decide_call("read_file").is_ok());
+        }
+        assert_eq!(s.tool_calls_used, 24);
+        let err = s.decide_call("read_file").unwrap_err();
+        assert!(
+            err.contains("Tool-call budget for this task is spent (24/24"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn task_budget_blocks_unsupported_tools_after_first_report() {
+        use crate::budget::UNSUPPORTED_PREFIX;
+        use crate::tools::DispatchPhase;
+        let mut s = AgentLoopState::new();
+        let boom = ToolOutcome {
+            name: "power_mode".to_string(),
+            status: "error".to_string(),
+            output: format!(
+                "{UNSUPPORTED_PREFIX}the Power saver plan is not configured on this machine"
+            ),
+            phase: DispatchPhase::Ran,
+        };
+        let note = s.unsupported_verdict(std::slice::from_ref(&boom)).unwrap();
+        assert!(note.contains("power_mode"), "{note}");
+        assert!(note.contains("Do not call it again"), "{note}");
+        /* idempotent: a second report adds no new note */
+        assert_eq!(s.unsupported_verdict(std::slice::from_ref(&boom)), None);
+        /* blocked from the next round: deterministic refusal, no dispatch */
+        let err = s.decide_call("power_mode").unwrap_err();
+        assert!(err.contains("unavailable on this system"), "{err}");
+        /* the block does not leak to other tools */
+        assert!(s.decide_call("get_time").is_ok());
+        /* an ordinary (transient) error never blocks */
+        let soft = ToolOutcome {
+            name: "web_fetch".to_string(),
+            status: "error".to_string(),
+            output: "HTTP 503 from example.com".to_string(),
+            phase: DispatchPhase::Ran,
+        };
+        assert_eq!(s.unsupported_verdict(std::slice::from_ref(&soft)), None);
+        assert!(s.decide_call("web_fetch").is_ok());
     }
 
     #[test]

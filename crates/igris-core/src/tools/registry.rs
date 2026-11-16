@@ -23,6 +23,8 @@ fn tool_budget(name: &str) -> Duration {
         // plain page loads / one search round-trip
         "web_fetch" => Duration::from_secs(25),
         "web_search" => Duration::from_secs(20),
+        // one API call + optional latest-release call
+        "github_repo_info" => Duration::from_secs(20),
         // walk + hash budget inside find_duplicates itself
         "find_duplicates" => Duration::from_secs(120),
         _ => TOOL_TIMEOUT,
@@ -615,6 +617,7 @@ mod tests {
                 "find_duplicates",
                 "focus_window",
                 "get_time",
+                "github_repo_info",
                 "list_dir",
                 "list_files",
                 "list_windows",

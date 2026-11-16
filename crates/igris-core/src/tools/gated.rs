@@ -481,8 +481,15 @@ pub(crate) fn plan_power_mode(args: &Value) -> Result<String, String> {
     let (label, guid) = power_scheme(mode)?;
     let listing = available_schemes()?;
     if !guid_listed(guid, &listing) {
+        /* "unsupported: " prefix (crate::budget): this is a DEFINITIVE
+         * unsupported-capability error - the agent loop turns the first
+         * one into a retry block for power_mode, so the model cannot
+         * spend rounds re-asking for plans this install will never
+         * offer (live evidence 2026-11-15: Windows 11 ships only
+         * Balanced). */
         return Err(format!(
-            "the {label} plan is not configured on this machine — powercfg /list does not offer it (no plan was switched)"
+            "unsupported: the {label} plan is not configured on this machine — \
+             powercfg /list does not offer it (no plan was switched)"
         ));
     }
     Ok(format!("Switch the power plan to {label} ({guid})."))

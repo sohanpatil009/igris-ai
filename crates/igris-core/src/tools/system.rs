@@ -207,7 +207,13 @@ fn audio_endpoint() -> Result<IAudioEndpointVolume, String> {
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
             .map_err(|e| format!("set_volume: COM instantiation failed: {e}"))?;
     let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) }
-        .map_err(|e| format!("set_volume: no default audio device: {e}"))?;
+        .map_err(|e| {
+            /* "unsupported: " prefix (crate::budget): a machine with no
+             * default render device will never answer volume asks - the
+             * agent loop turns the first such error into a retry block
+             * for set_volume */
+            format!("unsupported: no default audio device on this system: {e}")
+        })?;
     let endpoint: IAudioEndpointVolume = unsafe { device.Activate(CLSCTX_ALL, None) }
         .map_err(|e| format!("set_volume: endpoint activation failed: {e}"))?;
     Ok(endpoint)

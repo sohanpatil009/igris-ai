@@ -841,6 +841,171 @@ pub(crate) fn run_web_search(args: &Value) -> Result<String, String> {
     Ok(format_search_results(query, &stamp, &results, limit))
 }
 
+/* ---------------------------------------------------------------- */
+/* github_repo_info - deterministic repo facts over the GitHub API    */
+/* ---------------------------------------------------------------- */
+
+/// Unauthenticated GitHub REST API root (60 requests/hour is ample for
+/// an assistant session).
+const GITHUB_API: &str = "https://api.github.com";
+const GITHUB_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// owner/name out of the accepted spellings: "owner/name",
+/// "https://github.com/owner/name", "github.com/owner/name". ".git"
+/// suffix stripped, query/fragment stripped, extra path segments and
+/// non-GitHub hosts rejected - the output is joined into an API URL, so
+/// path injection dies here (every segment must be plain GitHub-name
+/// characters).
+fn github_repo_path(repo: &str) -> Result<String, String> {
+    let s = repo.trim();
+    if s.is_empty() {
+        return Err("repo is empty".into());
+    }
+    /* scheme first, then the host - both ASCII, so byte-len slicing is
+     * exact; anything else (gitlab.com, evil.com) keeps its host and
+     * dies on the segment count */
+    let mut body = s;
+    let lower = s.to_lowercase();
+    for scheme in ["https://", "http://"] {
+        if lower.starts_with(scheme) {
+            body = &s[scheme.len()..];
+            break;
+        }
+    }
+    let lower_body = body.to_lowercase();
+    if lower_body.starts_with("github.com/") {
+        body = &body["github.com/".len()..];
+    }
+    let body = body.split(['?', '#']).next().unwrap_or(body);
+    let mut segs = body.split('/').filter(|p| !p.is_empty());
+    let owner = segs.next().unwrap_or("");
+    let name = segs.next().unwrap_or("");
+    if segs.next().is_some() || owner.is_empty() || name.is_empty() {
+        return Err(format!(
+            "repo must be 'owner/name' or a github.com repository URL, got '{s}'"
+        ));
+    }
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    let ok = |seg: &str| {
+        !seg.is_empty()
+            && seg != "."
+            && seg != ".."
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    if !ok(owner) || !ok(name) {
+        return Err(format!("'{s}' is not a valid GitHub owner/name"));
+    }
+    Ok(format!("{owner}/{name}"))
+}
+
+/// One numeric field, 0 when absent or not a number (the GitHub API
+/// always sends these, but a defensive formatter never panics).
+fn gh_num(v: &Value, key: &str) -> u64 {
+    v.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn gh_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str)
+}
+
+/// The deterministic readback. All facts come from the API response
+/// bodies - the model never computes or rounds anything (plan P3 item
+/// 9's structured-output bullet). Optional lines are omitted when the
+/// API does not carry them.
+fn format_repo_info(path: &str, repo: &Value, release: Option<&Value>) -> String {
+    let mut out = format!("GitHub repository: https://github.com/{path}");
+    if let Some(d) = gh_str(repo, "description") {
+        if !d.is_empty() {
+            out.push_str(&format!("\nDescription: {d}"));
+        }
+    }
+    if let Some(lang) = gh_str(repo, "language") {
+        out.push_str(&format!("\nLanguage: {lang}"));
+    }
+    out.push_str(&format!(
+        "\nStars: {} | Forks: {} | Open issues: {}",
+        gh_num(repo, "stargazers_count"),
+        gh_num(repo, "forks_count"),
+        gh_num(repo, "open_issues_count")
+    ));
+    let license = repo
+        .get("license")
+        .and_then(|l| l.get("spdx_id"))
+        .and_then(Value::as_str)
+        .filter(|s| *s != "NOASSERTION");
+    if let Some(spdx) = license {
+        out.push_str(&format!("\nLicense: {spdx}"));
+    }
+    if let Some(branch) = gh_str(repo, "default_branch") {
+        out.push_str(&format!("\nDefault branch: {branch}"));
+    }
+    /* timestamps arrive ISO-8601 ("...T...Z"); the date part is what a
+     * human comparison needs */
+    if let Some(push) = gh_str(repo, "pushed_at") {
+        out.push_str(&format!("\nLast push: {}", push.split('T').next().unwrap_or(push)));
+    }
+    if let Some(r) = release {
+        let tag = gh_str(r, "tag_name").unwrap_or("unknown");
+        match gh_str(r, "published_at") {
+            Some(at) => out.push_str(&format!(
+                "\nLatest release: {tag} (published {})",
+                at.split('T').next().unwrap_or(at)
+            )),
+            None => out.push_str(&format!("\nLatest release: {tag}")),
+        }
+    }
+    out
+}
+
+pub(crate) fn run_github_repo_info(args: &Value) -> Result<String, String> {
+    let raw = required_str(args, "repo", "github_repo_info")?;
+    let path = github_repo_path(raw)?;
+    let repo_url = format!("{GITHUB_API}/repos/{path}");
+    let resp = web_get(&repo_url, GITHUB_TIMEOUT)
+        .map_err(|e| format!("Could not reach the GitHub API: {e}"))?;
+    let status = resp.status().as_u16();
+    if status == 404 {
+        return Err(format!(
+            "GitHub repository '{path}' not found (it may be private or renamed)."
+        ));
+    }
+    if status == 403 {
+        return Err(
+            "GitHub API rate limit reached (60 requests/hour unauthenticated) - \
+             try again later."
+                .into(),
+        );
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("GitHub API returned HTTP {status} for '{path}'."));
+    }
+    let body = resp
+        .into_body()
+        .into_with_config()
+        .limit(2 * 1024 * 1024)
+        .read_to_string()
+        .map_err(|e| format!("Could not read the GitHub API response: {e}"))?;
+    let repo: Value =
+        serde_json::from_str(&body).map_err(|e| format!("GitHub API sent malformed JSON: {e}"))?;
+    /* the latest release is best-effort: a repo without releases (or a
+     * rate-limited second hop) still returns the repo facts */
+    let release = web_get(&format!("{GITHUB_API}/repos/{path}/releases/latest"), GITHUB_TIMEOUT)
+        .ok()
+        .filter(|r| r.status().as_u16() == 200)
+        .and_then(|r| {
+            let text = r
+                .into_body()
+                .into_with_config()
+                .limit(1024 * 1024)
+                .read_to_string()
+                .ok()?;
+            serde_json::from_str::<Value>(&text).ok()
+        });
+    Ok(format_repo_info(&path, &repo, release.as_ref()))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -849,6 +1014,91 @@ mod tests {
     use serde_json::json;
 
     /* ---- shared v2 helpers ---- */
+
+    #[test]
+    fn github_repo_path_accepts_the_common_spellings() {
+        assert_eq!(github_repo_path("rust-lang/rust").unwrap(), "rust-lang/rust");
+        assert_eq!(
+            github_repo_path("https://github.com/huggingface/candle").unwrap(),
+            "huggingface/candle"
+        );
+        assert_eq!(
+            github_repo_path("http://github.com/ggml-org/llama.cpp").unwrap(),
+            "ggml-org/llama.cpp"
+        );
+        assert_eq!(
+            github_repo_path("github.com/owner/name.git").unwrap(),
+            "owner/name"
+        );
+        assert_eq!(
+            github_repo_path("  github.com/owner/name?tab=stars  ").unwrap(),
+            "owner/name"
+        );
+    }
+
+    #[test]
+    fn github_repo_path_rejects_injection_and_garbage() {
+        /* path traversal / host swap must die at parse time - the
+         * output is joined into an api.github.com URL */
+        assert!(github_repo_path("../etc/passwd").is_err());
+        assert!(github_repo_path("owner/name/extra").is_err());
+        assert!(github_repo_path("gitlab.com/owner/name").is_err());
+        assert!(github_repo_path("https://evil.com/owner/name").is_err());
+        assert!(github_repo_path("owner").is_err());
+        assert!(github_repo_path("").is_err());
+        assert!(github_repo_path("ow ner/na me").is_err());
+        assert!(github_repo_path("owner/na$me").is_err());
+    }
+
+    #[test]
+    fn format_repo_info_renders_deterministic_facts() {
+        let repo = json!({
+            "full_name": "huggingface/candle",
+            "html_url": "https://github.com/huggingface/candle",
+            "description": "Minimalist ML framework for Rust",
+            "language": "Rust",
+            "stargazers_count": 16_000,
+            "forks_count": 900,
+            "open_issues_count": 120,
+            "license": {"spdx_id": "Apache-2.0"},
+            "default_branch": "main",
+            "pushed_at": "2026-11-15T09:30:00Z"
+        });
+        let release = json!({
+            "tag_name": "v0.9.1",
+            "published_at": "2026-11-10T18:00:00Z"
+        });
+        let text = format_repo_info("huggingface/candle", &repo, Some(&release));
+        assert!(text.starts_with("GitHub repository: https://github.com/huggingface/candle"), "{text}");
+        assert!(text.contains("Description: Minimalist ML framework for Rust"), "{text}");
+        assert!(text.contains("Language: Rust"), "{text}");
+        assert!(text.contains("Stars: 16000 | Forks: 900 | Open issues: 120"), "{text}");
+        assert!(text.contains("License: Apache-2.0"), "{text}");
+        assert!(text.contains("Default branch: main"), "{text}");
+        assert!(text.contains("Last push: 2026-11-15"), "{text}");
+        assert!(text.contains("Latest release: v0.9.1 (published 2026-11-10)"), "{text}");
+    }
+
+    #[test]
+    fn format_repo_info_tolerates_missing_fields_and_no_release() {
+        let repo = json!({
+            "description": null,
+            "language": null,
+            "license": {"spdx_id": "NOASSERTION"},
+            "pushed_at": "2026-11-15"
+        });
+        let text = format_repo_info("a/b", &repo, None);
+        assert!(text.starts_with("GitHub repository: https://github.com/a/b"), "{text}");
+        assert!(!text.contains("Description:"), "{text}");
+        assert!(!text.contains("Language:"), "{text}");
+        assert!(!text.contains("License:"), "{text}");
+        assert!(text.contains("Stars: 0 | Forks: 0 | Open issues: 0"), "{text}");
+        assert!(text.contains("Last push: 2026-11-15"), "{text}");
+        assert!(!text.contains("Latest release:"), "{text}");
+        /* release without a published_at still shows the tag */
+        let text = format_repo_info("a/b", &repo, Some(&json!({"tag_name": "v1"})));
+        assert!(text.contains("Latest release: v1"), "{text}");
+    }
 
     #[test]
     fn percent_decode_sanitize_and_format_helpers() {
