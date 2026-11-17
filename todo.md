@@ -506,14 +506,20 @@ vendoring was rejected; see v1.2).
         false "I've opened it in Brave"; "Launch the <browser> with the
         page open" phrasing flips it to open_url. Evidence:
         benchmark.md B-series 2026-11-17.
-- [ ] **browser-rs Windows port** (vendored `browser-rs/`, own git clone,
-      MIT, upstream macOS/Linux-only): cdp.rs WebSocket transport
-      (--remote-debugging-port + /json/version discovery) replacing the
-      Unix pipe pair; watchdog body -> `taskkill /PID <pid> /T /F`;
-      install.rs win64 CfT URLs + %LOCALAPPDATA% cache + tar.exe extract;
-      profile_dir SingletonLock check cfg-gated to unix. Zero new deps
-      (tokio-tungstenite + reqwest already present). Evidence:
-      benchmark.md mcp-reff audit section 2026-11-17.
+- [x] **browser-rs Windows port** (vendored `browser-rs/`, own git clone,
+      MIT, upstream macOS/Linux-only) - DONE 2026-11-17, clone commit
+      `00e6e4c`: cdp.rs gained a WebSocket transport (`connect_ws` over
+      `--remote-debugging-port` + `/json/version` discovery) beside the
+      Unix pipe pair; launch tail split launch_pipe/launch_ws; watchdog
+      Windows body = `taskkill /PID <pid> /T /F`; install.rs win64 CfT
+      153.0.8010.36 + %LOCALAPPDATA% cache + tar.exe extract + .exe
+      suffixes; profile_dir SingletonLock check cfg-gated to unix. Zero
+      new deps. Live smoke: initialize + 39 tools, navigate example.com
+      (HTTP 200 + refs), browser_text markdown, browser_close with no
+      orphans. Found live: Chrome prefers --remote-debugging-pipe when
+      both flags present - the shared arg list must strip it for the
+      port path. Gate: build + clippy clean. Evidence: benchmark.md
+      browser-rs port section 2026-11-17.
 - [ ] **`mcp_tool` client tenant** (v3 rung made concrete by the audit):
       persistent server, `tools/list` cached at connect, MCP tool schemas
       -> ToolDef tenants, dispatch over JSON-RPC; start ungated under the

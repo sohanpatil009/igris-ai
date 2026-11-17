@@ -971,3 +971,59 @@ in-process chromiumoxide port would drag an async runtime into the sync
 core - browser-rs as a persistent MCP server behind the future mcp_tool
 tenant stays the architecturally consistent route (capability extension,
 never per-request spawn, never a core dependency).
+## browser-rs Windows port - implemented and verified (2026-11-17)
+
+Ported the vendored `browser-rs/` clone (own git, MIT; upstream macOS/Linux
+only) to Windows. Commit `00e6e4c` in that clone. Zero new dependencies -
+the WebSocket transport reuses the tokio-tungstenite and reqwest already
+in its Cargo.toml.
+
+### What changed (4 files)
+
+- cdp.rs: frame dispatch factored into dispatch()/finish_closed(); Writer
+  enum (Pipe/Mutex<File> | Ws/mpsc sender); new connect_ws() connects the
+  browser-level endpoint and runs the reader as a tokio task owning the
+  stream and the handler; send_full sends one JSON string per text frame
+  instead of NUL-framed writes. Pipe path untouched (kept compiled, Unix).
+- browser.rs: launch tail split into launch_pipe (unix, verbatim) and
+  launch_ws (windows): free TCP port via bind(127.0.0.1:0), spawn with
+  --remote-debugging-port (and the shared --remote-debugging-pipe flag
+  stripped - with both present Chrome prefers pipe mode and the endpoint
+  never opens; found live, first failure mode), poll /json/version for
+  webSocketDebuggerUrl (20 s budget), connect. Watchdog spawn shared.
+  profile_dir's SingletonLock liveness check cfg-gated to unix.
+- main.rs: watchdog body cfg-split - Windows kill_tree = taskkill /PID
+  <pid> /T /F (tree kill = process-group analog), retried until taskkill
+  reports nothing left; SIGTERM select arm gated to unix (ctrl_c remains).
+- install.rs: ("windows","x86_64") => "win64"; cache root %LOCALAPPDATA%
+  (base_cache_dir helper); executable_in appends .exe; extract via
+  System32 tar.exe (bsdtar reads zip natively), ditto/unzip unchanged.
+- Cargo.toml: reqwest +json feature; empty [workspace] table to detach
+  from the outer igris-ai workspace. README limits bullet updated.
+
+### Verification (live, MCP stdio driver D:\Temp\opencode\browser_rs_smoke.ps1)
+
+- initialize -> protocol 2025-06-18 reply; tools/list -> 39 tools.
+- browser_navigate https://example.com -> "Navigated to ... (HTTP 200)",
+  page title + element-ref snapshot.
+- browser_text -> markdown page text (title, url, body).
+- browser_close -> no orphan chrome-headless-shell processes.
+- Chromium for Testing 153.0.8010.36 win64 downloaded once (~180 MB) into
+  %LOCALAPPDATA%\browser-rs\chromium\... and extracted via tar.exe; the
+  chrome-headless-shell debug endpoint was separately confirmed with a
+  manual launch (endpoint answers /json/version in seconds).
+- cargo build + cargo clippy clean (one pre-existing upstream schemars
+  manifest warning). Upstream ships no test suite (0 tests); the live
+  smoke IS the verification.
+- Note: the first smoke run failed at the endpoint wait (255 s incl. the
+  download) - root cause was the leftover --remote-debugging-pipe flag
+  winning over the port; fixed by stripping it in launch_ws.
+
+### Integration path (IGRIS side)
+
+browser-rs is an MCP stdio server; IGRIS has no MCP client yet, so the
+39 tools cannot be called from IGRIS until the `mcp_tool` client tenant
+exists (todo: persistent server, cached tools/list, MCP schemas -> ToolDef
+tenants, start ungated under the config-tenant name rules). Footprint on
+this machine when running: chrome-headless-shell a few hundred MB RAM
+during calls; server binary itself is a small Rust exe.
