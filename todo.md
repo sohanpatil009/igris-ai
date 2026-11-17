@@ -506,6 +506,27 @@ vendoring was rejected; see v1.2).
         false "I've opened it in Brave"; "Launch the <browser> with the
         page open" phrasing flips it to open_url. Evidence:
         benchmark.md B-series 2026-11-17.
+- [ ] **browser-rs Windows port** (vendored `browser-rs/`, own git clone,
+      MIT, upstream macOS/Linux-only): cdp.rs WebSocket transport
+      (--remote-debugging-port + /json/version discovery) replacing the
+      Unix pipe pair; watchdog body -> `taskkill /PID <pid> /T /F`;
+      install.rs win64 CfT URLs + %LOCALAPPDATA% cache + tar.exe extract;
+      profile_dir SingletonLock check cfg-gated to unix. Zero new deps
+      (tokio-tungstenite + reqwest already present). Evidence:
+      benchmark.md mcp-reff audit section 2026-11-17.
+- [ ] **`mcp_tool` client tenant** (v3 rung made concrete by the audit):
+      persistent server, `tools/list` cached at connect, MCP tool schemas
+      -> ToolDef tenants, dispatch over JSON-RPC; start ungated under the
+      same guarded-name rules as config tenants; first server to wire =
+      ported browser-rs. Never per-request spawn, never the 41 core tools.
+- [ ] `clipboard_get`/`clipboard_set` (audit item 3, d3sk-mcp MIT as
+      reference) - text-only, Windows clipboard via the windows crate
+      (needs Win32_System_DataExchange + Win32_System_Memory features).
+- [ ] `edit_file` in-place editing (audit item 1, octofs Apache-2.0
+      line_hash.rs as reference): exact old_text/new_text with unique-match
+      enforcement, or line-id targeting with stale detection whose errors
+      show fresh ids around the target and relocate the hash nearest-first;
+      replace_file stays gated (whole-file overwrite).
 - [ ] Optional someday: WASM/MCP plugin bridge (`zeroclaw-plugins`) — only
       as an `mcp_tool` client tenant type, never a dependency of the core
 

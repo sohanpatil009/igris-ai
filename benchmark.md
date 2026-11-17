@@ -880,3 +880,94 @@ is a benchmark-grade honesty miss to watch.
   the known launched-app pipe artifact the bench driver already works
   around by PID-polling; IGRIS itself exited cleanly after printing its
   answer.
+## mcp-reff audit + browser-rs Windows port decision (2026-11-17)
+
+Audit of the five reference projects in `mcp-reff/` against IGRIS's 41
+in-process tools. Licenses decided the copy question first.
+
+### Licenses and verdicts
+
+| Project | License | Verdict |
+|---------|---------|---------|
+| d3sk-mcp-1.0.0 | MIT | copyable |
+| ferridriver-0.7.0 | MIT OR Apache-2.0 | copyable (14 crates - too heavy for IGRIS's needs) |
+| octofs-0.25.2 | Apache-2.0 | copyable (header + attribution required) |
+| omniget | GPL-3.0 | reference only - copying would GPL IGRIS |
+| OpenControl-0.1.0 | AGPL-3.0 | reference only - copying would AGPL IGRIS |
+
+### Where IGRIS stays (nothing replaced)
+
+Safety architecture (arm->confirm gating, budgets, unsupported: blocking,
+grammar-forced envelopes) has no reference analog - OpenControl's closest
+are an Escape-key abort and a read-only app blocklist, shallower than the
+file-backed pending store. Windows-deep tools (recycle_bin $I/$R parsing,
+power_mode, sys_stats/process_stats/disk_stats, shutdown/abort) are covered
+by no reference. The web stack (SSRF-vetoed web_fetch + provenance,
+web_search, github_repo_info) has no reference equivalent beyond browser
+navigation. Latency: in-process dispatch 0-40 ms vs +1-15 ms/call for any
+JSON-RPC server, plus prompt growth from foreign schemas - moving core
+tools to MCP would work against the 100-400 ms goal.
+
+### Adopt (license-clean, in value order)
+
+1. octofs line_hash.rs - composite N:hh line ids (position + content hash)
+   with stale-id verification whose errors are self-contained (fresh ids
+   around the target + relocation of the hash, nearest first). ~90 lines,
+   pure. Upgrades in-place editing; one failed edit becomes a one-step fix.
+2. octofs multi_edit.rs - batch edits across files staged in memory,
+   consistent global lock order, render-before-commit so a result-size
+   failure leaves nothing behind. One dispatch instead of N rounds (plan
+   item 9's structured-output bullet).
+3. d3sk-mcp clipboard_get/clipboard_set (enigo) - IGRIS's clearest gap
+   (grep confirms zero clipboard code). ~50 lines.
+4. d3sk-mcp mouse/keyboard (move/click/scroll/drag, key_press, type_text)
+   - IGRIS only has media_key. Input-injecting; gate like destructive ops.
+5. d3sk-mcp CDP browser control via chromiumoxide - browser-path table is
+   the same design as IGRIS's BROWSER_CANDIDATES (independent validation).
+Skip: omniget (GPL, heavy Tauri app; downloads/media already covered);
+ferridriver as a dependency (test-runner focus, 14 crates).
+Ideas re-implementable from OpenControl despite AGPL: JPEG capped at
+1568 px (token-light screenshots - moot for IGRIS's screenshot which
+saves a file and returns a path, never an image into context);
+wait_for_screen_change (kills blind-wait rounds); Set-of-Marks UIA tree
+(large project - license-clean shortcut is running OpenControl as an
+external MCP server behind the future mcp_tool tenant).
+
+### browser-rs (vendored in repo root, own git clone, MIT)
+
+Playwright-MCP-shaped browser server in Rust: bundled Chromium for
+Testing, 39/84 tools, markdown page reading (browser_text), browser_batch
+(multi-step per call), snapshot-diff replies, browser_handoff. Measured:
+535 MB vs Playwright MCP's 1496 MB over 4 pages, navigate 185-274 ms,
+server ready 3-6 ms, schemas 15.9k chars in agent context.
+
+macOS/Linux only upstream. Blockers read from source, all narrow:
+- cdp.rs: transport is --remote-debugging-pipe (NUL-framed JSON over
+  fds 3/4, dup2 + setpgid + libc pipe) - Unix-only.
+- browser.rs launch: pre_exec dup2, libc::close/from_raw_fd; watchdog
+  spawn (self --watchdog <pid>, stdin pipe held open).
+- browser.rs profile_dir: SingletonLock readlink + libc::kill liveness.
+- main.rs watchdog: libc::kill(-pgid, SIGTERM/SIGKILL).
+- install.rs: platform() lacks win64 (Google publishes chrome-win64 +
+  chrome-headless-shell-win64 for CfT 153.0.8010.36); cache_root uses
+  HOME/XDG; extract() shells to ditto/unzip.
+
+Port plan (zero new deps - tokio-tungstenite and reqwest already present):
+- cdp.rs: factor frame dispatch; add connect_ws() over WebSocket
+  (message-framed instead of NUL-framed); writer becomes enum
+  Pipe(File)/Ws(mpsc sender).
+- browser.rs launch: Windows branch picks a free TCP port
+  (--remote-debugging-port), spawns, polls /json/version for
+  webSocketDebuggerUrl, connects the ws Cdp. Watchdog spawn is shared.
+- profile_dir: cfg-gate the SingletonLock check to unix (Chrome uses
+  different locking on Windows).
+- main.rs watchdog: Windows body = taskkill /PID <pid> /T /F (tree kill =
+  process-group analog), retry until taskkill reports gone.
+- install.rs: ("windows","x86_64") => "win64"; cache under %LOCALAPPDATA%;
+  extract via System32 tar.exe (bsdtar reads zip natively on Win10+),
+  keeping ditto/unzip on their platforms.
+Verified: igris-ai dependency tree has zero tokio (Cargo.lock), so an
+in-process chromiumoxide port would drag an async runtime into the sync
+core - browser-rs as a persistent MCP server behind the future mcp_tool
+tenant stays the architecturally consistent route (capability extension,
+never per-request spawn, never a core dependency).
