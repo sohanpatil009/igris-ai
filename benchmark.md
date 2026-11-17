@@ -1027,3 +1027,72 @@ exists (todo: persistent server, cached tools/list, MCP schemas -> ToolDef
 tenants, start ungated under the config-tenant name rules). Footprint on
 this machine when running: chrome-headless-shell a few hundred MB RAM
 during calls; server binary itself is a small Rust exe.
+## Native browser tools in the registry - no MCP (2026-11-17)
+
+Per direction: browser tools live in IGRIS's own registry, in-process;
+no MCP anywhere. The ported browser-rs clone stays set aside for
+someday. The model-visible roster grew 41 -> 44 tools.
+
+### Design (crates/igris-core/src/tools/browser.rs, new, ~615 lines)
+
+- Sync CDP client over one WebSocket: `tungstenite` 0.28
+  (default-features off, "handshake" only) + the existing ureq agent
+  for the /json/version discovery GET. Zero async runtime anywhere:
+  reads use a 100 ms socket read timeout so the call loop checks
+  deadlines instead of blocking through; reply matching by CDP id,
+  Ping->Pong answered, events skipped.
+- One process-global session cell (OnceLock<Mutex<Option<...>>>)
+  holds socket + id counter + attached page sessionId (Target.
+  attachToTarget flatten:true) + browser pid. Debug port + pid persist
+  to %APPDATA%\igris\browser.json, so a crashed run's orphan browser is
+  REATTACHED, not duplicated; a stale entry (endpoint dead) is deleted
+  and a fresh browser launched.
+- Dedicated profile %LOCALAPPDATA%\igris\browser-profile, never the
+  user's real one (Chrome 136+ also requires a non-default
+  user-data-dir for remote debugging). --remote-debugging-pipe is
+  never passed beside the port flag (Chrome would prefer the pipe and
+  the endpoint never opens - the failure mode the browser-rs port hit).
+- Pick: caller-named chrome/brave/edge via the existing browser_exe
+  allowlist, else first installed of chrome/brave/edge; firefox is
+  rejected up front with "does not support the DevTools protocol
+  (CDP)" instead of an opaque later failure.
+- Error policy: CDP-socket errors carry a "CDP " prefix and drop the
+  session (next call relaunches/reattaches); page-level errors
+  (Page.navigate errorText, evaluate timeouts) keep the session for
+  retry. browser_open that finds a dead socket relaunches once inside
+  the same call.
+- Budgets (registry tool_budget): browser_open 30 s (cold launch +
+  Defender scan of a new exe), browser_read 10 s, browser_close 10 s.
+  In-call deadlines: discovery 12 s, attach 4 s, load 6 s, info 5 s,
+  read 8 s; close = Browser.close with 3 s grace, then taskkill
+  /PID <pid> /T /F tree kill (also covers reattached orphans).
+- Wiring: tools.rs `mod browser;` + three ToolDefs after open_url
+  (descs separate them from web_fetch = plain pages and open_url =
+  "just show the user"); registry.rs budget entries; Cargo.toml
+  +tungstenite. Roster snapshot tests updated: llm.rs count 41 -> 44 +
+  sort chain, config_tools.rs 42 -> 45, registry.rs names list.
+
+### Verification
+
+- Gate: cargo build --workspace clean (one dead-field warning fixed by
+  dropping the unused session port field); cargo test --workspace
+  464 passed / 0 failed / 1 ignored (baseline 459 + 5 new hermetic
+  tests: arg validation incl. the firefox veto, port-file roundtrip +
+  garbage rejection, char-boundary text clipping, honest read/close
+  behavior with no session).
+- Live via igris-ai.exe chat (driver D:\Temp\opencode\
+  browser_live_probe.ps1):
+  - "open https://example.com" -> [tools] browser_open dispatched,
+    launched Chrome 157 headless (pid 17776, port 57871), answered
+    "Example Domain".
+  - Between runs the browser + port file verified alive (pid present;
+    endpoint answered /json/version) - session outlives the process.
+  - Fresh-process "open / read / close" -> all three dispatches
+    ([tools] browser_open, browser_read, browser_close); browser_open
+    REATTACHED to the orphan browser via the port file; the answer
+    composed all three results.
+  - After close: pid gone, %APPDATA%\igris\browser.json removed, no
+    orphan processes.
+- Accepted v1 gap: browser_read in a fresh process errors with "call
+  browser_open first" rather than reattaching on its own; the model
+  then calls browser_open, which does reattach.

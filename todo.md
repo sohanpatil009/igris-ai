@@ -520,11 +520,32 @@ vendoring was rejected; see v1.2).
       both flags present - the shared arg list must strip it for the
       port path. Gate: build + clippy clean. Evidence: benchmark.md
       browser-rs port section 2026-11-17.
-- [ ] **`mcp_tool` client tenant** (v3 rung made concrete by the audit):
-      persistent server, `tools/list` cached at connect, MCP tool schemas
-      -> ToolDef tenants, dispatch over JSON-RPC; start ungated under the
-      same guarded-name rules as config tenants; first server to wire =
-      ported browser-rs. Never per-request spawn, never the 41 core tools.
+- [x] **Native browser tools in the registry** (no MCP, user direction
+      2026-11-17: browser-rs stays set aside) - DONE 2026-11-17: new
+      `tools/browser.rs` (~615 lines) is a sync CDP client over one
+      tungstenite 0.28 WebSocket + ureq /json/version discovery (zero
+      async runtime). Tools `browser_open` (launch/reattach + navigate +
+      title/preview), `browser_read` (title/url/~3000 chars visible
+      text), `browser_close` (graceful + taskkill tree fallback).
+      Session: process-global cell; debug port + pid persist to
+      `%APPDATA%\igris\browser.json` so a crashed run's orphan browser
+      is reattached, not duplicated; dedicated profile
+      `%LOCALAPPDATA%\igris\browser-profile`; pick chrome/brave/edge via
+      the browser_exe allowlist, firefox rejected up front (no CDP);
+      CDP-socket errors drop the session, page errors keep it. Budgets
+      30/10/10 s. Registry 41 -> 44 tools (roster snapshot tests
+      updated). Live: browser_open launched Chrome 157 headless and
+      answered "Example Domain"; fresh-process open reattached via the
+      port file; read + close verified; close removed pid/port file
+      with no orphans. Gate: build clean, 464/0/1. Evidence:
+      benchmark.md native browser tools section 2026-11-17.
+- [ ] **`mcp_tool` client tenant** - PARKED 2026-11-17 (user: "we dont
+      want any mcp"): browser needs went native in the registry
+      instead. Keep the design notes for if a community integration is
+      ever wanted: persistent server, `tools/list` cached at connect,
+      MCP tool schemas -> ToolDef tenants, dispatch over JSON-RPC; ungated
+      under the same guarded-name rules as config tenants. Never
+      per-request spawn, never the core tools.
 - [ ] `clipboard_get`/`clipboard_set` (audit item 3, d3sk-mcp MIT as
       reference) - text-only, Windows clipboard via the windows crate
       (needs Win32_System_DataExchange + Win32_System_Memory features).

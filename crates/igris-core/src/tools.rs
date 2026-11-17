@@ -113,6 +113,7 @@
 
 
 mod basic;
+mod browser;
 mod config_tools;
 mod dev;
 mod files;
@@ -134,6 +135,7 @@ pub use registry::{DispatchPhase, Registry, ToolDef};
 pub(crate) use shared::truncate_chars;
 
 use crate::tools::basic::{run_calculate, run_get_time, run_media_key, run_open_app, run_open_url};
+use crate::tools::browser::{run_browser_close, run_browser_open, run_browser_read};
 use crate::tools::config_tools::CONFIG_TOOLS;
 use crate::tools::dev::run_run_command;
 use crate::tools::files::{
@@ -488,6 +490,59 @@ pub fn seed_registry() -> Registry {
         gated: false,
         plan: None,
         run: Arc::new(run_open_url),
+    });
+    r.register(ToolDef {
+        name: "browser_open".to_string(),
+        desc: "Open a URL in an automation browser you control (Chrome DevTools \
+              Protocol): launches a dedicated browser - chrome, then brave, \
+              then edge; firefox is not supported - and returns the page \
+              title with a short text preview. Use this when you must read \
+              the page or interact with it in later steps (browser_read). \
+              Use web_fetch for plain pages, and open_url when the user \
+              just wants to see the site."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to open, e.g. https://example.com"
+                },
+                "browser": {
+                    "type": "string",
+                    "description": "Optional: chrome, brave or edge. Default: first installed of chrome, brave, edge."
+                },
+                "headless": {
+                    "type": "boolean",
+                    "description": "Optional: false shows the browser window (default true = headless)"
+                }
+            },
+            "required": ["url"]
+        }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_browser_open),
+    });
+    r.register(ToolDef {
+        name: "browser_read".to_string(),
+        desc: "Read the page currently open in the automation browser: title, \
+              URL and up to ~3000 characters of visible text. Call \
+              browser_open first."
+            .to_string(),
+        schema: json!({ "type": "object", "properties": {} }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_browser_read),
+    });
+    r.register(ToolDef {
+        name: "browser_close".to_string(),
+        desc: "Close the automation browser opened by browser_open and free \
+              its memory. Safe to call when nothing is open."
+            .to_string(),
+        schema: json!({ "type": "object", "properties": {} }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_browser_close),
     });
     r.register(ToolDef {
         name: "media_key".to_string(),
