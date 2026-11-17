@@ -490,10 +490,22 @@ vendoring was rejected; see v1.2).
         investigation away, final round released nothing) - the round
         cap is no longer the binding constraint there. Evidence:
         benchmark.md P3 item 9 section 2026-11-17.
-  - [ ] Browser targeting (U1 probe remainder): optional `browser`
-        argument for `open_url`/`play_song` so "in Brave" is capability,
-        not registry luck (https UserChoice missing on the benchmark host,
-        fallback hit Brave while http defaults to Firefox).
+  - [x] Browser targeting (U1 probe remainder) - DONE 2026-11-17:
+        optional `browser` argument (chrome, brave, firefox, edge) on
+        `open_url` and on config URL tools whose schema declares it
+        (play_song's tools.toml updated). Resolution is an allowlist
+        table of fixed install locations (Program Files / x86 /
+        LocalAppData), first existing exe wins; the URL is one argv
+        element via std::process::Command, never a shell, never a
+        user-supplied path; unknown names die with the allowed list at
+        dispatch time. Gate 459/0/1 (+4 tests). Live: brave 9->10 and
+        10->11 procs (open_url + play_song), firefox 0->11 (open_url),
+        netscape -> honest allowlist refusal, no window. Finding:
+        page-shaped prompts ("open https://... in Firefox") twice
+        steered the model to web_fetch instead - one retry gave a flatly
+        false "I've opened it in Brave"; "Launch the <browser> with the
+        page open" phrasing flips it to open_url. Evidence:
+        benchmark.md B-series 2026-11-17.
 - [ ] Optional someday: WASM/MCP plugin bridge (`zeroclaw-plugins`) — only
       as an `mcp_tool` client tenant type, never a dependency of the core
 

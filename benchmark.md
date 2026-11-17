@@ -826,3 +826,57 @@ complete without it.
   err log shows its dispatch (1 call, 23 ms); all other rounds print. Read
   as a stdout capture artifact, not a dispatch difference - err's timing
   lines are authoritative for what ran.
+## B-series - browser targeting for open_url/play_song (2026-11-17)
+
+Shipped in commit (this session, "core: optional browser argument"); gate 459
+passed / 0 failed / 1 ignored (+4 tests in basic.rs). Closes roadmap item 3
+from the U1 probe: "in Brave" becomes a capability instead of a registry
+accident.
+
+### What changed
+
+- Optional `browser` argument on `open_url` (code tool) and on every config
+  URL tool whose schema declares it (play_song's tools.toml updated):
+  chrome, brave, firefox, edge. Omitted = ShellExecuteW default browser,
+  exactly as before.
+- Resolution is an allowlist table (`BROWSER_CANDIDATES` in basic.rs): the
+  name picks a table row, the row lists fixed install locations (Program
+  Files / Program Files (x86) / LocalAppData), first existing exe wins.
+  The user can never smuggle a path through - a non-allowlisted name dies
+  with the allowed list before any path is touched. Env-var expansion is
+  whole-%VAR%-segment only, injectable for hermetic tests.
+- Launch: the URL is passed as ONE argv element via std::process::Command
+  (no shell). The URL has already passed the http/https + forbidden-
+  character validation, so it is exactly one safe argument.
+- Unknown browser: honest allowlist error at dispatch time; no launch.
+
+### Live probes (bench2 driver, brave/firefox process deltas)
+
+| Id | Ask | Wall | Result |
+|----|-----|------|--------|
+| B1B | "Launch the Brave browser with the page https://example.com open in it" (do not fetch) | ~15 s | open_url with browser=brave; brave.exe 9 -> 10 processes, newest started at 07:14:43. |
+| B2B | "Launch the Firefox browser with ... " (same shape) | ~19 s | open_url with browser=firefox; firefox.exe 0 -> 11 processes. |
+| B3 | "Play the song Never Gonna Give You Up in the Brave browser." | 6.3 s | play_song (config URL tool) routed through the browser argument; brave.exe 10 -> 11. The tools.toml schema's optional browser property is what told the model it could. |
+| B4B | "Launch the Netscape browser with ... " | 18.9 s | open_url browser=netscape -> allowlist refusal: "Allowed: chrome, brave, firefox, edge"; the model reported it honestly and asked which browser to use instead of proceeding. No window opened. |
+
+### Model-behavior finding (three probes needed a nudge)
+
+When the ask is phrased around a fetchable page ("Open https://example.com
+in the Firefox browser"), the model twice chose `web_fetch` instead of
+`open_url` - and B1's fetch attempt ended with a FLATLY FALSE "I've opened
+it in Brave" (no process delta: 9 -> 9). The "Launch the <browser> with the
+page ... open in it - do not fetch" phrasing flipped all retries to open_url.
+B4's fetch detour at least disclosed the substitution ("I used web_fetch
+instead"), B1's did not. The capability is real; the model's tool-choice
+under page-shaped prompts is the remaining gap, and the one dishonest claim
+is a benchmark-grade honesty miss to watch.
+
+### Side effects on the machine
+
+- Brave opened example.com twice, Firefox once, YouTube search once (the
+  B3 probe). All windows are user-visible on the desktop.
+- Firefox inherited the CLI's output pipe during the first B2B attempt's
+  manual (non-driver) invocation and held the shell open until timeout -
+  the known launched-app pipe artifact the bench driver already works
+  around by PID-polling; IGRIS itself exited cleanly after printing its
+  answer.
