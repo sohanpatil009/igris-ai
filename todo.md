@@ -506,6 +506,29 @@ vendoring was rejected; see v1.2).
         false "I've opened it in Brave"; "Launch the <browser> with the
         page open" phrasing flips it to open_url. Evidence:
         benchmark.md B-series 2026-11-17.
+  - [x] Click-through browser control (rabhata E2E remainder) - DONE
+        2026-11-17 (commit `a65c8dd`): `browser_click` (Runtime.evaluate
+        DOM click; when
+        selector and text are BOTH given they compose - the element
+        must match the selector AND contain the text) +
+        `browser_open_and_click` (navigate + click + settle read in
+        one call) + the launch flag
+        `--autoplay-policy=no-user-gesture-required` (fresh automation
+        profiles have zero Media Engagement Index). Chrome defers
+        playback in unfocused windows, so the play recipe ends with
+        focus_window (steered via the tool desc + play_song's
+        tools.toml desc; LFM picked it up unprompted in the acceptance
+        run). Live: the verbatim task "open brave and play rabhata
+        song on 70% volume" completed end-to-end on its own
+        (browser_open -> browser_open_and_click x3 -> set_volume 70 ->
+        focus_window; watch?v=zlt38OOqwDc playing, t advancing,
+        endpoint 70%, user confirmed audibly). Residual: composition
+        is LLM-steered, not deterministic - 8 rounds for a 4-tool flow
+        (dithering + spelling sensitivity of text matching); ties into
+        the deterministic tool-composition thread. Level 3 trusted
+        input (Input.dispatchMouseEvent) deferred. Gate 468/0/1.
+        Evidence: benchmark.md browser click-through section
+        2026-11-17.
 - [x] **browser-rs Windows port** (vendored `browser-rs/`, own git clone,
       MIT, upstream macOS/Linux-only) - DONE 2026-11-17, clone commit
       `00e6e4c`: cdp.rs gained a WebSocket transport (`connect_ws` over
@@ -562,3 +585,22 @@ vendoring was rejected; see v1.2).
 - [x] Test B (auto → GPU backend ready) — pass
 - [x] Test C (GPU exe renamed → auto CPU fallback → restored) — pass
 - [x] Commit: `c5b16e3` (backend) + `fbb9d34` (docs)
+- [x] GPU llama-server crash 2026-11-17 - investigated: 3x 0xc0000005
+      in nvoglv64.dll (NVIDIA driver) mid-generation, same fault
+      offset (MX350 2 GB, --swa-full 8k ctx runs at the VRAM edge -
+      server log warns "failed to fit params to free device memory").
+      The driver was wedged by the first crash and cleared itself
+      ~20 min later; a fresh GPU spawn then loaded AND passed a
+      generation probe. CPU build (MOON_LLM_CPU=1) accepted the
+      acceptance run in between. GPU code path unchanged - no IGRIS
+      action needed unless it recurs.
+- [x] llama-server logon autostart (user request 2026-11-17) - DONE
+      (commit `7c077c2`):
+      `scripts/llama_server_autostart.ps1` + a .vbs in the user's
+      Startup folder. Mirrors ensure_server (skip when /health answers
+      with our model; GPU first, CPU fallback; try_start's flags
+      verbatim) plus a 1-token GENERATION PROBE IGRIS lacks - it
+      catches a /health-alive but wedged server (the crash shape seen
+      that day). Never kills a foreign server. Reuse proven live:
+      fresh chat printed "reusing already-running llama-server".
+      Boot log %TEMP%\igris-llama-boot.log.

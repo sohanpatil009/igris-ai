@@ -1123,3 +1123,139 @@ First real multi-tool composition through the full voice-path shape
   on the browser_open session is the natural future extension).
 - Cleanup: no browser session file left behind (browser_open never
   got past validation), no orphans.
+
+## Browser click-through: browser_click + browser_open_and_click (2026-11-17)
+
+The task "open brave and play rabhata song on 70% volume" exposed the
+missing capability: nothing could CLICK a video. Level 1, the zero-code
+embed trick (youtube.com/embed?listType=search&list=X&autoplay=1), is
+DEAD: YouTube deprecated listType=search as of 15 Nov 2020 (the
+official player-parameters doc lists only playlist and user_uploads;
+live, the embed tab loads a bare error player titled just "YouTube").
+Level 2 was built (user choice): browser_click via Runtime.evaluate
+DOM click plus the launch flag
+--autoplay-policy=no-user-gesture-required (fresh automation profiles
+have zero Media Engagement Index, so YouTube refuses autoplay without
+it). Level 3 (trusted input, Input.dispatchMouseEvent) deferred.
+
+Implementation (tools/browser.rs; +4 hermetic tests; roster 44 -> 46
+built-ins; gate 468 passed / 0 failed / 1 ignored):
+- CLICK_JS: one-shot evaluate. Selector OR visible text; text matches
+  the first link/button whose text or title contains it
+  (case-insensitive, first 400 candidates). When BOTH are given they
+  COMPOSE: the element must match the selector AND contain the text.
+  Learned from a live run: with selector winning over text,
+  selector:"a" + text clicked the logo -> homepage detour.
+- Caller text/selector are embedded as JSON string literals
+  (serde_json::to_string), so quotes and angle brackets in user input
+  cannot break out of the script.
+- browser_click: 3 s pre-read (before URL) -> click -> 800 ms settle
+  -> post-read (one retry when a mid-navigation context dies);
+  not-found errors name the page they searched (title + url) so the
+  model can retry sensibly.
+- browser_open_and_click {url, text?, selector?, browser?, headless?}:
+  navigate + click + settle read in ONE call. The model itself
+  hallucinated wanting this ("browser_play_song") - the spec came from
+  the model. Collapses the play flow to one turn.
+- launch_args() extracted and pinned by test: never
+  --remote-debugging-pipe beside the port flag (Chrome would prefer
+  the pipe and the DevTools endpoint never opens - the browser-rs port
+  lesson), always the autoplay policy, headless optional.
+- browser_open desc steers headless:false for see/hear tasks.
+- Snapshot updates: registry names list, llm.rs ordering chain
+  (bclk < bc < bo < boac < br < c) + call-args count, config_tools
+  count 47.
+- Hermetic-test gotcha (captured in a test comment): valid-arg browser
+  calls fall through validation into session work - a selector-only
+  case in a test REATTACHED to the live browser and navigated it away
+  mid-playback. Only invalid-arg rejections are asserted.
+
+Live runs (detached probe driver, verbatim prompt, LFM3-1.7B):
+- Run 1 (scripted): browser_open headless:false -> browser_click text
+  "Raabta" -> watch?v=zlt38OOqwDc (radio chain). The model recovered
+  from a selector "video" no-match error by retrying with text - the
+  error-guides-retry design working as intended.
+- Run 2 (natural): play_song's name bias won (browser_open, set_volume,
+  play_song) with a false "playing" claim. Steering v2/v3 rewrote
+  play_song's tools.toml desc ("a results page plays NOTHING..."); the
+  next run skipped play_song entirely but burned all 10 rounds
+  dithering over click arguments.
+- Run 3: never really ran - the probe driver taught two lessons. (a) A
+  harness re-invocation broke the -Prompt binding and PowerShell sat at
+  the mandatory-param interactive prompt forever; driver v2 embeds the
+  prompt, parameter-less. (b) cmd.exe file redirection for igris's
+  stdout/stderr means a launched browser can never block the reader.
+  Launch is detached via WMI Win32_Process.Create (survives
+  tool-timeout tree-kills); per-run timestamped output files.
+- Run 4: turn 1 dispatched [tools] browser_open_and_click, set_volume
+  - the one-shot composition breakthrough. The misspelling "rabhata"
+  (extra h) broke substring matching against "Raabta" titles; the
+  model adapted (web_search for the video, direct open, media_key
+  play_pause) but the round cap cut it while writing its answer.
+  Playback stayed blocked: paused:false with t stuck at 0 - Chrome
+  DEFERS PLAYBACK IN UNFOCUSED WINDOWS. WScript.Shell AppActivate ->
+  t advanced 1.89 -> 5.96. Steering v4: finish the recipe with
+  focus_window.
+- Run 5: perfect turn-1 again, but the model passed text "Rabhata"
+  again and gave up instead of self-correcting.
+  browser_open_and_click gained selector support; steering v5 teaches
+  ytd-video-renderer a#video-title (YouTube's first video whatever the
+  spelling - the results page corrects the query itself).
+- Run 6 (acceptance, cold CPU server, ~4 min 54 s wall): the model ran
+  the flow END TO END - browser_open, browser_open_and_click x3,
+  set_volume 70, focus_window (picked up from the steering unprompted)
+  - and answered with the exact watch URL and volume. Ground truth:
+  watch?v=zlt38OOqwDc, paused:false, t advancing (173.1 -> 177.2 over
+  4 s), headed window focused, endpoint volume 70% (the video
+  element's vol 0.53 is YouTube's own player slider, not the system
+  scalar). User confirmed audibly.
+- Residual: composition is LLM-steered, not deterministic - 8 rounds
+  for a 4-tool flow (dithering plus spelling sensitivity of text
+  matching). The deterministic tool-composition roadmap item is the
+  structural fix; the 10-round cap is the binding constraint when LFM
+  dithers.
+
+Environment note: llama-server's GPU build crashed 3x today (event
+log: 0xc0000005 in nvoglv64.dll, the NVIDIA driver, same fault offset,
+during the first generation; GeForce MX350 2 GB VRAM runs --swa-full
+8k ctx at the VRAM edge - the server log warns "failed to fit params
+to free device memory"). Pattern fits a driver wedged by the first
+crash and clearing later: at 13:19 a fresh GPU spawn loaded AND passed
+a generation probe. Run 6 was accepted on the CPU build (MOON_LLM_CPU
+=1). The GPU code path is unchanged; revisit only if it recurs.
+
+Test-isolation bug found and fixed (gating.rs): the registry's gated
+tests armed their probe into the USER'S REAL %APPDATA%\igris
+\pending.json - the process-wide store is ONE file captured at
+LazyLock first touch, and a later full-suite run inside the 120 s
+expiry saw the stale probe as already pending, so
+dispatch_classified_marks_phases failed (phase != Armed) while
+passing in isolation. First attempt (IGRIS_PENDING_FILE env override
+in default_path(), kept as an operator seam) was insufficient: files.rs
+tests also dispatch real gated tools, so WHICH module touches the
+store first is nondeterministic. Final fix: a cfg!(test) branch in the
+LazyLock initializer - per-process temp file, recreated empty -
+hermetic regardless of test order. Verified: 468/0/1 twice AND the
+user's real pending.json absent after test runs.
+
+## llama-server logon autostart (2026-11-17)
+
+User request: the server should already be warm when the PC starts so
+no run pays the model-load cost. scripts/llama_server_autostart.ps1 +
+a .vbs in the user's Startup folder (hidden, fire-and-forget). The
+script mirrors ensure_server: skip when /health answers with our
+model, GPU build first, CPU fallback; flags are try_start's verbatim
+so a boot-spawned server is configuration-identical and the reuse path
+accepts it. One guard IGRIS itself does not have: after /health, a
+1-token generation probe - the day's GPU crash left /health answering
+while the process died on the first real request, which health+props
+cannot catch; the probe detects that wedge and falls back to CPU.
+Never kills a foreign server (fail-closed, like ensure_server).
+Live: with the run-6 CPU server up, the script logged "already
+running" (path 1). After killing it, the GPU build spawned and
+verified generation in 16 s and stayed up (the driver had recovered).
+Decisive reuse check: a fresh chat run printed "reusing
+already-running llama-server (:8081)" and answered - a boot-warmed
+server is accepted with zero model-load cost. Boot log:
+%TEMP%\igris-llama-boot.log; server stderr (same file IGRIS's
+try_start uses): %TEMP%\igris-llama-server-stderr.log.
