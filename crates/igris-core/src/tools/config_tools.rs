@@ -219,8 +219,21 @@ fn expand_template(template: &str, args: &Value, encode: bool) -> Result<String,
 pub(crate) fn run_config_url(template: &str, args: &Value) -> Result<String, String> {
     let url = expand_template(template, args, true)?;
     validate_open_url(&url)?;
-    shell_open(&url)?;
-    Ok(format!("Opened {url}"))
+    /* Optional standard browser arg (U1 follow-up): any config URL tool
+     * whose schema declares `browser` gains browser targeting. The URL
+     * template never references it, so expansion ignores it; only the
+     * allowlisted names in basic::BROWSER_CANDIDATES are accepted. */
+    match args.get("browser") {
+        None | Some(Value::Null) => {
+            shell_open(&url)?;
+            Ok(format!("Opened {url}"))
+        }
+        Some(Value::String(name)) => {
+            let msg = crate::tools::basic::open_in_named_browser(name, &url)?;
+            Ok(format!("{msg}"))
+        }
+        Some(_) => Err("browser must be a string: chrome, brave, firefox or edge".into()),
+    }
 }
 
 pub(crate) fn run_config_command(template: &[String], args: &Value) -> Result<String, String> {

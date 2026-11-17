@@ -389,8 +389,129 @@ pub(crate) fn run_open_url(args: &Value) -> Result<String, String> {
     let url = required_str(args, "url", "open_url")?;
     validate_open_url(url)?;
     let url = url.trim().to_string();
-    shell_open(&url)?;
-    Ok(format!("Opened {url} in the default browser."))
+    match args.get("browser") {
+        None | Some(Value::Null) => {
+            shell_open(&url)?;
+            Ok(format!("Opened {url} in the default browser."))
+        }
+        Some(Value::String(name)) => open_in_named_browser(name, &url),
+        Some(_) => Err("browser must be a string: chrome, brave, firefox or edge".into()),
+    }
+}
+
+/* ================================================================ */
+/* browser targeting — optional `browser` arg (U1 follow-up)          */
+/* ================================================================ */
+
+/// Browser targeting (U1 probe follow-up, 2026-11-16): the live run's
+/// "in Brave" outcome was registry accident, not capability - the https
+/// association had no UserChoice, so ShellExecuteW's default-browser
+/// fallback happened to be Brave while http pointed at Firefox. The
+/// optional `browser` argument (open_url and config URL tools) makes
+/// "in Brave" a real capability: the URL is passed as ONE argv element
+/// to that browser's own executable - never a shell, never an arbitrary
+/// user-supplied path. The allowlist table below IS the whole launch
+/// surface; each entry is tried in order and the first existing exe wins.
+const BROWSER_CANDIDATES: &[(&str, &[&str])] = &[
+    (
+        "chrome",
+        &[
+            "%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe",
+            "%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe",
+            "%LocalAppData%\\Google\\Chrome\\Application\\chrome.exe",
+        ],
+    ),
+    (
+        "brave",
+        &[
+            "%ProgramFiles%\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+            "%LocalAppData%\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+        ],
+    ),
+    ("firefox", &["%ProgramFiles%\\Mozilla Firefox\\firefox.exe"]),
+    (
+        "edge",
+        &[
+            "%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe",
+            "%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe",
+        ],
+    ),
+];
+
+/// The browser names [`browser_exe`] accepts, for error messages.
+pub(crate) const BROWSER_NAMES: &str = "chrome, brave, firefox, edge";
+
+/// Resolve a browser name from [`BROWSER_CANDIDATES`] to its executable.
+/// Pure filesystem lookup over fixed install locations - the caller can
+/// never smuggle a path through; the name picks a table row and the row
+/// picks the exe.
+pub(crate) fn browser_exe(name: &str) -> Result<std::path::PathBuf, String> {
+    let want = name.trim().to_lowercase();
+    let Some((label, candidates)) = BROWSER_CANDIDATES.iter().find(|(n, _)| *n == want) else {
+        return Err(format!(
+            "Unknown browser '{name}'. Allowed: {BROWSER_NAMES} (omit browser for the system default)"
+        ));
+    };
+    let mut tried: Vec<String> = Vec::new();
+    for cand in *candidates {
+        let Some(path) = expand_env_path(cand) else {
+            continue; /* env var absent on this host */
+        };
+        if path.is_file() {
+            return Ok(path);
+        }
+        tried.push(path.display().to_string());
+    }
+    Err(format!(
+        "'{label}' is not installed at any known location on this machine (tried: {})",
+        tried.join("; ")
+    ))
+}
+
+/// Expand the %VAR% references used by [`BROWSER_CANDIDATES`]. Only whole
+/// `%NAME%` segments are substituted; an unknown var drops the candidate.
+fn expand_env_path(spec: &str) -> Option<std::path::PathBuf> {
+    expand_env_path_with(spec, |var| std::env::var(var).ok())
+}
+
+/// The pure core of [`expand_env_path`]: the environment lookup is
+/// injectable so tests exercise substitution without touching the real
+/// environment (which parallel tests must never mutate).
+fn expand_env_path_with(
+    spec: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    let mut out = String::with_capacity(spec.len());
+    let mut rest = spec;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('%') else {
+            return None; /* lone % - a malformed spec, never guess */
+        };
+        let var = &after[..end];
+        match get(var) {
+            Some(v) => out.push_str(&v),
+            None => return None,
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Some(std::path::PathBuf::from(out))
+}
+
+/// Open `url` in the named browser: spawn the resolved exe with the URL
+/// as one argv element (std::process::Command, no shell). The URL has
+/// already passed [`validate_open_url`], so it cannot contain spaces,
+/// quotes or control characters - it is exactly one safe argument.
+pub(crate) fn open_in_named_browser(browser: &str, url: &str) -> Result<String, String> {
+    let exe = browser_exe(browser)?;
+    let label = browser.trim().to_lowercase();
+    std::process::Command::new(&exe)
+        .arg(url)
+        .spawn()
+        .map_err(|e| format!("Could not launch {}: {e}", exe.display()))?;
+    Ok(format!("Opened {url} in {label}."))
 }
 
 /* ================================================================ */
@@ -661,6 +782,81 @@ mod tests {
     fn open_url_rejects_missing_args_without_launching() {
         assert!(reg().dispatch("open_url", &json!({})).is_err());
         assert!(reg().dispatch("open_url", &json!({"url": 5})).is_err());
+    }
+
+    /* ---- browser targeting (U1 follow-up) ---- */
+
+    #[test]
+    fn browser_exe_allowlist_is_the_whole_surface() {
+        /* names outside the table die before any path is touched
+         * (trimmed + case-insensitive names ARE accepted by design) */
+        for bad in ["netscape", "", "C:\\evil\\exe", "brave.exe"] {
+            let err = browser_exe(bad).unwrap_err();
+            assert!(err.contains("Allowed: chrome, brave, firefox, edge"), "{err}");
+        }
+    }
+
+    #[test]
+    fn browser_exe_resolves_known_names_or_says_uninstalled() {
+        /* host-dependent by design: each allowlisted name either resolves
+         * to an existing exe or errors with the tried paths - never a
+         * panic, never a launch */
+        for name in ["chrome", "brave", "firefox", "edge"] {
+            match browser_exe(name) {
+                Ok(path) => {
+                    assert!(path.is_file(), "{name} resolved to a missing file: {path:?}");
+                    let file = path.file_name().unwrap().to_string_lossy().to_lowercase();
+                    let want = match name {
+                        "edge" => "msedge.exe",
+                        other => other,
+                    };
+                    assert!(file.starts_with(want), "{name} -> {file}");
+                }
+                Err(e) => assert!(
+                    e.contains("not installed at any known location"),
+                    "{name}: {e}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn open_url_rejects_bad_browser_types_without_launching() {
+        /* a non-string browser must fail at parse time, never fall back
+         * to the default path silently */
+        assert!(
+            reg()
+                .dispatch("open_url", &json!({"url": "https://example.com", "browser": 3}))
+                .is_err()
+        );
+        assert!(
+            reg()
+                .dispatch("open_url", &json!({"url": "https://example.com", "browser": []}))
+                .is_err()
+        );
+        /* unknown name: allowlist error before any resolution */
+        let err = reg()
+            .dispatch("open_url", &json!({"url": "https://example.com", "browser": "netscape"}))
+            .unwrap_err();
+        assert!(err.contains("Unknown browser 'netscape'"), "{err}");
+    }
+
+    #[test]
+    fn expand_env_path_substitutes_whole_segments_only() {
+        let fake = |var: &str| -> Option<String> {
+            match var {
+                "IGRIS_TESTVAR" => Some("C:/tmp".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            expand_env_path_with("%IGRIS_TESTVAR%\\sub\\file.txt", fake),
+            Some(std::path::PathBuf::from("C:/tmp\\sub\\file.txt"))
+        );
+        /* unknown var drops the candidate instead of guessing */
+        assert_eq!(expand_env_path_with("%IGRIS_NO_SUCH_VAR_9%\\x", fake), None);
+        /* a lone % is malformed - reject, never treat as text */
+        assert_eq!(expand_env_path_with("100%\\x", fake), None);
     }
 
     /* ---- media_key ---- */

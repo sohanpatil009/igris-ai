@@ -466,13 +466,21 @@ pub fn seed_registry() -> Registry {
     });
     r.register(ToolDef {
         name: "open_url".to_string(),
-        desc: "Open a web URL (http or https) in the default browser.".to_string(),
+        desc: "Open a web URL (http or https) in a browser. By default the system's \
+              default browser; pass browser (chrome, brave, firefox or edge) to target \
+              a specific one, e.g. when the user says 'in Brave'. If that browser is \
+              not installed the error says so - omit browser and retry, or tell the user."
+            .to_string(),
         schema: json!({
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
                     "description": "The URL to open, e.g. https://example.com"
+                },
+                "browser": {
+                    "type": "string",
+                    "description": "Optional: chrome, brave, firefox or edge. Omit for the system default."
                 }
             },
             "required": ["url"]
