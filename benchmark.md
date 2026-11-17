@@ -1096,3 +1096,30 @@ someday. The model-visible roster grew 41 -> 44 tools.
 - Accepted v1 gap: browser_read in a fresh process errors with "call
   browser_open first" rather than reattaching on its own; the model
   then calls browser_open, which does reattach.
+## Live E2E: "open brave and play rabhata song on 70% volume" (2026-11-17)
+
+First real multi-tool composition through the full voice-path shape
+(chat -> LFM -> registry -> effects), run via the chat probe driver.
+
+- One turn dispatched three tools: browser_open, set_volume, play_song.
+- browser_open was rejected by design: the model passed a search query
+  containing a space as the url and validate_open_url vetoed it (it
+  takes direct URLs only). The model moved on without surfacing a
+  failure - exactly the error-guides-retry behavior the arg validation
+  exists for.
+- set_volume: endpoint read-back (GetMasterVolumeLevelScalar after
+  SetMasterVolumeLevelScalar) confirmed 70%. A waveOutGetVolume probe
+  from the outside read 100% - legacy wave API does not track the
+  endpoint scalar on this machine; the endpoint read-back is
+  authoritative (same API the OS mixer slider shows).
+- play_song (config tenant, tools.toml): opened the YouTube search
+  results for "rabhata" with browser=brave. Brave verified: tab title
+  "(1938) rabhata - YouTube - Brave", 24 brave processes.
+- Honest final reply: results page open in Brave at 70% volume, user
+  picks the track ("Let me know if you want to confirm or pick a
+  specific track"). Results pages do not autoplay - play_song is a
+  search-opener by design; clicking a video needs a browser_click
+  capability IGRIS does not have yet (CDP click via Runtime.evaluate
+  on the browser_open session is the natural future extension).
+- Cleanup: no browser session file left behind (browser_open never
+  got past validation), no orphans.
