@@ -27,7 +27,9 @@ fn tool_budget(name: &str) -> Duration {
         "github_repo_info" => Duration::from_secs(20),
         // browser session: cold launch can hit a Defender scan of the exe
         "browser_open" => Duration::from_secs(30),
+        "browser_open_and_click" => Duration::from_secs(30),
         "browser_read" => Duration::from_secs(10),
+        "browser_click" => Duration::from_secs(10),
         "browser_close" => Duration::from_secs(10),
         // walk + hash budget inside find_duplicates itself
         "find_duplicates" => Duration::from_secs(120),
@@ -606,8 +608,10 @@ mod tests {
             names,
             vec![
                 "activity_log",
+                "browser_click",
                 "browser_close",
                 "browser_open",
+                "browser_open_and_click",
                 "browser_read",
                 "calculate",
                 "close_app",

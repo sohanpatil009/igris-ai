@@ -48,6 +48,8 @@ const INFO_BUDGET: Duration = Duration::from_secs(5);
 const READ_BUDGET: Duration = Duration::from_secs(8);
 /// How much visible text browser_read returns to the model.
 const READ_CLIP: usize = 3000;
+/// One click evaluate + the post-click settle read inside browser_click.
+const CLICK_BUDGET: Duration = Duration::from_secs(10);
 /// Small agent only for the loopback DevTools discovery GET (short
 /// overall timeout; the poll loop retries).
 static DISCOVERY_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
@@ -197,6 +199,45 @@ impl BrowserSession {
 const PAGE_INFO_JS: &str = "JSON.stringify({title: document.title, url: location.href, \
      text: document.body ? document.body.innerText : ''})";
 
+/// One-shot synthetic click. `__SEL__`/`__TXT__` are replaced with JSON
+/// string literals (so quotes in caller input stay harmless). With both
+/// arguments the element must match the selector AND contain the text
+/// (case-insensitive, first 400 candidates); with one, that one rule
+/// applies. Returns a JSON summary for honest feedback.
+const CLICK_JS: &str = r#"JSON.stringify((function () {
+    var sel = __SEL__;
+    var tx = __TXT__;
+    var el = null;
+    var key = function (n) {
+        return ((n.textContent || '') + ' ' + (n.getAttribute('title') || '')).trim().toLowerCase();
+    };
+    if (sel && tx) {
+        var lc = tx.toLowerCase();
+        var cands = document.querySelectorAll(sel);
+        for (var i = 0; i < cands.length && i < 400; i++) {
+            if (key(cands[i]).indexOf(lc) !== -1) { el = cands[i]; break; }
+        }
+    } else if (sel) {
+        el = document.querySelector(sel);
+    } else if (tx) {
+        var lc2 = tx.toLowerCase();
+        var cands2 = document.querySelectorAll('a,button,[role="button"],[role="link"]');
+        for (var j = 0; j < cands2.length && j < 400; j++) {
+            if (key(cands2[j]).indexOf(lc2) !== -1) { el = cands2[j]; break; }
+        }
+    }
+    if (!el) { return { found: false }; }
+    el.click();
+    return { found: true, tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80), href: el.href || '' };
+})())"#;
+
+/// Fill [`CLICK_JS`] with the caller's selector/text as JSON literals.
+fn click_js(selector: Option<&str>, text: Option<&str>) -> String {
+    let sel = serde_json::to_string(selector.unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
+    let txt = serde_json::to_string(text.unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
+    CLICK_JS.replace("__SEL__", &sel).replace("__TXT__", &txt)
+}
+
 static SESSION: OnceLock<Mutex<Option<BrowserSession>>> = OnceLock::new();
 
 fn session_cell() -> &'static Mutex<Option<BrowserSession>> {
@@ -230,11 +271,31 @@ fn open_session(exe: &Path, headless: bool) -> Result<BrowserSession, String> {
     Ok(BrowserSession { ws, next_id, page, pid, child: Some(child) })
 }
 
+/// The automation browser's launch line. Hermetically pinned by tests:
+/// never pass `--remote-debugging-pipe` beside the port flag (Chrome
+/// would prefer the pipe and the DevTools endpoint never opens), and
+/// always allow unmuted autoplay (fresh automation profiles have zero
+/// Media Engagement Index, so sites like YouTube refuse to autoplay
+/// without the policy flag).
+fn launch_args(port: u16, headless: bool, profile: &Path) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", profile.display()),
+        "--no-first-run".into(),
+        "--no-default-browser-check".into(),
+        "--autoplay-policy=no-user-gesture-required".into(),
+        "--window-size=1280,800".into(),
+    ];
+    if headless {
+        args.push("--headless".into());
+    }
+    args
+}
+
 /// Pick a free port, spawn the automation-dedicated browser and wait for
 /// its DevTools discovery endpoint to answer.
 fn spawn_browser(exe: &Path, headless: bool) -> Result<(u16, u32, Child), String> {
-    let port = {
-        let listener =
+    let port = {        let listener =
             TcpListener::bind("127.0.0.1:0").map_err(|e| format!("no free local debug port: {e}"))?;
         listener
             .local_addr()
@@ -245,16 +306,7 @@ fn spawn_browser(exe: &Path, headless: bool) -> Result<(u16, u32, Child), String
     std::fs::create_dir_all(&profile)
         .map_err(|e| format!("could not create the browser profile dir: {e}"))?;
 
-    let mut args: Vec<String> = vec![
-        format!("--remote-debugging-port={port}"),
-        format!("--user-data-dir={}", profile.display()),
-        "--no-first-run".into(),
-        "--no-default-browser-check".into(),
-        "--window-size=1280,800".into(),
-    ];
-    if headless {
-        args.push("--headless".into());
-    }
+    let mut args = launch_args(port, headless, &profile);
     args.push("about:blank".into());
 
     let mut child = Command::new(exe)
@@ -484,6 +536,128 @@ pub(crate) fn run_browser_open(args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+pub(crate) fn run_browser_open_and_click(args: &Value) -> Result<String, String> {
+    let url = args
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "browser_open_and_click needs a url (http or https)".to_string())?;
+    validate_open_url(url)?;
+    let selector = args
+        .get("selector")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let text = args
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if selector.is_none() && text.is_none() {
+        return Err(
+            "browser_open_and_click needs text (what to click once the page \
+             is open) or a selector"
+                .into(),
+        );
+    }
+    let headless = args.get("headless").and_then(Value::as_bool).unwrap_or(true);
+    let (exe, name) = pick_browser(args.get("browser").and_then(Value::as_str))?;
+
+    let mut cell = session_cell().lock().unwrap();
+    let mut sess = match cell.take() {
+        Some(s) => s,
+        None => open_session(&exe, headless)?,
+    };
+    let deadline = Instant::now() + LOAD_BUDGET;
+    let nav = match sess.call("Page.navigate", json!({ "url": url }), deadline) {
+        Ok(v) => v,
+        Err(e) if e.starts_with("CDP ") => {
+            sess = open_session(&exe, headless)?;
+            sess.call("Page.navigate", json!({ "url": url }), deadline)?
+        }
+        Err(e) => {
+            *cell = Some(sess);
+            return Err(e);
+        }
+    };
+    if let Some(err) = nav["errorText"].as_str().filter(|s| !s.is_empty()) {
+        *cell = Some(sess);
+        return Err(format!("navigation failed: {err}"));
+    }
+    sess.wait_ready(deadline);
+
+    // The click: same one-shot evaluate browser_click uses, then a settle
+    // read so the model learns what the click landed on.
+    let reply = match sess.call(
+        "Runtime.evaluate",
+        json!({ "expression": click_js(selector, text), "returnByValue": true }),
+        Instant::now() + CLICK_BUDGET,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            if !e.starts_with("CDP ") {
+                *cell = Some(sess);
+            }
+            return Err(e);
+        }
+    };
+    if let Some(d) = reply.get("exceptionDetails") {
+        *cell = Some(sess);
+        let msg = d["exception"]["description"]
+            .as_str()
+            .or_else(|| d["text"].as_str())
+            .unwrap_or("unknown script error");
+        return Err(format!("click script failed: {msg}"));
+    }
+    let payload = reply["result"]["value"].as_str().unwrap_or("");
+    let v: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    if v["found"].as_bool() != Some(true) {
+        // Best-effort page state so the model can see WHERE it looked.
+        let where_at = sess
+            .page_info(Instant::now() + Duration::from_secs(3))
+            .map(|(t, u, _)| format!("{} ({u})", if t.is_empty() { "(untitled)" } else { &t }))
+            .unwrap_or_else(|_| "(unknown page)".into());
+        *cell = Some(sess);
+        let what = selector
+            .map(|s| format!("selector '{s}'"))
+            .or_else(|| text.map(|t| format!("text '{t}'")))
+            .unwrap_or_default();
+        return Err(format!(
+            "opened {url} but nothing matched {what} on page {where_at} - nothing was clicked"
+        ));
+    }
+
+    std::thread::sleep(Duration::from_millis(800));
+    let after = match sess.page_info(Instant::now() + INFO_BUDGET) {
+        Ok(info) => Some(info),
+        Err(_) => {
+            std::thread::sleep(Duration::from_millis(500));
+            sess.page_info(Instant::now() + INFO_BUDGET).ok()
+        }
+    };
+    *cell = Some(sess);
+
+    let mode = if headless { "headless" } else { "headed" };
+    let tag = v["tag"].as_str().unwrap_or("?");
+    let clicked = v["text"].as_str().unwrap_or_default();
+    let mut out = format!(
+        "Opened {url} in {name} ({mode}) and clicked: <{tag}> \"{clicked}\""
+    );
+    if let Some(href) = v["href"].as_str().filter(|h| !h.is_empty()) {
+        out.push_str(&format!("\nLink: {href}"));
+    }
+    if let Some((title, url2, _)) = after {
+        if !url2.is_empty() && url2 != url {
+            out.push_str(&format!(
+                "\nPage now: {} ({url2})",
+                if title.is_empty() { "(untitled)" } else { &title }
+            ));
+        } else if !title.is_empty() {
+            out.push_str(&format!("\nPage: {title}"));
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn run_browser_read(_args: &Value) -> Result<String, String> {
     let mut cell = session_cell().lock().unwrap();
     let Some(mut sess) = cell.take() else {
@@ -510,6 +684,109 @@ pub(crate) fn run_browser_read(_args: &Value) -> Result<String, String> {
             Err(e)
         }
     }
+}
+
+pub(crate) fn run_browser_click(args: &Value) -> Result<String, String> {
+    let selector = args
+        .get("selector")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let text = args
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if selector.is_none() && text.is_none() {
+        return Err("browser_click needs a css selector or text to find".into());
+    }
+
+    let mut cell = session_cell().lock().unwrap();
+    let Some(mut sess) = cell.take() else {
+        return Err("no browser session is open - call browser_open first".into());
+    };
+
+    // The URL before the click, so the post-click read can tell the
+    // model whether navigation happened (a click often opens a new page).
+    let before_url = match sess.page_info(Instant::now() + Duration::from_secs(3)) {
+        Ok((_, url, _)) => url,
+        Err(e) => {
+            if !e.starts_with("CDP ") {
+                *cell = Some(sess);
+            }
+            return Err(e);
+        }
+    };
+
+    let js = click_js(selector, text);
+    let deadline = Instant::now() + CLICK_BUDGET;
+    let reply = match sess.call(
+        "Runtime.evaluate",
+        json!({ "expression": js, "returnByValue": true }),
+        deadline,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            if !e.starts_with("CDP ") {
+                *cell = Some(sess);
+            }
+            return Err(e);
+        }
+    };
+    if let Some(d) = reply.get("exceptionDetails") {
+        *cell = Some(sess);
+        let msg = d["exception"]["description"]
+            .as_str()
+            .or_else(|| d["text"].as_str())
+            .unwrap_or("unknown script error");
+        return Err(format!("click script failed: {msg}"));
+    }
+
+    let payload = reply["result"]["value"].as_str().unwrap_or("");
+    let v: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    if v["found"].as_bool() != Some(true) {
+        let where_at = sess
+            .page_info(Instant::now() + Duration::from_secs(3))
+            .map(|(t, u, _)| format!("{} ({u})", if t.is_empty() { "(untitled)" } else { &t }))
+            .unwrap_or_else(|_| "(unknown page)".into());
+        *cell = Some(sess);
+        let hint = text.map(|t| format!(" containing '{t}'")).unwrap_or_default();
+        return Err(format!(
+            "no clickable element matched{} on page {where_at} - nothing was clicked",
+            selector
+                .map(|s| format!(" selector '{s}'"))
+                .or(Some(hint))
+                .unwrap_or_default()
+        ));
+    }
+
+    // Let SPA navigation settle, then read the page the click landed on.
+    // A mid-navigation destroyed context reads as an error; retry once
+    // before giving up on the follow-up info (the click itself happened).
+    std::thread::sleep(Duration::from_millis(800));
+    let after = match sess.page_info(Instant::now() + INFO_BUDGET) {
+        Ok(info) => Some(info),
+        Err(_) => {
+            std::thread::sleep(Duration::from_millis(500));
+            sess.page_info(Instant::now() + INFO_BUDGET).ok()
+        }
+    };
+    *cell = Some(sess);
+
+    let tag = v["tag"].as_str().unwrap_or("?");
+    let clicked = v["text"].as_str().unwrap_or_default();
+    let mut out = format!("Clicked: <{tag}> \"{clicked}\"");
+    if let Some(href) = v["href"].as_str().filter(|h| !h.is_empty()) {
+        out.push_str(&format!("\nLink: {href}"));
+    }
+    if let Some((title, url, _)) = after {
+        if url != before_url && !url.is_empty() {
+            out.push_str(&format!("\nPage now: {} ({url})", if title.is_empty() { "(untitled)" } else { &title }));
+        } else if !title.is_empty() {
+            out.push_str(&format!("\nPage: {title}"));
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn run_browser_close(_args: &Value) -> Result<String, String> {
@@ -608,8 +885,80 @@ mod tests {
     }
 
     #[test]
-    fn browser_read_and_close_are_honest_without_a_session() {
+    fn launch_args_carry_the_cdp_and_autoplay_policies() {
+        let args = launch_args(9223, true, Path::new("C:\\p"));
+        assert!(args.iter().any(|a| a.contains("--remote-debugging-port=9223")));
+        assert!(args.iter().any(|a| a.contains("user-data-dir")));
+        // Chrome prefers the pipe when both flags are present and then the
+        // DevTools endpoint never opens - the port flag must stand alone.
+        assert!(args.iter().all(|a| !a.contains("remote-debugging-pipe")));
+        // Fresh automation profiles have zero Media Engagement Index.
+        assert!(args
+            .iter()
+            .any(|a| a.contains("--autoplay-policy=no-user-gesture-required")));
+        assert!(args.iter().any(|a| a.contains("--headless")));
+        assert!(!launch_args(9223, false, Path::new("C:\\p"))
+            .iter()
+            .any(|a| a.contains("--headless")));
+    }
+
+    #[test]
+    fn browser_click_validates_arguments_before_any_session() {
+        let err = run_browser_click(&json!({})).unwrap_err();
+        assert!(err.contains("selector"), "{err}");
+        assert!(run_browser_click(&json!({ "selector": "   " })).is_err());
+        assert!(run_browser_click(&json!({ "text": "" })).is_err());
+        assert!(run_browser_click(&json!({ "selector": "a", "text": "x" }))
+            .unwrap_err()
+            .contains("browser_open"));
+    }
+
+    #[test]
+    fn browser_open_and_click_validates_arguments_before_any_session() {
+        assert!(run_browser_open_and_click(&json!({}))
+            .unwrap_err()
+            .contains("url"));
+        assert!(run_browser_open_and_click(&json!({ "url": "https://example.com" }))
+            .unwrap_err()
+            .contains("text"));
+        assert!(run_browser_open_and_click(&json!({
+            "url": "https://www.youtube.com/results?search_query=x",
+            "text": "x",
+            "browser": "firefox"
+        }))
+        .unwrap_err()
+        .contains("DevTools protocol"));
+        assert!(run_browser_open_and_click(&json!({
+            "url": "file:///etc/passwd",
+            "text": "x"
+        }))
+        .is_err());
+        /* A selector alone is a valid click target, but every valid-arg
+         * call proceeds to session work - the live success path, which
+         * hermetic tests must never drive. Only invalid-arg rejections
+         * are asserted here. */
+    }
+
+    #[test]
+    fn click_js_embeds_arguments_as_json_literals() {
+        let js = click_js(Some("a#video-title"), Some("ra\"b <x>"));
+        assert!(!js.contains("__SEL__") && !js.contains("__TXT__"), "{js}");
+        assert!(js.contains(r#""a#video-title""#), "{js}");
+        // Quotes and angle brackets in caller input must arrive escaped,
+        // so they can never break out of the string literal.
+        assert!(js.contains(r#""ra\"b <x>""#), "{js}");
+        assert!(js.contains("querySelectorAll(sel)") && js.contains("el.click()"), "{js}");
+        let js2 = click_js(None, Some("hello"));
+        assert!(js2.contains(r#""hello""#), "{js2}");
+        assert_eq!(click_js(None, None), CLICK_JS.replace("__SEL__", "\"\"").replace("__TXT__", "\"\""));
+    }
+
+    #[test]
+    fn browser_read_click_and_close_are_honest_without_a_session() {
         assert!(run_browser_read(&json!({})).unwrap_err().contains("browser_open"));
+        assert!(run_browser_click(&json!({ "text": "play" }))
+            .unwrap_err()
+            .contains("browser_open"));
         assert!(run_browser_close(&json!({})).is_ok());
     }
 }

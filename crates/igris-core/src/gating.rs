@@ -260,8 +260,17 @@ impl PendingStore {
 /// Default location: `%APPDATA%\igris\pending.json` (same trust domain
 /// as memory.json and tools.toml); falls back to the temp dir when the
 /// config dir cannot be resolved, degrading gracefully like the memory
-/// store.
+/// store. `IGRIS_PENDING_FILE` overrides the location: the process-wide
+/// store is one file for the whole process, so tests point it at a
+/// per-process temp file and never touch the user's real pending.json
+/// (a gated arm from a test would otherwise leak into it and make later
+/// runs see the probe as already pending).
 pub fn default_path() -> PathBuf {
+    if let Ok(p) = std::env::var("IGRIS_PENDING_FILE") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     dirs::config_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("igris")
@@ -269,7 +278,26 @@ pub fn default_path() -> PathBuf {
 }
 
 static PENDING: std::sync::LazyLock<std::sync::Mutex<PendingStore>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(PendingStore::open_or_empty(&default_path())));
+    std::sync::LazyLock::new(|| {
+        /* Test builds of this crate never touch the user's real
+         * pending.json: the store is ONE file per process, captured at
+         * first touch, and WHICH test module touches it first is
+         * nondeterministic (files.rs, registry.rs, ... all dispatch
+         * gated tools). A per-process temp file, recreated empty, keeps
+         * every run hermetic regardless of test order — a stale armed
+         * entry inside the expiry window would otherwise make a later
+         * run see the probe as already pending and fail to arm. */
+        if cfg!(test) {
+            let p = std::env::temp_dir().join(format!(
+                "igris_pending_test_{}.json",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&p);
+            std::sync::Mutex::new(PendingStore::open_or_empty(&p))
+        } else {
+            std::sync::Mutex::new(PendingStore::open_or_empty(&default_path()))
+        }
+    });
 
 /// Process-wide pending store behind a mutex; the registry's dispatch
 /// locks it per gated call.

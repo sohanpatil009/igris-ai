@@ -1859,8 +1859,10 @@ Gated tools: their first call only validates the action and announces the plan Ã
         assert!(block.starts_with("\n## Tool Use Protocol"));
         assert!(block.contains("### Available Tools"));
         assert!(block.ends_with("\n\n"));
+        let bclk = block.find("**browser_click**").unwrap();
         let bc = block.find("**browser_close**").unwrap();
         let bo = block.find("**browser_open**").unwrap();
+        let boac = block.find("**browser_open_and_click**").unwrap();
         let br = block.find("**browser_read**").unwrap();
         let c = block.find("**calculate**").unwrap();
         let ca = block.find("**close_app**").unwrap();
@@ -1903,8 +1905,10 @@ Gated tools: their first call only validates the action and announces the plan Ã
         let wsi = block.find("**workspace_info**").unwrap();
         let wri = block.find("**write_file**").unwrap();
         assert!(
-            bc < bo
-                && bo < br
+            bclk < bc
+                && bc < bo
+                && bo < boac
+                && boac < br
                 && br < c
                 && c < ca
                 && ca < cs
@@ -1949,7 +1953,7 @@ Gated tools: their first call only validates the action and announces the plan Ã
         // Every entry carries ONE canonical call-arguments example (plan
         // P0): the raw schema dump made the model echo "properties"
         // shapes as data (the open_app defect class).
-        assert_eq!(block.matches("Call arguments: `").count(), 44);
+        assert_eq!(block.matches("Call arguments: `").count(), 46);
         assert!(!block.contains("\"required\""));
         assert!(!block.contains("properties"));
         // The calculate tenant's function enum is enumerated in its
