@@ -61,13 +61,6 @@ const SYSTEM_PROMPT: &str = "You are a general purpose assistant. Whatever the u
 enum PromptStyle {
     Lfm3,
     Qwen35,
-    /// iFlytek Spark X2.6: fullwidth sentence sentinels + <|System|>/<|User|>/
-    /// <|Bot|>/<|Tool|> roles and a native <tool_response> carrier.
-    Spark,
-    /// TinyMixtral / plain ChatML: <|im_start|>role, no thinking token.
-    ChatmlPlain,
-    /// Qwen3-VL-Thinking: ChatML with an OPEN <think> generation prompt.
-    QwenThinking,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -93,92 +86,6 @@ const PROFILES: &[ModelProfile] = &[
         key: "qwen",
         gguf: "llama-cpp/models/qwen3-5-4B-Q4_K_M.gguf",
         label: "Qwen3.5-4B",
-        style: PromptStyle::Qwen35,
-        swa_full: false,
-    },
-    ModelProfile {
-        key: "qwen-moe",
-        gguf: "llama-cpp/models/Qwen35-2B-MoE-A1.3B-Q4_K_M.gguf",
-        label: "Qwen3.5-2B-MoE",
-        style: PromptStyle::Qwen35,
-        swa_full: false,
-    },
-    ModelProfile {
-        key: "spark",
-        gguf: "llama-cpp/models/Spark-X2.6-1.7B-Q4_K_M.gguf",
-        label: "Spark-X2.6-1.7B",
-        style: PromptStyle::Spark,
-        swa_full: false,
-    },
-    ModelProfile {
-        key: "tinymixtral",
-        gguf: "llama-cpp/models/TinyMixtral-4x248M-MoE.i1-Q4_K_M.gguf",
-        label: "TinyMixtral-4x248M-MoE",
-        style: PromptStyle::ChatmlPlain,
-        swa_full: false,
-    },
-    ModelProfile {
-        key: "qwen-omni",
-        gguf: "llama-cpp/models/qwen3-5-4B-Q4_K_M(omni).gguf",
-        label: "Qwen3.5-4B-Omni",
-        style: PromptStyle::Qwen35,
-        swa_full: false,
-    },
-    /* Additional user-provisioned GGUFs (2026-11-22). Dialects are reused
-     * where the GGUF metadata matches an existing family. */
-    ModelProfile {
-        key: "lfm3-1.7b",
-        gguf: "llama-cpp/models/LFM3-1.7B-Q4_K_M.gguf",
-        label: "LFM3-1.7B",
-        style: PromptStyle::Lfm3,
-        swa_full: false,
-    },
-    ModelProfile {
-        key: "lfm2.5",
-        gguf: "llama-cpp/models/LFM2.5-2.6B-Q4_K_M.gguf",
-        label: "LFM2.5-2.6B",
-        style: PromptStyle::Lfm3,
-        swa_full: false,
-    },
-    ModelProfile {
-        key: "qwen35-2b",
-        gguf: "llama-cpp/models/Qwen3.5-2B-Q4_K_M.gguf",
-        label: "Qwen3.5-2B",
-        style: PromptStyle::Qwen35,
-        swa_full: false,
-    },
-    ModelProfile {
-        key: "qwen38-2b",
-        gguf: "llama-cpp/models/Qwen3.8-2B-Uncensored-Q4_K_M.gguf",
-        label: "Qwen3.8-2B",
-        style: PromptStyle::Qwen35,
-        swa_full: false,
-    },
-    ModelProfile {
-        key: "qwen3-1.7b",
-        gguf: "llama-cpp/models/Qwen3-1.7B-Q8_0.gguf",
-        label: "Qwen3-1.7B",
-        style: PromptStyle::ChatmlPlain,
-        swa_full: false,
-    },
-    ModelProfile {
-        key: "qwen3vl-thinking",
-        gguf: "llama-cpp/models/Qwen3VL-2B-Thinking-Q4_K_M.gguf",
-        label: "Qwen3VL-2B-Thinking",
-        style: PromptStyle::QwenThinking,
-        swa_full: false,
-    },
-    ModelProfile {
-        key: "qwen3vl-instruct",
-        gguf: "llama-cpp/models/Qwen3VL-2B-Instruct-Q4_K_M.gguf",
-        label: "Qwen3VL-2B-Instruct",
-        style: PromptStyle::ChatmlPlain,
-        swa_full: false,
-    },
-    ModelProfile {
-        key: "qwen-moe-copy",
-        gguf: "llama-cpp/models/Qwen35-2B-MoE-A1.3B-Q4_K_M (1).gguf",
-        label: "Qwen3.5-2B-MoE (copy)",
         style: PromptStyle::Qwen35,
         swa_full: false,
     },
@@ -251,14 +158,6 @@ const IM_END: &str = "<|im_end|>";
 const LFM3_BOS: &str = "<|startoftext|>";
 const LFM3_EMPTY_THINK: &str = "<think></think>\n";
 const QWEN_EMPTY_THINK: &str = "<think>\n\n</think>\n\n";
-const QWEN_THINK_OPEN: &str = "<think>\n";
-/* Spark's sentinels use a fullwidth vertical bar (U+FF5C) and the
- * lower-one-eighth block (U+2581) as the word separator, exactly as in
- * the GGUF's chat template. Spelled with escapes so the source stays
- * ASCII-only for these unusual tokens. */
-const SPARK_BOS: &str = "\u{3c}\u{FF5C}start\u{2581}of\u{2581}sentence\u{FF5C}\u{3e}";
-const SPARK_EOS: &str = "\u{3c}\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}\u{3e}";
-const SPARK_EMPTY_THINK: &str = "</think>";
 
 /// Render `messages` as the active model's ChatML dialect. Every turn
 /// becomes `<|im_start|>role\ncontent<|im_end|>\n`; assistant turns carry
@@ -273,80 +172,29 @@ fn render_prompt(messages: &[Value], final_request: bool, style: PromptStyle) ->
     let (bos, empty_think) = match style {
         PromptStyle::Lfm3 => (LFM3_BOS, LFM3_EMPTY_THINK),
         PromptStyle::Qwen35 => ("", QWEN_EMPTY_THINK),
-        PromptStyle::QwenThinking => ("", QWEN_THINK_OPEN),
-        PromptStyle::ChatmlPlain => ("", ""),
-        /* Spark emits its BOS per turn, so no leading sentinel here. */
-        PromptStyle::Spark => ("", ""),
     };
     let mut s = String::from(bos);
     let n = messages.len();
     for (i, m) in messages.iter().enumerate() {
         let role = m["role"].as_str().unwrap_or("user");
         let content = m["content"].as_str().unwrap_or("");
+        s.push_str(IM_START);
+        s.push_str(role);
+        s.push('\n');
+        if role == "assistant" {
+            s.push_str(empty_think);
+        }
+        s.push_str(content);
         let last = i + 1 == n;
-        let open = !(!final_request && last);
-
-        match style {
-            PromptStyle::Spark => {
-                s.push_str(SPARK_BOS);
-                /* The tool-result carrier is a user-role message carrying
-                 * our generic `[Tool results]` block; Spark's template
-                 * expects a Tool turn with a native <tool_response> body. */
-                if role == "user" && content.starts_with("[Tool results]") {
-                    s.push_str("<|Tool|>\n<tool_response>");
-                    s.push_str(content);
-                    s.push_str("</tool_response>");
-                } else {
-                    let spark_role = match role {
-                        "system" => "System",
-                        "assistant" => "Bot",
-                        "user" => "User",
-                        other => other,
-                    };
-                    s.push_str("<|");
-                    s.push_str(spark_role);
-                    s.push_str("|>\n");
-                    if role == "assistant" {
-                        s.push_str(SPARK_EMPTY_THINK);
-                    }
-                    s.push_str(content);
-                }
-                if open {
-                    s.push_str(SPARK_EOS);
-                }
-            }
-            _ => {
-                s.push_str(IM_START);
-                s.push_str(role);
-                s.push('\n');
-                if role == "assistant" {
-                    s.push_str(empty_think);
-                }
-                s.push_str(content);
-                if open {
-                    s.push_str(IM_END);
-                    s.push('\n');
-                }
-            }
+        if !(!final_request && last) {
+            s.push_str(IM_END);
+            s.push('\n');
         }
     }
     if final_request {
-        match style {
-            PromptStyle::Spark => {
-                s.push_str(SPARK_BOS);
-                s.push_str("<|Bot|>\n");
-                s.push_str(SPARK_EMPTY_THINK);
-            }
-            PromptStyle::ChatmlPlain => {
-                s.push_str(IM_START);
-                s.push_str("assistant\n");
-            }
-            _ => {
-                s.push_str(IM_START);
-                s.push_str("assistant\n");
-                s.push_str(empty_think);
-            }
-        }
+        s.push_str(IM_START);
+        s.push_str("assistant\n");
+        s.push_str(empty_think);
     }
     s
 }
@@ -2606,38 +2454,8 @@ Gated tools: their first call only validates the action and announces the plan Ã
             assert!(!q.swa_full);
             assert_eq!(model_id_from_gguf(q.gguf), "qwen3-5-4b-q4_k_m.gguf");
         }
-        let moe = profile_for_key("qwen-moe").unwrap();
-        assert_eq!(moe.style, PromptStyle::Qwen35);
-        assert_eq!(
-            model_id_from_gguf(moe.gguf),
-            "qwen35-2b-moe-a1.3b-q4_k_m.gguf"
-        );
         assert!(profile_for_key("llama").is_none());
-    }
-
-    #[test]
-    fn new_profiles_and_spark_dialect() {
-        let spark = profile_for_key("spark").unwrap();
-        assert_eq!(spark.style, PromptStyle::Spark);
-        assert_eq!(model_id_from_gguf(spark.gguf), "spark-x2.6-1.7b-q4_k_m.gguf");
-        let tiny = profile_for_key("tinymixtral").unwrap();
-        assert_eq!(tiny.style, PromptStyle::ChatmlPlain);
-        let omni = profile_for_key("qwen-omni").unwrap();
-        assert_eq!(omni.style, PromptStyle::Qwen35);
-
-        let msgs = vec![
-            json!({"role": "system", "content": "SYS"}),
-            json!({"role": "user", "content": "HI"}),
-            json!({"role": "user", "content": "[Tool results]\nblock"}),
-        ];
-        let s = render_prompt(&msgs, true, PromptStyle::Spark);
-        assert!(s.contains("<|System|>\nSYS"));
-        assert!(s.contains("<|User|>\nHI"));
-        assert!(s.contains("<|Tool|>\n<tool_response>"));
-        assert!(s.ends_with("<|Bot|>\n</think>"));
-        let plain = render_prompt(&msgs, true, PromptStyle::ChatmlPlain);
-        assert!(plain.starts_with("<|im_start|>system\nSYS"));
-        assert!(plain.ends_with("<|im_start|>assistant\n"));
+        assert!(profile_for_key("qwen-moe").is_none());
     }
 
     #[test]

@@ -1487,3 +1487,9 @@ its correct `<think>` prompt), and two exact duplicates
 active `moe` branch experiment despite its tool failure. Side effect of the
 Qwen3.5-2B developer row: it wrote a stray `workspace_structure.md` at the
 repo root via `write_file`/`replace_file`; that file was removed.
+
+**Final reduction:** after the category matrix, seven more GGUFs were
+deleted (LFM3-1.7B, LFM2.5-2.6B, Qwen3.5-2B, Qwen3-1.7B, Qwen3VL-Instruct,
+Spark-X2.6-1.7B and Qwen35-2B-MoE) and their profiles removed. Only the two
+models that passed 8/9 categories remain: `LFM3-Omni-2B` and `Qwen3.5-4B`.
+`MOON_LLM_MODEL` now accepts only `lfm3` and `qwen`.

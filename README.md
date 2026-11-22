@@ -38,8 +38,11 @@ no code change is needed to switch:
 | `MOON_LLM_MODEL` | GGUF | Notes |
 |---|---|---|
 | `lfm3` (default) | `LFM3-Omni-2B-Q4_K_M.gguf` | LFM3 ChatML dialect; `--swa-full` for its sliding-window layers |
-| `qwen` | `qwen3-5-4B-Q4_K_M.gguf` | Qwen3.5-4B (~2.7 GB); its own ChatML/thinking prefix, no SWA flag |
-| `qwen-moe` | `Qwen35-2B-MoE-A1.3B-Q4_K_M.gguf` | Qwen3.5-2B MoE (1.3 B active), fastest of the three |
+| `qwen` | `qwen3-5-4B-Q4_K_M.gguf` | Qwen3.5-4B (~2.5 GB); its own ChatML/thinking prefix, no SWA flag |
+
+Only these two models ship. The other GGUFs tested during provisioning were
+removed: they were either broken (gibberish, reasoning loops, plain-text
+tool calls) or unreliable as agents — see `benchmark.md`.
 
 ```powershell
 $env:MOON_LLM_MODEL = 'qwen'
@@ -271,7 +274,7 @@ completes, the reply streams back token-by-token (first token typically
   (b12110) down to ~1.5–3 s on an RTX 4050. To re-provision the runtime on a
   fresh machine, run `powershell -ExecutionPolicy Bypass -File
   .\scripts\update_llama_binaries.ps1` (backs up the old binaries first).
-- Model: selected with `MOON_LLM_MODEL` (default `assets/llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf`, ~1.1 GB; `qwen` and `qwen-moe` also bundled).
+- Model: selected with `MOON_LLM_MODEL` (default `assets/llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf`, ~1.0 GB; `qwen` Qwen3.5-4B also bundled).
   The `llama-server` process keeps running after the app exits so the next
   run skips the model load; `Stop-Process -Name llama-server` frees it.
 - Test without a mic (streams a WAV in real time through the same
