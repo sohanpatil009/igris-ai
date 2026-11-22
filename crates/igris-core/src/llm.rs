@@ -218,12 +218,49 @@ pub struct ToolSpec {
     pub parameters_schema: Value,
 }
 
+/// Qwen3.5's own chat template teaches a different envelope: an attribute
+/// `<function=NAME>` block nested in the tool-call tags, with
+/// `<parameter=KEY>` children. Feeding the MoE the generic JSON protocol
+/// made it emit bare tool names and malformed bodies (benchmark 2026-11-22);
+/// this is the model's native spelling, which its finetune already knows.
+fn native_tool_protocol_instructions() -> String {
+    format!(
+        "## Tool Use Protocol\n\n\
+         If you choose to call a function ONLY reply in the following format with NO suffix:\n\n\
+         ```\n{open}\n\
+         <function=example_function_name>\n\
+         <parameter=example_parameter_1>\n\
+         value_1\n\
+         </parameter>\n\
+         </function>\n\
+         {close}\n\
+         ```\n\n\
+         CRITICAL: Output actual {open} tags — never describe steps or give examples.\n\n\
+         Example: User asks what time it is. You MUST respond with a real call:\n\
+         {open}\n\
+         <function=get_time>\n\
+         </function>\n\
+         {close}\n\n\
+         The <function=...></function> block MUST be nested inside {open}{close}.\n\
+         Required parameters MUST be specified as <parameter=KEY>value</parameter> children.\n\
+         You may give brief reasoning BEFORE the call, never after.\n\
+         After tool execution, results appear in <tool_response> blocks. Continue reasoning with the results until you can give a final answer.\n\n\
+         Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first — never claim you don't know without checking.\n\n\
+         Gated tools: their first call only validates the action and announces the plan — it does NOT execute, and the result starts with NOT EXECUTED — CONFIRMATION REQUIRED. Tell the user exactly what will happen and wait for a clear yes; only after the user confirms, call the same tool again with identical arguments and it will execute. If the user declines or changes the request, do not call it again.\n\n",
+        open = toolparse::TOOL_CALL_OPEN,
+        close = toolparse::TOOL_CALL_CLOSE,
+    )
+}
+
 /// Verbatim port of ZeroClaw's `TOOL_CALL_PROTOCOL_INSTRUCTIONS`
 /// (zeroclaw-runtime/src/agent/tool_call_format.rs:39-58), including the
 /// trailing blank line. Tag literals are referenced from the vendored
 /// parser's constants so no raw tag text lives in this source file; the
 /// pinned test asserts the exact bytes.
-fn tool_call_protocol_instructions() -> String {
+fn tool_call_protocol_instructions(style: PromptStyle) -> String {
+    if style == PromptStyle::Qwen35 {
+        return native_tool_protocol_instructions();
+    }
     format!(
         "## Tool Use Protocol\n\n\
          To use a tool, wrap a JSON object in {open}{close} tags:\n\n\
@@ -261,7 +298,7 @@ pub fn tools_protocol_block(specs: &[ToolSpec]) -> String {
     let mut sorted: Vec<&ToolSpec> = specs.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
     let mut s = String::from("\n");
-    s.push_str(&tool_call_protocol_instructions());
+    s.push_str(&tool_call_protocol_instructions(profile().style));
     s.push_str("### Available Tools\n\n");
     for spec in sorted {
         let _ = writeln!(
@@ -677,6 +714,9 @@ pub fn tool_result_block(name: &str, status: &str, output: &str) -> String {
 /// executed call. Plain appended text â€” `render_prompt` needs no change
 /// and the KV-cache prefix stays stable.
 pub fn tool_results_user_message(outcomes: &[ToolOutcome]) -> String {
+    /* Native <tool_response> wrappers were tried on the MoE and made the
+     * final answer worse (2026-11-22 probe): keep the generic carrier for
+     * every profile. */
     let mut s = String::from("[Tool results]\n");
     for o in outcomes {
         s.push_str(&tool_result_block(&o.name, &o.status, &o.output));
@@ -862,7 +902,12 @@ pub fn agent_turn(
     let registry = tools::registry();
     /* grammar-constrained retries (v3): one grammar per turn, built from
      * the sorted specs so the per-tool args rules are index-stable */
-    let grammar = crate::toolgrammar::tool_calls_grammar(&registry.specs());
+    let native = profile().style == PromptStyle::Qwen35;
+    let grammar = if native {
+        crate::toolgrammar::native_tool_calls_grammar(&registry.specs())
+    } else {
+        crate::toolgrammar::tool_calls_grammar(&registry.specs())
+    };
     /* true from the round after a malformed verdict until a good round */
     let mut constrained = false;
     let timed = std::env::var_os("MOON_TIMING").is_some();
@@ -1988,7 +2033,7 @@ Example: User says something that needs a tool. You MUST respond with a real cal
             + " tags. Continue reasoning with the results until you can give a final answer.\n\n\
 Persistent memory: personal facts the user has shared (preferences, plans, dates, passwords, notes) are saved in your memory and survive between sessions. When asked about anything personal, call memory_recall first â€” never claim you don't know without checking.\n\n\
 Gated tools: their first call only validates the action and announces the plan â€” it does NOT execute, and the result starts with NOT EXECUTED â€” CONFIRMATION REQUIRED. Tell the user exactly what will happen and wait for a clear yes; only after the user confirms, call the same tool again with identical arguments and it will execute. If the user declines or changes the request, do not call it again.\n\n";
-        assert_eq!(tool_call_protocol_instructions(), expected);
+        assert_eq!(tool_call_protocol_instructions(PromptStyle::Lfm3), expected);
     }
 
     #[test]

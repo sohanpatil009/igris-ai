@@ -118,6 +118,49 @@ pub fn tool_calls_grammar(specs: &[ToolSpec]) -> Option<String> {
     Some(g)
 }
 
+/// Qwen3.5-family native envelope: `<tool_call><function=NAME><parameter=K>v</parameter></function></tool_call>`.
+/// Same bounded-whitespace discipline as the JSON grammar; argument
+/// values are plain text (the parser JSON-decodes them when possible).
+pub fn native_tool_calls_grammar(specs: &[ToolSpec]) -> Option<String> {
+    if specs.is_empty() {
+        return None;
+    }
+    let mut g = String::with_capacity(1024 + specs.len() * 80);
+    g.push_str("root ::= env ( ws env )*\n");
+    g.push_str("env ::= open ws fn ws close\n");
+    g.push_str(&format!(
+        "open ::= {}\nclose ::= {}\n",
+        lit(crate::toolparse::TOOL_CALL_OPEN),
+        lit(crate::toolparse::TOOL_CALL_CLOSE),
+    ));
+    g.push_str("ws ::= [ \\t\\r\\n]{0,3}\n");
+    let names: Vec<String> = specs.iter().map(|s| lit(&s.name)).collect();
+    g.push_str(&format!("fname ::= {}\n", names.join(" | ")));
+    g.push_str("fopen ::= \"<function=\" fname \">\"\n");
+    g.push_str("fclose ::= \"</function>\"\n");
+    let mut pnames: Vec<String> = Vec::new();
+    for spec in specs {
+        if let Some(props) = spec.parameters_schema.get("properties").and_then(Value::as_object) {
+            for key in props.keys() {
+                let p = lit(key);
+                if !pnames.contains(&p) {
+                    pnames.push(p);
+                }
+            }
+        }
+    }
+    let pname_rule = if pnames.is_empty() {
+        lit("unused")
+    } else {
+        pnames.join(" | ")
+    };
+    g.push_str(&format!("pname ::= {}\n", pname_rule));
+    g.push_str("param ::= \"<parameter=\" pname \">\" ws val ws \"</parameter>\"\n");
+    g.push_str("val ::= [^<\\x00-\\x1F]{1,200}\n");
+    g.push_str("fn ::= fopen ws ( param ws )* fclose\n");
+    Some(g)
+}
+
 /// The arguments-object rule for one tool, derived from its JSON schema:
 /// a brace, the mandatory properties joined by commas, each optional
 /// property as a bounded optional group, a brace. Required properties
