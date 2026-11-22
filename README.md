@@ -159,7 +159,9 @@ Replies stream live after a minimal `ai:-` label — no timing or status lines
 around them. When a tool runs, the console prints `executing: <tool>` (the
 voice loop speaks "executing" once per turn). Action requests get one short
 confirmation afterwards — e.g. `play rehbara song on youtube` -> "Playing the
-song." — while informational questions still get a full answer.
+song." — while informational questions still get a full answer. Any URL the
+model prints is stripped before it reaches piper, so TTS only ever speaks
+human-listenable words ("Playing the Rehbara song on YouTube", never a link).
 
 ### Image understanding (optional, via Cactus Mirage)
 

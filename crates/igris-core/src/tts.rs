@@ -943,8 +943,27 @@ impl Speaker {
 /* helpers used by the reply stream                                 */
 /* ================================================================ */
 
-/* Strip markdown leftovers and control chars so piper reads clean
- * prose. */
+/* A token that is a link rather than something a person would say aloud.
+ * Covers https://..., www..., youtube.com/watch?... and bare domains with a
+ * path/query. Punctuation around a URL is ignored. */
+fn is_url_like(word: &str) -> bool {
+    /* Drop sentence punctuation first so "YouTube." stays a word, while
+     * "example.com" still looks like a domain. */
+    let w = word
+        .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ';' | ':'));
+    let l = w.to_ascii_lowercase();
+    if l.is_empty() {
+        return false;
+    }
+    if l.contains("://") || l.starts_with("www.") || l.starts_with("http") {
+        return true;
+    }
+    l.contains('.')
+}
+
+/* Strip markdown leftovers, control chars and URLs so piper reads clean,
+ * human-listenable prose. */
 pub fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_space = true;
@@ -964,7 +983,11 @@ pub fn sanitize(s: &str) -> String {
             }
         }
     }
-    out.trim().to_string()
+    let words: Vec<&str> = out
+        .split_whitespace()
+        .filter(|w| !is_url_like(w))
+        .collect();
+    words.join(" ")
 }
 
 /* Pull the next complete sentence out of the streaming reply buffer.
@@ -1056,4 +1079,17 @@ pub fn cmd_speak(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     speaker.speak(&text)?;
     speaker.wait_drain(Duration::from_secs(120));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_drops_links_but_keeps_human_words() {
+        let s = sanitize("Playing **Rehbara** on YouTube. https://www.youtube.com/watch?v=aTBRK-7fGNU");
+        assert_eq!(s, "Playing Rehbara on YouTube.");
+        let s2 = sanitize("Opened example.com and www.example.com/page for you.");
+        assert_eq!(s2, "Opened and for you.");
+    }
 }

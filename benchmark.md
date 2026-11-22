@@ -1747,3 +1747,7 @@ and to reserve detail for informational questions.
 
 Action output is now one line instead of a paragraph; informational answers
 are unchanged in depth.
+
+Follow-up: the model may still PRINT a watch URL in chat (LFM3 did), but
+`tts::sanitize` now drops URL-like tokens before speech, so piper reads only
+"Playing the Rehbara song on YouTube." Unit test pins the stripping.
