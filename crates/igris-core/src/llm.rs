@@ -1,6 +1,6 @@
 ï»¿//! Local LLM inference through llama.cpp (no Ollama).
 //!
-//! The GGUF in `assets/llama-cpp/model/` is served by the bundled
+//! The GGUF in `assets/llama-cpp/models/` (currently LFM3-Omni-2B) is served by the bundled
 //! `llama-server` (Vulkan GPU build in `assets/llama-cpp/vulkan/`), which
 //! exposes an HTTP API on
 //! localhost. This module either reuses an already-running server or starts
@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
  * use time so every front-end finds them regardless of its CWD. */
 const LLAMA_GPU_EXE: &str = "llama-cpp/vulkan/llama-server.exe";
 const LLAMA_CPU_EXE: &str = "llama-cpp/cpu/llama-server.exe";
-const LLM_MODEL: &str = "llama-cpp/model/LFM3-1.7B-Q4_K_M.gguf";
+const LLM_MODEL: &str = "llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf";
 const PORT: u16 = 8081;
 const CTX_TOKENS: i64 = 8000;
 /// Liquid's recommended sampling defaults for general use.
@@ -1327,7 +1327,11 @@ fn spawn_isolated(
     }
 
     /* One-entry attribute list restricting inherited handles to exactly
-     * [stdin, stdout, stderr]. */
+     * [stdin, stdout, stderr]. The handle array MUST stay alive until
+     * CreateProcessW returns below: Windows reads the list during process
+     * creation (dropping it here yields ERROR_INVALID_PARAMETER 0x80070057
+     * at spawn time, intermittently per backend). */
+    let handles = [h_in, h_out, h_err];
     let mut size = 0usize;
     unsafe {
         /* Probe call: it "fails" by design and leaves the required
@@ -1339,7 +1343,6 @@ fn spawn_isolated(
     unsafe {
         InitializeProcThreadAttributeList(Some(list), 1, None, &mut size)
             .map_err(|e| format!("InitializeProcThreadAttributeList failed: {e}"))?;
-        let handles = [h_in, h_out, h_err];
         UpdateProcThreadAttribute(
             list,
             0,
@@ -2310,23 +2313,23 @@ Gated tools: their first call only validates the action and announces the plan Ã
 
     #[test]
     fn expected_model_id_is_the_bundled_gguf_name() {
-        assert_eq!(expected_model_id(), "lfm3-1.7b-q4_k_m.gguf");
+        assert_eq!(expected_model_id(), "lfm3-omni-2b-q4_k_m.gguf");
     }
 
     #[test]
     fn props_model_id_extraction_tolerates_build_shapes() {
         /* The live bundled build (b12110): top-level model_path with a
          * full Windows path (observed 2026-11-15 on :8081). */
-        let live = r#"{"model_path":"E:\\proj\\assets\\llama-cpp/model/LFM3-1.7B-Q4_K_M.gguf","build_info":"b12110"}"#;
+        let live = r#"{"model_path":"E:\\proj\\assets\\llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf","build_info":"b12110"}"#;
         assert_eq!(
             parse_props_model_id(live).as_deref(),
-            Some("lfm3-1.7b-q4_k_m.gguf")
+            Some("lfm3-omni-2b-q4_k_m.gguf")
         );
         /* Older spelling: model_alias. */
-        let alias = r#"{"model_alias":"/models/LFM3-1.7B-Q4_K_M.gguf"}"#;
+        let alias = r#"{"model_alias":"/models/LFM3-Omni-2B-Q4_K_M.gguf"}"#;
         assert_eq!(
             parse_props_model_id(alias).as_deref(),
-            Some("lfm3-1.7b-q4_k_m.gguf")
+            Some("lfm3-omni-2b-q4_k_m.gguf")
         );
         /* A wrong model is extracted as itself (the caller compares). */
         let wrong = r#"{"model_path":"C:\\other\\Qwen2-0.5B.gguf"}"#;

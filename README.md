@@ -10,7 +10,7 @@ igris-ai/
 │   ├── igris-core/   # agent core lib: STT, LLM, TTS, toolparse, tools, assist, live, hotkey
 │   └── igris-cli/    # reference terminal front-end (binary keeps the name igris-ai)
 ├── assets/           # gitignored runtime assets (provisioned once, reused forever)
-│   ├── llama-cpp/    # vulkan/ + cpu/ llama-server builds, model/ LFM3 GGUF
+│   ├── llama-cpp/    # vulkan/ + cpu/ llama-server builds, models/ LFM3-Omni-2B GGUF
 │   ├── piper/        # piper.exe + espeak-ng-data
 │   ├── tts/          # piper voice files (downloaded on first use)
 │   └── stt/          # small-streaming/, medium-streaming/ Moonshine models
@@ -88,7 +88,7 @@ cargo run --release -- chat                     # interactive loop, replies stre
 cargo run --release -- chat "who are you"       # one-shot
 ```
 
-Backed by `assets/llama-cpp/model/LFM3-1.7B-Q4_K_M.gguf` through the bundled llama.cpp.
+Backed by `assets/llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf` through the bundled llama.cpp.
 On first use the app starts `llama-server` detached on `127.0.0.1:8081`; the
 process intentionally keeps running after the app exits so later runs skip
 the model load. Stop it manually with `taskkill /IM llama-server.exe /F`.
@@ -243,7 +243,7 @@ completes, the reply streams back token-by-token (first token typically
   `-ngl 99 -fa on -c 8000 --swa-full --cache-reuse 1` — the flags matter, see
   `crates/igris-core/src/llm.rs`). The CPU
   build stays in `assets/llama-cpp/cpu/` as fallback.
-- Model: `assets/llama-cpp/model/LFM3-1.7B-Q4_K_M.gguf` (LiquidAI LFM3-1.7B, ~1 GB).
+- Model: `assets/llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf` (LiquidAI LFM3-Omni-2B, ~1.1 GB).
   The `llama-server` process keeps running after the app exits so the next
   run skips the model load; `Stop-Process -Name llama-server` frees it.
 - Test without a mic (streams a WAV in real time through the same
