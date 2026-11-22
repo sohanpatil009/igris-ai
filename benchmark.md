@@ -1259,3 +1259,63 @@ already-running llama-server (:8081)" and answered - a boot-warmed
 server is accepted with zero model-load cost. Boot log:
 %TEMP%\igris-llama-boot.log; server stderr (same file IGRIS's
 try_start uses): %TEMP%\igris-llama-server-stderr.log.
+
+## goal.md examples - both models after the b12359 upgrade (2026-11-22)
+
+Branch `feature/lfm3-omni-2b-model`. Runtime: llama.cpp v1.0.0-dev
+(b12359) Vulkan on RTX 4050 Laptop, warm server (a `chat "hi"` warmup
+preceded each batch, so no model-load time is in the numbers). One-shot
+`target\release\igris-ai.exe chat "<command>"`, wall-clock measured with a
+.NET Stopwatch from process start to exit. Each model's batch ran on a
+freshly spawned server of its own GGUF. Numbers are seconds.
+
+The commands are taken from `goal.md`'s tables; the two file/dir prompts
+add an explicit `D:\igris-ai` root because that path is not in the tool's
+default user-folder scope (the goal.md row is "Find my IGRIS README" /
+"Show me the project structure").
+
+| goal.md row | spoken command | tool(s) dispatched | Qwen3.5-4B | LFM3-Omni-2B |
+|---|---|---|---:|---:|
+| §1 "Open Chrome" (allowlist) | Open Notepad | `open_app` | 2.20 | 1.01 |
+| §3 "Find my IGRIS README" | Find the README in D:\igris-ai | `list_dir` (Qwen) / `file_search` + `read_file` (LFM3) | 1.98 | 12.02 |
+| §4 "Show me the project structure" | Show me the structure of D:\igris-ai | `list_dir` | 3.43 | 2.01 |
+| §5 "Search latest AI models" | Search latest AI models | `web_search` (Qwen) / `web_search` + 3x `web_fetch` (LFM3) | 8.71 | 11.75 |
+| §7 "How much RAM am I using?" | How much RAM am I using? | `sys_stats` | 1.72 | 1.82 |
+| §8 "Remember my project directory" | Remember that my exam is on March 3rd | `memory_save` | 1.89 | - (not rerun) |
+| §8 "What was my last task?" | When is my exam? | `memory_recall` | 1.34 | 0.82 |
+
+All seven Qwen commands and all six LFM3 commands produced a correct final
+answer with a tool round; no envelope text leaked into the reply. Qwen
+range 1.34-8.71 s, LFM3 range 0.82-12.02 s, both inside the repo's
+"<10 s spoken command -> action" criterion for the ordinary cases.
+
+### Findings
+
+- **Qwen is now competitive on these, not just faster to load.** The
+  b12359 Vulkan prefill FA path is what makes it possible: before the
+  upgrade the same one-tool round took 6.84 s and the two-tool round
+  16.64 s; after it, the measured rounds were 1.57 s and 2.71 s.
+- **Long answers, not thinking, dominate the slow rows.** LFM3's 12.02 s
+  "find README" is mostly `read_file` rendering the whole 16 KB README
+  into the reply; Qwen chose `list_dir` instead and finished in 1.98 s.
+  The 11.75 s web case is one search plus three fetches, not planning.
+- **Protocol drift is filtered, not fatal.** The LFM3 RAM run emitted two
+  bogus `tool_name` envelopes before the real `sys_stats` call; the parser
+  ignored them and the answer was correct. Qwen's `2 plus 2` (todo.md
+  Phase 5) still repeats `calculate` seven times across rounds (~16 s);
+  dedup prevents double execution but the rounds cost time. That case is
+  deliberately not in the table as a pass.
+- **Freshness is a data problem, not a tool problem.** "Search latest AI
+  models" returned a live result, yet Qwen summarised 2024-era models and
+  LFM3 said 2025 - both behind the current date. This is the exact gap the
+  P3 source-confidence work addresses; the tools themselves returned.
+- **Cross-process memory survives.** Qwen saved "exam March 3rd" in one
+  CLI process; a later, separate LFM3 process recalled it in 0.82 s.
+
+### Side effects on this machine
+
+Notepad was opened by both `open_app` runs and closed afterwards. The
+`memory_save` run added one entry (`exam is on March 3rd`) to
+`%APPDATA%\igris\memory.json` - persistent by design. The two web rows
+made real DuckDuckGo / page requests. No volume, power, shutdown or
+delete tools were exercised.
