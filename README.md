@@ -262,11 +262,15 @@ growth of that partial text is pushed into the LLM as a `max_tokens=1`
 completes, the reply streams back token-by-token (first token typically
 < 1 s). Conversation history is kept across exchanges. ENTER to finish.
 
-- The local LLM runs through **llama.cpp v0.9.0 (b12110)**, Vulkan build in
-  `assets/llama-cpp/vulkan/` (GPU: any Vulkan-capable adapter; here the MX350,
-  `-ngl 99 -fa on -c 8000 --swa-full --cache-reuse 1` — the flags matter, see
-  `crates/igris-core/src/llm.rs`). The CPU
-  build stays in `assets/llama-cpp/cpu/` as fallback.
+- The local LLM runs through **llama.cpp v1.0.0-dev (b12359)**, Vulkan build in
+  `assets/llama-cpp/vulkan/` (GPU: any Vulkan-capable adapter; `-ngl 99 -fa on
+  -c 8000 --cache-reuse 1`, plus `--swa-full` for LFM3 — the flags matter, see
+  `crates/igris-core/src/llm.rs`). The CPU build stays in
+  `assets/llama-cpp/cpu/` as fallback. b12359 matters for Qwen: its Vulkan
+  prefill FlashAttention path took Qwen3.5-4B tool rounds from ~7–16 s
+  (b12110) down to ~1.5–3 s on an RTX 4050. To re-provision the runtime on a
+  fresh machine, run `powershell -ExecutionPolicy Bypass -File
+  .\scripts\update_llama_binaries.ps1` (backs up the old binaries first).
 - Model: selected with `MOON_LLM_MODEL` (default `assets/llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf`, ~1.1 GB; `qwen` and `qwen-moe` also bundled).
   The `llama-server` process keeps running after the app exits so the next
   run skips the model load; `Stop-Process -Name llama-server` frees it.

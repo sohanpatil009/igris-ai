@@ -1172,7 +1172,7 @@ fn model_id_from_gguf(gguf: &str) -> String {
 }
 
 /// Extract the GGUF file name from a llama-server /props body. Tolerant
-/// across builds: the live bundled build (b12110) reports `model_path`
+/// across builds: the live bundled build (b12359) reports `model_path`
 /// top-level; `model_alias` is the older spelling. None when the body is
 /// not props-shaped JSON (a foreign server, a 404 page).
 fn parse_props_model_id(body: &str) -> Option<String> {
@@ -2472,9 +2472,9 @@ Gated tools: their first call only validates the action and announces the plan Ã
 
     #[test]
     fn props_model_id_extraction_tolerates_build_shapes() {
-        /* The live bundled build (b12110): top-level model_path with a
+        /* The live bundled build (b12359): top-level model_path with a
          * full Windows path (observed 2026-11-15 on :8081). */
-        let live = r#"{"model_path":"E:\\proj\\assets\\llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf","build_info":"b12110"}"#;
+        let live = r#"{"model_path":"E:\\proj\\assets\\llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf","build_info":"b12359"}"#;
         assert_eq!(
             parse_props_model_id(live).as_deref(),
             Some("lfm3-omni-2b-q4_k_m.gguf")
