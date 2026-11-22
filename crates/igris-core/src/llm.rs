@@ -681,15 +681,18 @@ pub fn tool_results_user_message(outcomes: &[ToolOutcome]) -> String {
 /// reply can loop its envelope several times, and executing the same
 /// call twice would, e.g., open the app twice. Signature = name +
 /// canonicalized (key-sorted) arguments, using upstream's canonicalizer.
+fn call_signature(call: &toolparse::ParsedToolCall) -> (String, String) {
+    (
+        call.name.clone(),
+        toolparse::canonicalize_json_for_tool_signature(&call.arguments).to_string(),
+    )
+}
+
 pub fn dedup_tool_calls(calls: Vec<toolparse::ParsedToolCall>) -> Vec<toolparse::ParsedToolCall> {
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut unique = Vec::with_capacity(calls.len());
     for call in calls {
-        let sig = (
-            call.name.clone(),
-            toolparse::canonicalize_json_for_tool_signature(&call.arguments).to_string(),
-        );
-        if seen.insert(sig) {
+        if seen.insert(call_signature(&call)) {
             unique.push(call);
         }
     }
@@ -858,6 +861,16 @@ pub fn agent_turn(
     let grammar = crate::toolgrammar::tool_calls_grammar(&registry.specs());
     /* true from the round after a malformed verdict until a good round */
     let mut constrained = false;
+    /* Cross-round loop guard: a model that re-emits the SAME call in a
+     * later round used to re-execute it (9x web_search measured 2026-11-22).
+     * Remember each (name, canonical args) -> original result for this
+     * turn; repeats get the original result back with a note, cost no
+     * tool execution and nudge the model to finish. Per-turn only, so
+     * gated tools' two-step confirm in a later turn still works. */
+    let mut seen_outputs: std::collections::HashMap<
+        (String, String),
+        (String, crate::tools::DispatchPhase),
+    > = std::collections::HashMap::new();
     let timed = std::env::var_os("MOON_TIMING").is_some();
     let mut state = AgentLoopState::new();
     /* Task-class budget (plan P3 item 9): the newest user utterance
@@ -1011,34 +1024,50 @@ pub fn agent_turn(
          * deterministic refusal tool_result without running; allowed
          * calls dispatch exactly as before (one on the plain path,
          * several on parallel workers), results stay in call order. */
-        let mut decisions: Vec<Result<(), String>> = Vec::with_capacity(calls.len());
-        for call in &calls {
-            decisions.push(state.decide_call(&call.name));
-        }
         let mut slots: Vec<Option<ToolOutcome>> = Vec::with_capacity(calls.len());
-        let mut runnable: Vec<(usize, &toolparse::ParsedToolCall)> = Vec::new();
-        for (i, (call, decision)) in calls.iter().zip(&decisions).enumerate() {
-            match decision {
+        let mut runnable: Vec<(usize, &toolparse::ParsedToolCall, (String, String))> = Vec::new();
+        let mut repeats = 0usize;
+        for (i, call) in calls.iter().enumerate() {
+            let sig = call_signature(call);
+            if let Some((prev_out, prev_phase)) = seen_outputs.get(&sig) {
+                /* Same call was already executed earlier THIS turn. Feed
+                 * back the original result instead of running it again:
+                 * kills the 9x web_search loop without losing information. */
+                let mut output = prev_out.clone();
+                output.push_str(
+                    "\n(already executed earlier in this turn; result unchanged - do not repeat this call)",
+                );
+                slots.push(Some(ToolOutcome {
+                    name: call.name.clone(),
+                    status: "ok".to_string(),
+                    output,
+                    phase: *prev_phase,
+                }));
+                repeats += 1;
+                continue;
+            }
+            match state.decide_call(&call.name) {
                 Ok(()) => {
                     slots.push(None);
-                    runnable.push((i, call));
+                    runnable.push((i, call, sig));
                 }
                 Err(refusal) => slots.push(Some(ToolOutcome {
                     name: call.name.clone(),
                     status: "error".to_string(),
-                    output: refusal.clone(),
+                    output: refusal,
                     phase: crate::tools::DispatchPhase::Invalid,
                 })),
             }
         }
         if runnable.len() == 1 {
-            let (i, call) = runnable[0];
+            let (i, call, sig) = &runnable[0];
             let (result, phase) = registry.dispatch_classified(&call.name, &call.arguments);
             let (status, output) = match result {
                 Ok(out) => ("ok", out),
                 Err(e) => ("error", e),
             };
-            slots[i] = Some(ToolOutcome {
+            seen_outputs.insert(sig.clone(), (output.clone(), phase));
+            slots[*i] = Some(ToolOutcome {
                 name: call.name.clone(),
                 status: status.to_string(),
                 output,
@@ -1047,15 +1076,16 @@ pub fn agent_turn(
         } else if runnable.len() > 1 {
             let batch: Vec<(String, Value)> = runnable
                 .iter()
-                .map(|(_, c)| (c.name.clone(), c.arguments.clone()))
+                .map(|(_, c, _)| (c.name.clone(), c.arguments.clone()))
                 .collect();
             let results = registry.dispatch_batch(&batch);
-            for (i, o) in runnable.iter().map(|(i, _)| *i).zip(results) {
+            for ((i, _, sig), o) in runnable.iter().zip(results) {
                 let (status, output) = match o.result {
                     Ok(out) => ("ok", out),
                     Err(e) => ("error", e),
                 };
-                slots[i] = Some(ToolOutcome {
+                seen_outputs.insert(sig.clone(), (output.clone(), o.phase));
+                slots[*i] = Some(ToolOutcome {
                     name: o.name,
                     status: status.to_string(),
                     output,
@@ -1066,17 +1096,23 @@ pub fn agent_turn(
         let outcomes: Vec<ToolOutcome> = slots.into_iter().flatten().collect();
         if timed {
             eprintln!(
-                "[timing] round {} tools {}ms over {} call(s){}",
+                "[timing] round {} tools {}ms over {} call(s){}{}",
                 state.rounds,
                 t_tools.elapsed().as_millis(),
                 runnable.len(),
                 if runnable.len() > 1 { " parallel" } else { "" },
+                if repeats > 0 { format!(" ({} repeat(s) skipped)", repeats) } else { String::new() },
             );
         }
         /* the results message, plus the escalation-ladder verdict (v3
          * hardening) which may append a corrective note or force the
          * next round to sample under the tool-call grammar */
         let mut results_msg = tool_results_user_message(&outcomes);
+        if repeats > 0 {
+            results_msg.push_str(
+                "\nNote: repeated tool calls were not re-executed - the earlier results above are still current. Continue to your final answer.",
+            );
+        }
         /* definitive unsupported-capability results (plan P3 item 9):
          * block the tool for the rest of the turn and tell the model
          * once, so it never spends rounds re-calling a missing

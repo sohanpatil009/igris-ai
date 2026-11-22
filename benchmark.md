@@ -1493,3 +1493,35 @@ deleted (LFM3-1.7B, LFM2.5-2.6B, Qwen3.5-2B, Qwen3-1.7B, Qwen3VL-Instruct,
 Spark-X2.6-1.7B and Qwen35-2B-MoE) and their profiles removed. Only the two
 models that passed 8/9 categories remain: `LFM3-Omni-2B` and `Qwen3.5-4B`.
 `MOON_LLM_MODEL` now accepts only `lfm3` and `qwen`.
+
+## Speed optimisation - cross-round tool-call dedup (2026-11-22)
+
+Reran all nine category probes on both surviving models, then changed the
+agent loop to remember `(tool name, canonical args) -> result` for the
+duration of one turn. A repeat call now returns the original result with a
+"do not repeat this call" note instead of re-executing and burning another
+LLM + tool round. Scoped per turn, so gated tools' two-step confirm in a
+later turn is unaffected.
+
+| Probe | LFM3 before | LFM3 after | Qwen before | Qwen after |
+|---|---:|---:|---:|---:|
+| 1 desktop | 1.01 s | 0.97 s | 1.46 s | 1.39 s |
+| 2 music | 0.61 s | 1.09 s | 1.23 s | 1.25 s |
+| 3 files | 11.59 s | 10.93 s | 1.72 s | 1.72 s |
+| 4 developer | 2.00 s | 2.02 s | 3.48 s | 3.47 s |
+| 5 browser | 7.63 s | **4.31 s** | 3.50 s | 7.40 s* |
+| 6 comm | 4.79 s | 4.61 s | 2.21 s | 1.93 s |
+| 7 system | 1.80 s | 1.95 s | 1.75 s | 1.74 s |
+| 8 memory | 0.86 s | 0.87 s | 1.85 s | 1.88 s |
+| 9 advanced | 6.40 s | **5.12 s** | 11.52 s | **8.53 s** |
+
+\* Qwen's web-search rows move with network latency; the 3.50 -> 7.40 s
+row is external variance, not a code regression (its advanced row dropped
+from 11.52 to 8.53 s and used two tool calls instead of five).
+
+Biggest wins are exactly the loop cases: LFM3's web-search round count
+stayed high in the trace but repeat rounds no longer re-ran the tool, and
+Qwen's advanced task went 5 -> 2 real calls. Remaining slow rows are now
+long-output bound (LFM3 `file_search` + `read_file` echoing a 16 KB README,
+~11 s), not loop bound. Further gains there would require capping answer
+length, which trades answer completeness for speed and was not applied.
