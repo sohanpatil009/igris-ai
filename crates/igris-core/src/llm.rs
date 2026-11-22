@@ -66,6 +66,8 @@ enum PromptStyle {
     Spark,
     /// TinyMixtral / plain ChatML: <|im_start|>role, no thinking token.
     ChatmlPlain,
+    /// Qwen3-VL-Thinking: ChatML with an OPEN <think> generation prompt.
+    QwenThinking,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -119,6 +121,64 @@ const PROFILES: &[ModelProfile] = &[
         key: "qwen-omni",
         gguf: "llama-cpp/models/qwen3-5-4B-Q4_K_M(omni).gguf",
         label: "Qwen3.5-4B-Omni",
+        style: PromptStyle::Qwen35,
+        swa_full: false,
+    },
+    /* Additional user-provisioned GGUFs (2026-11-22). Dialects are reused
+     * where the GGUF metadata matches an existing family. */
+    ModelProfile {
+        key: "lfm3-1.7b",
+        gguf: "llama-cpp/models/LFM3-1.7B-Q4_K_M.gguf",
+        label: "LFM3-1.7B",
+        style: PromptStyle::Lfm3,
+        swa_full: false,
+    },
+    ModelProfile {
+        key: "lfm2.5",
+        gguf: "llama-cpp/models/LFM2.5-2.6B-Q4_K_M.gguf",
+        label: "LFM2.5-2.6B",
+        style: PromptStyle::Lfm3,
+        swa_full: false,
+    },
+    ModelProfile {
+        key: "qwen35-2b",
+        gguf: "llama-cpp/models/Qwen3.5-2B-Q4_K_M.gguf",
+        label: "Qwen3.5-2B",
+        style: PromptStyle::Qwen35,
+        swa_full: false,
+    },
+    ModelProfile {
+        key: "qwen38-2b",
+        gguf: "llama-cpp/models/Qwen3.8-2B-Uncensored-Q4_K_M.gguf",
+        label: "Qwen3.8-2B",
+        style: PromptStyle::Qwen35,
+        swa_full: false,
+    },
+    ModelProfile {
+        key: "qwen3-1.7b",
+        gguf: "llama-cpp/models/Qwen3-1.7B-Q8_0.gguf",
+        label: "Qwen3-1.7B",
+        style: PromptStyle::ChatmlPlain,
+        swa_full: false,
+    },
+    ModelProfile {
+        key: "qwen3vl-thinking",
+        gguf: "llama-cpp/models/Qwen3VL-2B-Thinking-Q4_K_M.gguf",
+        label: "Qwen3VL-2B-Thinking",
+        style: PromptStyle::QwenThinking,
+        swa_full: false,
+    },
+    ModelProfile {
+        key: "qwen3vl-instruct",
+        gguf: "llama-cpp/models/Qwen3VL-2B-Instruct-Q4_K_M.gguf",
+        label: "Qwen3VL-2B-Instruct",
+        style: PromptStyle::ChatmlPlain,
+        swa_full: false,
+    },
+    ModelProfile {
+        key: "qwen-moe-copy",
+        gguf: "llama-cpp/models/Qwen35-2B-MoE-A1.3B-Q4_K_M (1).gguf",
+        label: "Qwen3.5-2B-MoE (copy)",
         style: PromptStyle::Qwen35,
         swa_full: false,
     },
@@ -191,6 +251,7 @@ const IM_END: &str = "<|im_end|>";
 const LFM3_BOS: &str = "<|startoftext|>";
 const LFM3_EMPTY_THINK: &str = "<think></think>\n";
 const QWEN_EMPTY_THINK: &str = "<think>\n\n</think>\n\n";
+const QWEN_THINK_OPEN: &str = "<think>\n";
 /* Spark's sentinels use a fullwidth vertical bar (U+FF5C) and the
  * lower-one-eighth block (U+2581) as the word separator, exactly as in
  * the GGUF's chat template. Spelled with escapes so the source stays
@@ -212,6 +273,7 @@ fn render_prompt(messages: &[Value], final_request: bool, style: PromptStyle) ->
     let (bos, empty_think) = match style {
         PromptStyle::Lfm3 => (LFM3_BOS, LFM3_EMPTY_THINK),
         PromptStyle::Qwen35 => ("", QWEN_EMPTY_THINK),
+        PromptStyle::QwenThinking => ("", QWEN_THINK_OPEN),
         PromptStyle::ChatmlPlain => ("", ""),
         /* Spark emits its BOS per turn, so no leading sentinel here. */
         PromptStyle::Spark => ("", ""),

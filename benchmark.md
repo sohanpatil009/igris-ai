@@ -1429,3 +1429,59 @@ own native tool format (`<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_va
 is not in the parser's accepted families, so it had to fall back to our
 generic JSON protocol, which explains the retries. TinyMixtral is too
 small for the tool protocol; do not use it for agent tasks.
+
+## goal.md categories - all surviving models (2026-11-22)
+
+One example from each of goal.md's nine categories, one-shot `chat` on a
+warm Vulkan server per model. Cell format is **seconds / verdict**;
+PASS = correct tool dispatched and answer, PARTIAL = dispatched but wrong
+tool or loops, FAIL = no dispatch or unusable output. The Spark leg stalled
+after its first row (inherited-handle wedge from Notepad) and is reported
+separately.
+
+| goal.md category | LFM3-Omni-2B | Qwen3.5-4B | LFM3-1.7B | LFM2.5-2.6B | Qwen3.5-2B | Qwen3-1.7B | Qwen3VL-Instruct |
+|---|---|---|---|---|---|---|---|
+| 1 desktop (open_app) | 1.24 PASS | 1.42 PASS | 1.17 PASS | 0.63 FAIL (text) | 1.00 PASS | 5.18 PASS | 0.81 PASS |
+| 2 music (media_key) | 0.75 PASS | 1.43 PASS | 0.77 FAIL | 2.33 FAIL (text) | 0.70 PASS | 2.47 PASS | 0.49 FAIL |
+| 3 files | 12.40 PASS | 2.01 PASS | 13.48 PARTIAL | 0.59 FAIL (text) | 5.28 PASS | 3.86 PASS | 0.50 FAIL (fence) |
+| 4 developer | 1.99 PASS | 3.58 PASS | 2.62 PASS | 0.62 FAIL (text) | 30.42 FAIL (10 calls, write_file) | 8.06 PASS | 2.59 PASS |
+| 5 browser | 6.16 PASS | 15.73 PASS | 9.13 PASS | 0.63 FAIL (text) | 11.41 FAIL (10x web_search) | 9.26 PARTIAL | 1.21 PARTIAL |
+| 6 communication | 5.10 PASS | 2.30 PASS | 2.42 PARTIAL | 0.46 FAIL (text) | 0.96 PASS | 8.05 PASS | 4.00 PASS |
+| 7 system | 1.75 PARTIAL (bogus tool_name) | 1.88 PASS | 1.05 PASS | 0.36 FAIL (text) | 1.27 PASS | 3.88 PARTIAL (process_stats) | 0.33 FAIL (fence) |
+| 8 memory | 0.86 PARTIAL (wrong tool) | 1.73 PASS | 0.80 FAIL | 2.53 FAIL (text) | 1.53 PASS | 3.11 PASS | 0.54 FAIL (fence) |
+| 9 advanced | 13.83 PASS | 28.14 PARTIAL (10x web_fetch) | 13.65 PARTIAL | 1.20 FAIL (text) | 7.16 FAIL (10x web_search) | 15.21 PARTIAL (activity_log) | 5.48 FAIL (9x web_search) |
+
+Pass counts: **LFM3-Omni 8/9**, **Qwen3.5-4B 8/9**, **LFM3-1.7B 5/9**,
+**Qwen3.5-2B 5/9**, **Qwen3-1.7B 5/9**, **Qwen3VL-Instruct 4/9**,
+**LFM2.5-2.6B 0/9**.
+
+### Findings
+
+- **LFM3-Omni-2B and Qwen3.5-4B are the only reliable agents.** Both
+  dispatch in every category; odd malformed/duplicate envelopes are
+  filtered by the parser and do not corrupt the answer.
+- **LFM2.5-2.6B emits its tool calls as plain text** (`[file_search(query=…)]`,
+  `[sys_stats()]`) — its GGUF native format is
+  `<|tool_call_start|>[name(args)]<|tool_call_end|>`, which our generic
+  protocol does not teach. It loads and chats but is unusable as an agent
+  until a dedicated dialect is added.
+- **Qwen3.5-2B loops hard** — ten `web_search` calls on research, and on
+  "show project structure" it escalated to `write_file`/`replace_file`
+  (30 s). Its speed is not worth the risk; keep it for chat.
+- **Qwen3-1.7B picks wrong tools** (`process_stats` for RAM, `activity_log`
+  for research) but completes. **Qwen3VL-Instruct** answers with bare code
+  fences on several rows and loops `web_search` nine times.
+- **LFM3-1.7B** is fine on desktop/files/developer but skips tool calls for
+  music and memory, answering from stale knowledge instead.
+- Spark's first row (open app) did dispatch after repeated malformed
+  envelopes; the remaining eight rows were not captured because the batch
+  wedged on an inherited-handle stall from Notepad - the same bug class
+  fixed for `open_url` and `browser_open` but still present in `open_app`.
+
+### Model cleanup performed
+
+Deleted five files: TinyMixtral-4x248M (gibberish), Qwen3.8-2B-Uncensored
+(hallucinated time), Qwen3VL-2B-Thinking (10-round reasoning loop even with
+its correct `<think>` prompt), and two exact duplicates
+(`qwen3-5-4B…(omni)` and `Qwen35-2B-MoE…(1)`). `qwen-moe` was kept for the
+active `moe` branch experiment despite its tool failure.
