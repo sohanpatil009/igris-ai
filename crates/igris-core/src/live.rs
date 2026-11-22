@@ -434,10 +434,43 @@ fn mono_input_stream<T: MicSample>(
 }
 
 pub(crate) fn open_mic() -> Result<MicSession, Box<dyn std::error::Error>> {
+    use cpal::traits::DeviceTrait;
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or("microphone error: no default input device found")?;
+    /* The system default can be a silent virtual endpoint (e.g. AudioRelay).
+     * MOON_INPUT_DEVICE lets the user pick the real mic by a name substring. */
+    let wanted = std::env::var("MOON_INPUT_DEVICE").ok();
+    let device = if let Some(ref needle) = wanted {
+        let needle_lower = needle.trim().to_ascii_lowercase();
+        let found = host
+            .input_devices()?
+            .find(|d| {
+                d.description()
+                    .map(|x| x.name().to_ascii_lowercase().contains(&needle_lower))
+                    .unwrap_or(false)
+            });
+        match found {
+            Some(d) => d,
+            None => {
+                let names: Vec<String> = host
+                    .input_devices()?
+                    .filter_map(|d| d.description().ok().map(|x| x.name().to_string()))
+                    .collect();
+                return Err(format!(
+                    "MOON_INPUT_DEVICE='{needle}' matched no input device (available: {})",
+                    names.join(", ")
+                )
+                .into());
+            }
+        }
+    } else {
+        host.default_input_device()
+            .ok_or("microphone error: no default input device found")?
+    };
+    let device_name = device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| "(unknown device)".into());
+    println!("  mic        : {device_name}");
     let config = device.default_input_config()?;
     let fmt = config.sample_format();
     let rate = config.sample_rate();

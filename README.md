@@ -98,6 +98,11 @@ a live status row with the input meter (bar + RMS), speaking state, raw un-analy
 backlog and the model's measured speed (Nx real-time). When a sentence completes it
 prints the measured latency.
 
+- The microphone is cpal's **default input**. If that is a silent virtual endpoint
+  (e.g. "Virtual Mic (Virtual Mic for AudioRelay)") and nothing is transcribed, pick
+  the real device by name substring: `$env:MOON_INPUT_DEVICE = "Microphone Array"`
+  (or your headset mic). The startup line `mic : <device>` shows exactly which one
+  was opened; the same setting applies to `assist`/`assist --hotkey`.
 - Press **ENTER** to stop; a final summary (total time, stats) is printed and the window
   stays usable until you close it.
 - Capture runs at the mic's **native rate** (e.g. 48 kHz); resampling to 16 kHz happens
