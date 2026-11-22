@@ -358,10 +358,10 @@ fn turn_reply<'k, 'd>(
                 filler_done = true;
                 /* one short filler per turn, spoken while the tools run */
                 if let Some(sp) = tts {
-                    let _ = sp.speak("ek seconds…");
+                    let _ = sp.speak("executing");
                 }
             }
-            println!("\n[tools] {}", names.join(", "));
+            println!("\nexecuting: {}", names.join(", "));
         };
         let mut sink = llm::StreamSink {
             on_released: &mut on_released,

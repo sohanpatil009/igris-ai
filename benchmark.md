@@ -1732,3 +1732,18 @@ LFM3 is ~1.9 s faster (~28%) on this task. Both models reached a real video
 page (titles such as "'REHBARA' Official Lyrical Video | Abhijeet Srivastava"),
 not just the search results. Playback state (paused vs playing) was not
 instrumented here - the check is page-opened, not audio-decoding.
+
+### Concise action replies + "executing" status (same branch)
+
+Tool rounds now print `executing: <tool names>` instead of `[tools] ...` in
+chat, and the voice loop says "executing" once per turn. The system personas
+also instruct the model to answer action requests with one short confirmation
+and to reserve detail for informational questions.
+
+| Probe | LFM3 | Qwen |
+|---|---|---|
+| `play rehbara song on youtube` | 4.84 s; `executing: browser_open_and_click` then "Playing the Rehbara song on YouTube." + URL | 5.68 s; `executing: browser_open_and_click` then "Playing the song." |
+| `why is llama.cpp useful on small laptops?` | full multi-paragraph answer (with tool research) | full structured 6-point answer |
+
+Action output is now one line instead of a paragraph; informational answers
+are unchanged in depth.
