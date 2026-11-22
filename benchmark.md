@@ -1484,4 +1484,6 @@ Deleted five files: TinyMixtral-4x248M (gibberish), Qwen3.8-2B-Uncensored
 (hallucinated time), Qwen3VL-2B-Thinking (10-round reasoning loop even with
 its correct `<think>` prompt), and two exact duplicates
 (`qwen3-5-4B…(omni)` and `Qwen35-2B-MoE…(1)`). `qwen-moe` was kept for the
-active `moe` branch experiment despite its tool failure.
+active `moe` branch experiment despite its tool failure. Side effect of the
+Qwen3.5-2B developer row: it wrote a stray `workspace_structure.md` at the
+repo root via `write_file`/`replace_file`; that file was removed.
