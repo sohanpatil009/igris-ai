@@ -137,6 +137,7 @@ pub(crate) use shared::truncate_chars;
 use crate::tools::basic::{run_calculate, run_get_time, run_media_key, run_open_app, run_open_url};
 use crate::tools::browser::{
     run_browser_click, run_browser_close, run_browser_open, run_browser_open_and_click,
+    run_browser_vision_click,
     run_browser_read,
 };
 use crate::tools::config_tools::CONFIG_TOOLS;
@@ -606,6 +607,32 @@ pub fn seed_registry() -> Registry {
         gated: false,
         plan: None,
         run: Arc::new(run_browser_click),
+    });
+    r.register(ToolDef {
+        name: "browser_vision_click".to_string(),
+        desc: "Click a button or link by its SCREEN POSITION instead of a CSS \
+               selector. Mirage takes a screenshot of the open page and locates \
+               the element whose visible text or name best matches `text`; a \
+               trusted mouse click is sent at its centre. Use this when \
+               browser_click's selectors miss (YouTube markup changes). Give \
+               text describing what to click, e.g. 'first video'. The result \
+               states OPENED with the new title/URL, or NOT OPENED if nothing \
+               happened. Optional x/y skips detection and clicks directly."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "What to click, e.g. 'first video' or 'Sign in'"
+                },
+                "x": { "type": "number", "description": "Optional direct screenshot x coordinate" },
+                "y": { "type": "number", "description": "Optional direct screenshot y coordinate" }
+            }
+        }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_browser_vision_click),
     });
     r.register(ToolDef {
         name: "browser_close".to_string(),

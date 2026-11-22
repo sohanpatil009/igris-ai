@@ -63,6 +63,57 @@ pub fn describe_image(image: &Path) -> Result<String, String> {
     }
 }
 
+/// A located UI element: centre coordinates in screenshot pixels plus the
+/// label Mirage matched, for coordinate-based browser clicks.
+#[derive(Debug, Clone)]
+pub struct LocatedElement {
+    pub x: f64,
+    pub y: f64,
+    pub name: String,
+    pub score: f64,
+}
+
+/// Ask Mirage which detected object/text best matches `query` in `image`.
+pub fn locate_in_image(image: &Path, query: &str) -> Result<LocatedElement, String> {
+    if !image.is_file() {
+        return Err(format!("image not found: {}", image.display()));
+    }
+    let script = script_path();
+    let weights = crate::paths::asset("mirage\\mirage.cact");
+    if !script.is_file() || !weights.is_file() {
+        return Err("vision helper or Mirage weights missing".into());
+    }
+    let python = std::env::var("MOON_PYTHON").unwrap_or_else(|_| "python".to_string());
+    let output = Command::new(&python)
+        .arg(&script)
+        .arg("locate")
+        .arg(image)
+        .arg(&weights)
+        .arg(query)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("could not start {python}: {e}"))?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        return Err(format!(
+            "Mirage locate failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("bad locate result: {e}"))?;
+    let x = v["x"].as_f64().ok_or("no x in locate result")?;
+    let y = v["y"].as_f64().ok_or("no y in locate result")?;
+    Ok(LocatedElement {
+        x,
+        y,
+        name: v["name"].as_str().unwrap_or("").to_string(),
+        score: v["score"].as_f64().unwrap_or(0.0),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

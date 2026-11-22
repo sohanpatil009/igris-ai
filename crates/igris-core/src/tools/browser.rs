@@ -178,6 +178,33 @@ impl BrowserSession {
         }
     }
 
+    /// Capture the current viewport as a PNG on disk (for Mirage vision).
+    fn screenshot(&mut self, path: &Path, deadline: Instant) -> Result<(), String> {
+        let reply = self.call(
+            "Page.captureScreenshot",
+            json!({ "format": "png", "captureBeyondViewport": false }),
+            deadline,
+        )?;
+        let data = reply["data"]
+            .as_str()
+            .ok_or("screenshot reply had no data")?;
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
+            .map_err(|e| format!("bad screenshot data: {e}"))?;
+        std::fs::write(path, bytes).map_err(|e| format!("could not write screenshot: {e}"))
+    }
+
+    /// Click at canvas coordinates with trusted CDP mouse events.
+    fn click_xy(&mut self, x: f64, y: f64, deadline: Instant) -> Result<(), String> {
+        let base = json!({ "x": x, "y": y, "button": "left", "clickCount": 1 });
+        let mut pressed = base.clone();
+        pressed["type"] = json!("mousePressed");
+        self.call("Input.dispatchMouseEvent", pressed, deadline)?;
+        let mut released = base;
+        released["type"] = json!("mouseReleased");
+        self.call("Input.dispatchMouseEvent", released, deadline)?;
+        Ok(())
+    }
+
     /// Pull title, URL and visible text in one evaluate round-trip.
     fn page_info(&mut self, deadline: Instant) -> Result<(String, String, String), String> {
         let reply = self.call(
@@ -791,6 +818,78 @@ pub(crate) fn run_browser_click(args: &Value) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+/// Click a UI element by its screen position, located by Mirage from a
+/// screenshot. This replaces fragile CSS selectors for pages whose markup
+/// drifts (YouTube), and always reports whether navigation actually happened.
+pub(crate) fn run_browser_vision_click(args: &Value) -> Result<String, String> {
+    let query = args
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("first result");
+    let direct = match (
+        args.get("x").and_then(Value::as_f64),
+        args.get("y").and_then(Value::as_f64),
+    ) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    };
+
+    let mut cell = session_cell().lock().unwrap();
+    let Some(mut sess) = cell.take() else {
+        return Err("no browser session is open - call browser_open first".into());
+    };
+    let before_url = sess
+        .page_info(Instant::now() + Duration::from_secs(3))
+        .map(|(_, u, _)| u)
+        .unwrap_or_default();
+
+    let shot = std::env::temp_dir().join("igris-browser-vision.png");
+    let result: Result<String, String> = (|| {
+        sess.screenshot(&shot, Instant::now() + Duration::from_secs(6))?;
+        let (x, y, label) = if let Some((x, y)) = direct {
+            (x, y, "provided coordinates".to_string())
+        } else {
+            let loc = crate::vision::locate_in_image(&shot, query)?;
+            (loc.x, loc.y, format!("{} (score {:.2})", loc.name, loc.score))
+        };
+        sess.click_xy(x, y, Instant::now() + Duration::from_secs(6))?;
+        std::thread::sleep(Duration::from_millis(900));
+        let after = sess
+            .page_info(Instant::now() + INFO_BUDGET)
+            .ok();
+        let mut out = format!("Vision click at ({:.0}, {:.0}) on {label}.", x, y);
+        match after {
+            Some((title, url, _)) if !url.is_empty() && url != before_url => {
+                out.push_str(&format!(
+                    "\nOPENED: {} ({url})",
+                    if title.is_empty() { "(untitled)" } else { &title }
+                ));
+            }
+            Some((title, url, _)) => {
+                out.push_str(&format!(
+                    "\nNOT OPENED - still on {}{}",
+                    if title.is_empty() { "(untitled)" } else { &title },
+                    if url.is_empty() { String::new() } else { format!(" ({url})") }
+                ));
+            }
+            None => out.push_str("\nRESULT UNKNOWN - page did not answer after click"),
+        }
+        Ok(out)
+    })();
+
+    if let Err(e) = &result
+        && e.starts_with("CDP ")
+    {
+        // Transport died; do not put the session back.
+    } else {
+        *cell = Some(sess);
+    }
+    let _ = std::fs::remove_file(&shot);
+    result
 }
 
 pub(crate) fn run_browser_close(_args: &Value) -> Result<String, String> {

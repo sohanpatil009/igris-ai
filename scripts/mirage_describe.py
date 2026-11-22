@@ -58,11 +58,46 @@ def summarize(result: dict) -> str:
     return "\n".join(lines)
 
 
+def locate(result: dict, query: str):
+    """Find the best detected object/text matching QUERY and return its centre."""
+    words = [w for w in query.lower().split() if len(w) > 1]
+    candidates = []
+    for t in result.get("text") or []:
+        s = t.get("string") or ""
+        if any(w in s.lower() for w in words):
+            candidates.append((float(t.get("score", 0)), "text: " + s, t.get("bbox")))
+    for o in result.get("objects") or []:
+        n = o.get("name") or ""
+        if any(w in n.lower() for w in words):
+            candidates.append((float(o.get("score", 0)), "object: " + n, o.get("bbox")))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    score, name, bbox = candidates[0]
+    if not bbox or len(bbox) < 4:
+        return None
+    x1, y1, x2, y2 = (float(v) for v in bbox[:4])
+    return {
+        "x": (x1 + x2) / 2.0,
+        "y": (y1 + y2) / 2.0,
+        "name": name,
+        "score": score,
+        "bbox": [x1, y1, x2, y2],
+    }
+
+
 def main() -> int:
-    if len(sys.argv) < 3:
+    locate_mode = len(sys.argv) > 1 and sys.argv[1] == "locate"
+    if locate_mode:
+        if len(sys.argv) < 5:
+            print("usage: mirage_describe.py locate IMAGE WEIGHTS QUERY", file=sys.stderr)
+            return 2
+        image, weights, query = sys.argv[2], sys.argv[3], sys.argv[4]
+    elif len(sys.argv) < 3:
         print("usage: mirage_describe.py IMAGE WEIGHTS", file=sys.stderr)
         return 2
-    image, weights = sys.argv[1], sys.argv[2]
+    else:
+        image, weights, query = sys.argv[1], sys.argv[2], None
     if not os.path.isfile(image):
         print("image not found: " + image, file=sys.stderr)
         return 2
@@ -77,7 +112,10 @@ def main() -> int:
     try:
         model = cactus.Mirage(weights=weights)
         result = model.describe(image)
-        if isinstance(result, str):
+        if locate_mode:
+            found = locate(result, query) if isinstance(result, dict) else None
+            print(json.dumps(found or {}, ensure_ascii=True))
+        elif isinstance(result, str):
             print(result)
         else:
             print(summarize(result))

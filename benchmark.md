@@ -1647,3 +1647,34 @@ site. LFM3 also emitted a `browser_open` call on this prompt (model behaviour,
 not a skill selection - the skill hint uses only the user's words). Text-only
 chat is unchanged; the vision path is opt-in via `--image`. The cost is ~10 s
 per image in this first implementation (no long-lived Python sidecar yet).
+
+## Vision-based browser click vs CSS selector (2026-11-22)
+
+Branch `vision-click`. Added `browser_vision_click`: CDP
+`Page.captureScreenshot` -> Mirage `locate` returns the centre of the best
+matching text/object -> trusted `Input.dispatchMouseEvent` press/release ->
+read title/URL and report `OPENED` / `NOT OPENED`. The tool result is the
+verification the model sees, so it can state whether the page actually opened.
+
+Benchmark: YouTube search for "rabhata", click first video, fresh browser per
+run, warm server, wall-clock seconds. Ground truth = Chrome window title
+after the run.
+
+| Model / method | Runs | Avg | Opened |
+|---|---|---:|---|
+| Qwen3.5-4B selector (`browser_open_and_click`) | 18.99, 17.85, 19.82, 17.67 | **18.58 s** | 4/4 |
+| Qwen3.5-4B vision (`browser_vision_click`) | 17.15, 16.63, 16.79, 17.12 | **16.92 s** | 3/4 |
+| LFM3-Omni selector | 14.65, 14.50 | **14.58 s** | 2/2 |
+| LFM3-Omni vision | 15.93, 5.73 | 10.83 s | 0/2 |
+
+Verdict: the coordinate click is **technically working** (a Qwen run opened
+the exact "Raabta" video, verified by window title) and is ~1.7 s faster on
+average for Qwen, but it is **less reliable**: one Qwen run and both LFM3
+runs failed to produce a click that opened the page. The selector path, after
+the loop-guard and skill changes, is now 6/6 reliable on this task. Mirage's
+OCR is also weak on small text (example.com's link text was unreadable at
+1280x800), so vision clicking needs large, high-contrast targets.
+
+Recommendation: keep `browser_vision_click` as a **fallback** for pages where
+CSS selectors drift, not as the default. No merge to master without explicit
+approval. Tests: 471 passed / 1 pre-existing environment failure / 1 ignored.
