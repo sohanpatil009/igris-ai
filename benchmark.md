@@ -1678,3 +1678,20 @@ OCR is also weak on small text (example.com's link text was unreadable at
 Recommendation: keep `browser_vision_click` as a **fallback** for pages where
 CSS selectors drift, not as the default. No merge to master without explicit
 approval. Tests: 471 passed / 1 pre-existing environment failure / 1 ignored.
+
+### Full-screen viewport follow-up (same branch)
+
+The automation browser now launches at the full primary-screen size
+(`GetSystemMetrics` -> `--window-size=W,H`, `--window-position=0,0`) and headed
+mode adds `--start-maximized --kiosk`. On this machine the viewport is
+1536x960 instead of 1280x800.
+
+| Method | Runs | Avg | Opened |
+|---|---|---:|---|
+| Vision click, 1280x800 | 17.15, 16.63, 16.79, 17.12 | 16.92 s | 3/4 |
+| Vision click, full screen | 17.54, 16.77, 15.37, 16.99 | **16.42 s** | **4/4** |
+| Selector click (control) | 18.99, 17.85, 19.82, 17.67 | 18.58 s | 4/4 |
+
+Full screen removed the one failure and shaved ~0.5 s. Small-text pages
+(example.com's link text) are still unreadable to Mirage, so the vision
+fallback remains target-size dependent.

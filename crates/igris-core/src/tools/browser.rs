@@ -304,17 +304,38 @@ fn open_session(exe: &Path, headless: bool) -> Result<BrowserSession, String> {
 /// always allow unmuted autoplay (fresh automation profiles have zero
 /// Media Engagement Index, so sites like YouTube refuse to autoplay
 /// without the policy flag).
+/// Full primary-screen size, so the automation viewport uses the whole
+/// display. Vision clicking benefits from the extra area, and a headed
+/// window is maximised for the user. Falls back to 1280x800.
+fn screen_size() -> (u32, u32) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    let w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    if w > 0 && h > 0 {
+        (w as u32, h as u32)
+    } else {
+        (1280, 800)
+    }
+}
+
 fn launch_args(port: u16, headless: bool, profile: &Path) -> Vec<String> {
+    let (w, h) = screen_size();
     let mut args: Vec<String> = vec![
         format!("--remote-debugging-port={port}"),
         format!("--user-data-dir={}", profile.display()),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         "--autoplay-policy=no-user-gesture-required".into(),
-        "--window-size=1280,800".into(),
+        format!("--window-size={w},{h}"),
+        format!("--window-position=0,0"),
     ];
     if headless {
         args.push("--headless".into());
+    } else {
+        /* Headed: real full-screen window (no address bar) so the user
+         * and the vision click see the same full-viewport page. */
+        args.push("--start-maximized".into());
+        args.push("--kiosk".into());
     }
     args
 }
@@ -999,9 +1020,11 @@ mod tests {
             .iter()
             .any(|a| a.contains("--autoplay-policy=no-user-gesture-required")));
         assert!(args.iter().any(|a| a.contains("--headless")));
-        assert!(!launch_args(9223, false, Path::new("C:\\p"))
-            .iter()
-            .any(|a| a.contains("--headless")));
+        assert!(args.iter().any(|a| a.starts_with("--window-size=")));
+        let headed = launch_args(9223, false, Path::new("C:\\p"));
+        assert!(!headed.iter().any(|a| a.contains("--headless")));
+        assert!(headed.iter().any(|a| a == "--start-maximized"));
+        assert!(headed.iter().any(|a| a == "--kiosk"));
     }
 
     #[test]
