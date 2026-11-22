@@ -332,10 +332,10 @@ fn launch_args(port: u16, headless: bool, profile: &Path) -> Vec<String> {
     if headless {
         args.push("--headless".into());
     } else {
-        /* Headed: real full-screen window (no address bar) so the user
-         * and the vision click see the same full-viewport page. */
+        /* Headed: maximise to the whole screen but keep the native title
+         * bar with minimise / maximise / close buttons visible so the user
+         * can operate the window. Kiosk mode is deliberately NOT used. */
         args.push("--start-maximized".into());
-        args.push("--kiosk".into());
     }
     args
 }
@@ -851,11 +851,14 @@ pub(crate) fn run_browser_vision_click(args: &Value) -> Result<String, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("first result");
+    // Only trust explicit coordinates when they are real pixels. LFM3 was
+    // observed filling hallucinated x=0/y=0 parameters and clicking the
+    // top-left corner; zero/negative values are ignored so Mirage locates.
     let direct = match (
         args.get("x").and_then(Value::as_f64),
         args.get("y").and_then(Value::as_f64),
     ) {
-        (Some(x), Some(y)) => Some((x, y)),
+        (Some(x), Some(y)) if x > 0.0 && y > 0.0 => Some((x, y)),
         _ => None,
     };
 
@@ -1024,7 +1027,8 @@ mod tests {
         let headed = launch_args(9223, false, Path::new("C:\\p"));
         assert!(!headed.iter().any(|a| a.contains("--headless")));
         assert!(headed.iter().any(|a| a == "--start-maximized"));
-        assert!(headed.iter().any(|a| a == "--kiosk"));
+        // Keep native window controls visible - no kiosk/--app mode.
+        assert!(headed.iter().all(|a| a != "--kiosk"));
     }
 
     #[test]

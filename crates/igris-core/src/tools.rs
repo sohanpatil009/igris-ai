@@ -617,7 +617,8 @@ pub fn seed_registry() -> Registry {
                browser_click's selectors miss (YouTube markup changes). Give \
                text describing what to click, e.g. 'first video'. The result \
                states OPENED with the new title/URL, or NOT OPENED if nothing \
-               happened. Optional x/y skips detection and clicks directly."
+               happened. Only pass `text` - the position is detected from the
+               screenshot. Do not pass x/y; they are not used."
             .to_string(),
         schema: json!({
             "type": "object",
@@ -625,10 +626,9 @@ pub fn seed_registry() -> Registry {
                 "text": {
                     "type": "string",
                     "description": "What to click, e.g. 'first video' or 'Sign in'"
-                },
-                "x": { "type": "number", "description": "Optional direct screenshot x coordinate" },
-                "y": { "type": "number", "description": "Optional direct screenshot y coordinate" }
-            }
+                }
+            },
+            "required": ["text"]
         }),
         gated: false,
         plan: None,

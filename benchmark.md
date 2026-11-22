@@ -1695,3 +1695,20 @@ mode adds `--start-maximized --kiosk`. On this machine the viewport is
 Full screen removed the one failure and shaved ~0.5 s. Small-text pages
 (example.com's link text) are still unreadable to Mirage, so the vision
 fallback remains target-size dependent.
+
+### LFM3 fix - hallucinated x/y parameters (same branch)
+
+LFM3 failed 0/4 on the vision click even with full screen. `MOON_DEBUG_RAW`
+showed it filling the tool's optional `x`/`y` schema fields with `0`, so the
+tool clicked the top-left corner instead of Mirage's located position. Fix:
+drop `x`/`y` from the advertised schema and reject non-positive explicit
+coordinates (fall back to Mirage detection). After the fix, same full-screen
+YouTube task:
+
+| Runs | Avg | Opened |
+|---|---:|---|
+| 16.59, 14.99, 14.66, 14.57 s | **15.20 s** | **4/4** |
+
+Window controls: headed mode now uses only `--start-maximized` (kiosk mode
+removed) so minimise / maximise / close buttons stay visible and operable by
+the user. Headless automation is unaffected. Master was not touched.
