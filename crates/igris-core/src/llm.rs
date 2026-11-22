@@ -1,19 +1,21 @@
 ﻿//! Local LLM inference through llama.cpp (no Ollama).
 //!
-//! The GGUF in `assets/llama-cpp/models/` (currently LFM3-Omni-2B) is served by the bundled
+//! One of the GGUFs in `assets/llama-cpp/models/` is served by the bundled
 //! `llama-server` (Vulkan GPU build in `assets/llama-cpp/vulkan/`), which
-//! exposes an HTTP API on
-//! localhost. This module either reuses an already-running server or starts
-//! one as a detached child process; the process intentionally keeps running
-//! after this app exits so later runs skip the model load cost.
+//! exposes an HTTP API on localhost. `MOON_LLM_MODEL` picks the model:
+//! `lfm3` (default), `qwen` (Qwen3.5-4B) or `qwen-moe` (Qwen3.5-2B-MoE).
+//! This module either reuses an already-running server or starts one as a
+//! detached child process; the process intentionally keeps running after
+//! this app exits so later runs skip the model load cost.
 //!
-//! Prompts are rendered here and sent to the raw `/v1/completions`
-//! endpoint instead of the chat endpoint. llama-server reuses the longest
-//! common token prefix of a slot's KV cache; with a hand-rendered ChatML
-//! prompt every prefill ping (partial transcript while the user is still
-//! speaking) is a strict token-prefix of the final request, so the final
-//! request only processes the few tokens spoken since the last ping. The
-//! chat endpoint re-tokenizes per request and defeats that reuse on LFM3.
+//! Prompts are rendered here (in each model's own ChatML dialect) and sent
+//! to the raw `/v1/completions` endpoint instead of the chat endpoint.
+//! llama-server reuses the longest common token prefix of a slot's KV cache;
+//! with a hand-rendered prompt every prefill ping (partial transcript while
+//! the user is still speaking) is a strict token-prefix of the final
+//! request, so the final request only processes the few tokens spoken since
+//! the last ping. The chat endpoint re-tokenizes per request and defeats
+//! that reuse.
 
 use crate::paths;
 use crate::toolparse;
@@ -37,7 +39,6 @@ use std::time::{Duration, Instant};
  * use time so every front-end finds them regardless of its CWD. */
 const LLAMA_GPU_EXE: &str = "llama-cpp/vulkan/llama-server.exe";
 const LLAMA_CPU_EXE: &str = "llama-cpp/cpu/llama-server.exe";
-const LLM_MODEL: &str = "llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf";
 const PORT: u16 = 8081;
 const CTX_TOKENS: i64 = 8000;
 /// Liquid's recommended sampling defaults for general use.
@@ -46,6 +47,91 @@ const TOP_K: i64 = 50;
 /// Default persona for terminal `chat`: general-purpose assistant that
 /// answers quickly and directly.
 const SYSTEM_PROMPT: &str = "You are a general purpose assistant. Whatever the user asks, reply immediately with a short, clear and accurate answer. No filler, no preamble, get straight to the point.";
+
+/* ================================================================ */
+/* Model profiles: one runtime, several GGUFs                        */
+/* ================================================================ */
+
+/* The tool protocol and stream filters are model-agnostic, but the
+ * prompt skeleton is not: LFM3 and Qwen3.5 both speak ChatML, yet they
+ * disagree on the BOS token and on the "thinking disabled" assistant
+ * prefix. A profile keeps those differences (and the server flags that
+ * go with them) in one place; every other layer stays shared. */
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptStyle {
+    Lfm3,
+    Qwen35,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ModelProfile {
+    key: &'static str,
+    gguf: &'static str,
+    label: &'static str,
+    style: PromptStyle,
+    /// LFM3 mixes sliding-window attention layers; its KV-shift reuse
+    /// needs --swa-full. Qwen3.5 has no SWA layers, so leave it off.
+    swa_full: bool,
+}
+
+const PROFILES: &[ModelProfile] = &[
+    ModelProfile {
+        key: "lfm3",
+        gguf: "llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf",
+        label: "LFM3-Omni-2B",
+        style: PromptStyle::Lfm3,
+        swa_full: true,
+    },
+    ModelProfile {
+        key: "qwen",
+        gguf: "llama-cpp/models/qwen3-5-4B-Q4_K_M.gguf",
+        label: "Qwen3.5-4B",
+        style: PromptStyle::Qwen35,
+        swa_full: false,
+    },
+    ModelProfile {
+        key: "qwen-moe",
+        gguf: "llama-cpp/models/Qwen35-2B-MoE-A1.3B-Q4_K_M.gguf",
+        label: "Qwen3.5-2B-MoE",
+        style: PromptStyle::Qwen35,
+        swa_full: false,
+    },
+];
+
+const DEFAULT_MODEL_KEY: &str = "lfm3";
+
+/// Resolve a profile key. Unknown keys are a hard error here so the
+/// caller can report the allowed list; the runtime itself falls back to
+/// the default with a warning (a typo must not brick the assistant).
+fn profile_for_key(key: &str) -> Option<&'static ModelProfile> {
+    let key = key.trim().to_ascii_lowercase();
+    /* A couple of obvious spellings are accepted as aliases so users
+     * don't have to guess the exact key. */
+    let key = match key.as_str() {
+        "qwen3-5" | "qwen35" => "qwen",
+        "qwen35moe" | "qwen3-5-moe" => "qwen-moe",
+        other => other,
+    };
+    PROFILES.iter().find(|p| p.key == key)
+}
+
+/// The active profile, chosen by `MOON_LLM_MODEL` once per process.
+/// `MOON_LLM_MODEL` accepts `lfm3`, `qwen` or `qwen-moe`; unset/invalid
+/// selects `lfm3` (the model the bundled prompt protocol was tuned on).
+fn profile() -> &'static ModelProfile {
+    static ACTIVE: OnceLock<&'static ModelProfile> = OnceLock::new();
+    *ACTIVE.get_or_init(|| match std::env::var("MOON_LLM_MODEL") {
+        Ok(k) => profile_for_key(&k).unwrap_or_else(|| {
+            eprintln!(
+                "  llm       : unknown MOON_LLM_MODEL='{}' (choose: {}); using {DEFAULT_MODEL_KEY}",
+                k,
+                PROFILES.iter().map(|p| p.key).collect::<Vec<_>>().join(", ")
+            );
+            profile_for_key(DEFAULT_MODEL_KEY).unwrap()
+        }),
+        Err(_) => profile_for_key(DEFAULT_MODEL_KEY).unwrap(),
+    })
+}
 
 /// Persona for the voice assistant: replies are read aloud, so they must
 /// be short, conversational and free of markdown/lists/emoji. The system
@@ -69,19 +155,32 @@ pub const VOICE_SYSTEM_PROMPT: &str = "You are a helpful voice assistant. Reply 
 
 const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
-const GEN_PROMPT: &str = "<think></think>";
+/* Per-style prompt fragments, transcribed from each GGUF's own
+ * `tokenizer.chat_template` (verified 2026-11-22 with a metadata reader).
+ * Both families are ChatML, but LFM3 emits a BOS token and closes the
+ * empty think inline (`<think></think>`); Qwen3.5 emits no BOS and its
+ * thinking-disabled prefix is `<think>\n\n</think>\n\n`. Using the wrong
+ * one still "works" superficially but degrades instruction following and
+ * breaks the strict-prefix property the live prefill cache relies on. */
+const LFM3_BOS: &str = "<|startoftext|>";
+const LFM3_EMPTY_THINK: &str = "<think></think>\n";
+const QWEN_EMPTY_THINK: &str = "<think>\n\n</think>\n\n";
 
-/* Render `messages` as ChatML. Every turn becomes
- * `<|im_start|>role\ncontent<|im_end|>\n`; assistant turns additionally
- * carry the empty think block after the role line. The array must end
- * with the user message to answer.
- *
- * `final_request = false` (prefill ping): the trailing user turn stays
- * open (no <|im_end|>), so the text-so-far is a strict token-prefix of
- * the final request. `final_request = true` closes it and appends the
- * assistant generation prompt. */
-fn render_prompt(messages: &[Value], final_request: bool) -> String {
-    let mut s = String::from("<|startoftext|>");
+/// Render `messages` as the active model's ChatML dialect. Every turn
+/// becomes `<|im_start|>role\ncontent<|im_end|>\n`; assistant turns carry
+/// the dialect's empty think block after the role line. The array must
+/// end with the user message to answer.
+///
+/// `final_request = false` (prefill ping): the trailing user turn stays
+/// open (no <|im_end|>), so the text-so-far is a strict token-prefix of
+/// the final request. `final_request = true` closes it and appends the
+/// assistant generation prompt.
+fn render_prompt(messages: &[Value], final_request: bool, style: PromptStyle) -> String {
+    let (bos, empty_think) = match style {
+        PromptStyle::Lfm3 => (LFM3_BOS, LFM3_EMPTY_THINK),
+        PromptStyle::Qwen35 => ("", QWEN_EMPTY_THINK),
+    };
+    let mut s = String::from(bos);
     let n = messages.len();
     for (i, m) in messages.iter().enumerate() {
         let role = m["role"].as_str().unwrap_or("user");
@@ -90,8 +189,7 @@ fn render_prompt(messages: &[Value], final_request: bool) -> String {
         s.push_str(role);
         s.push('\n');
         if role == "assistant" {
-            s.push_str(GEN_PROMPT);
-            s.push('\n');
+            s.push_str(empty_think);
         }
         s.push_str(content);
         let last = i + 1 == n;
@@ -103,8 +201,7 @@ fn render_prompt(messages: &[Value], final_request: bool) -> String {
     if final_request {
         s.push_str(IM_START);
         s.push_str("assistant\n");
-        s.push_str(GEN_PROMPT);
-        s.push('\n');
+        s.push_str(empty_think);
     }
     s
 }
@@ -1052,16 +1149,26 @@ fn server_ready() -> bool {
     )
 }
 
-/// Lowercased file name of the GGUF this build expects to serve, e.g.
-/// "lfm3-1.7b-q4_k_m.gguf" â€” the identity a reused server must carry.
+/// Human-readable name of the active LLM, for CLI/voice banners.
+pub fn model_label() -> &'static str {
+    profile().label
+}
+
+/// Lowercased file name of the GGUF the active profile expects to serve,
+/// e.g. "lfm3-omni-2b-q4_k_m.gguf" or "qwen3-5-4b-q4_k_m.gguf" — the
+/// identity a reused server must carry.
 fn expected_model_id() -> &'static str {
     static EXPECTED: OnceLock<String> = OnceLock::new();
-    EXPECTED.get_or_init(|| {
-        std::path::Path::new(LLM_MODEL)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_lowercase())
-            .unwrap_or_else(|| LLM_MODEL.to_lowercase())
-    })
+    EXPECTED.get_or_init(|| model_id_from_gguf(profile().gguf))
+}
+
+/// Pure form of the identity derivation, so tests can pin every
+/// profile's expected id without touching process-wide env state.
+fn model_id_from_gguf(gguf: &str) -> String {
+    std::path::Path::new(gguf)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| gguf.to_lowercase())
 }
 
 /// Extract the GGUF file name from a llama-server /props body. Tolerant
@@ -1463,18 +1570,14 @@ fn try_start(backend: Backend) -> Result<Option<String>, String> {
             exe.display()
         ));
     }
+    let prof = profile();
     let mut args = vec![
         "-m".into(),
-        paths::asset(LLM_MODEL).to_string_lossy().into_owned(),
+        paths::asset(prof.gguf).to_string_lossy().into_owned(),
         "-c".into(),
         CTX_TOKENS.to_string(),
         "-fa".into(),
         "on".into(), /* flash attention: ~2x decode speed on this GPU */
-        /* LFM3 mixes sliding-window attention layers; the default SWA
-         * cache rejects KV-shift reuse ("cache_reuse is not supported by
-         * this context"). --swa-full stores the full window and unlocks
-         * prompt-prefix reuse. Both builds support it. */
-        "--swa-full".into(),
         /* KV-shifting chunk reuse: a new request may also reuse interior
          * cache chunks, not just the leading prefix. */
         "--cache-reuse".into(),
@@ -1487,6 +1590,13 @@ fn try_start(backend: Backend) -> Result<Option<String>, String> {
         "--port".into(),
         PORT.to_string(),
     ];
+    if prof.swa_full {
+        /* LFM3 mixes sliding-window attention layers; the default SWA
+         * cache rejects KV-shift reuse ("cache_reuse is not supported by
+         * this context"). --swa-full stores the full window and unlocks
+         * prompt-prefix reuse. Qwen3.5 has no SWA layers, so skip it. */
+        args.push("--swa-full".into());
+    }
     if backend == Backend::Gpu {
         args.push("-ngl".into());
         args.push("99".into()); /* offload every layer (Vulkan) */
@@ -1598,7 +1708,7 @@ fn complete(body: Value) -> Result<Value, Box<dyn std::error::Error>> {
 pub fn prefill(messages: &[Value]) -> Result<u64, Box<dyn std::error::Error>> {
     ensure_server(false)?;
     let body = json!({
-        "prompt": render_prompt(messages, false),
+        "prompt": render_prompt(messages, false, profile().style),
         "max_tokens": 1,
         "temperature": 0.0,
         "cache_prompt": true,
@@ -1628,7 +1738,7 @@ pub fn chat_stream(
 ) -> Result<(String, u128, Option<String>), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let mut body = json!({
-        "prompt": render_prompt(messages, true),
+        "prompt": render_prompt(messages, true, profile().style),
         "max_tokens": max_tokens,
         "temperature": TEMPERATURE,
         "top_k": TOP_K,
@@ -2309,11 +2419,55 @@ Gated tools: their first call only validates the action and announces the plan �
         assert!(msg.trim_end().ends_with(toolparse::TOOL_RESULT_CLOSE));
     }
 
-    /* ---- BUG-006: server-reuse identity check ---- */
+    /* ---- model profiles + BUG-006: server-reuse identity check ---- */
 
     #[test]
-    fn expected_model_id_is_the_bundled_gguf_name() {
-        assert_eq!(expected_model_id(), "lfm3-omni-2b-q4_k_m.gguf");
+    fn profile_keys_select_the_right_gguf_and_style() {
+        let lfm3 = profile_for_key("LFM3").unwrap();
+        assert_eq!(lfm3.style, PromptStyle::Lfm3);
+        assert!(lfm3.swa_full);
+        assert_eq!(
+            model_id_from_gguf(lfm3.gguf),
+            "lfm3-omni-2b-q4_k_m.gguf"
+        );
+        for key in ["qwen", "QWEN3-5", " qwen "] {
+            let q = profile_for_key(key).unwrap();
+            assert_eq!(q.style, PromptStyle::Qwen35);
+            assert!(!q.swa_full);
+            assert_eq!(model_id_from_gguf(q.gguf), "qwen3-5-4b-q4_k_m.gguf");
+        }
+        let moe = profile_for_key("qwen-moe").unwrap();
+        assert_eq!(moe.style, PromptStyle::Qwen35);
+        assert_eq!(
+            model_id_from_gguf(moe.gguf),
+            "qwen35-2b-moe-a1.3b-q4_k_m.gguf"
+        );
+        assert!(profile_for_key("llama").is_none());
+    }
+
+    #[test]
+    fn render_prompt_uses_each_models_own_chatml_dialect() {
+        let msgs = vec![
+            json!({"role": "system", "content": "SYS"}),
+            json!({"role": "user", "content": "HI"}),
+            json!({"role": "assistant", "content": "YO"}),
+            json!({"role": "user", "content": "AGAIN"}),
+        ];
+        let lfm3 = render_prompt(&msgs, true, PromptStyle::Lfm3);
+        assert!(lfm3.starts_with("<|startoftext|><|im_start|>system\nSYS<|im_end|>\n"));
+        assert!(lfm3.contains("<|im_start|>assistant\n<think></think>\nYO<|im_end|>\n"));
+        assert!(lfm3.ends_with("<|im_start|>assistant\n<think></think>\n"));
+
+        let qwen = render_prompt(&msgs, true, PromptStyle::Qwen35);
+        assert!(qwen.starts_with("<|im_start|>system\nSYS<|im_end|>\n"));
+        assert!(qwen.contains("<|im_start|>assistant\n<think>\n\n</think>\n\nYO<|im_end|>\n"));
+        assert!(qwen.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+
+        /* A prefill ping must stay a strict prefix of the final request:
+         * only the trailing user turn is left open. */
+        let ping = render_prompt(&msgs, false, PromptStyle::Qwen35);
+        assert!(ping.ends_with("<|im_start|>user\nAGAIN"));
+        assert!(qwen.starts_with(&ping));
     }
 
     #[test]

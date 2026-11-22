@@ -585,7 +585,10 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     install_console();
 
-    println!("Moonshine voice assistant (streaming {arch_label} STT + LFM3-1.7B via llama.cpp)");
+    println!(
+        "Moonshine voice assistant (streaming {arch_label} STT + {} via llama.cpp)",
+        crate::llm::model_label()
+    );
     println!("  model dir : {model_dir}");
     match &file_path {
         None if hotkey_mode => {

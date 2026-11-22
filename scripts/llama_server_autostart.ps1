@@ -13,7 +13,16 @@ $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
 $gpuExe = Join-Path $root 'assets\llama-cpp\vulkan\llama-server.exe'
 $cpuExe = Join-Path $root 'assets\llama-cpp\cpu\llama-server.exe'
-$model = Join-Path $root 'assets\llama-cpp\models\LFM3-Omni-2B-Q4_K_M.gguf'
+# Mirror llm.rs::profile(): MOON_LLM_MODEL = lfm3 | qwen | qwen-moe.
+$profile = if ($env:MOON_LLM_MODEL) { $env:MOON_LLM_MODEL.Trim().ToLowerInvariant() } else { 'lfm3' }
+$modelRel = switch ($profile) {
+    'lfm3'     { 'assets\llama-cpp\models\LFM3-Omni-2B-Q4_K_M.gguf' }
+    'qwen'     { 'assets\llama-cpp\models\qwen3-5-4B-Q4_K_M.gguf' }
+    'qwen-moe' { 'assets\llama-cpp\models\Qwen35-2B-MoE-A1.3B-Q4_K_M.gguf' }
+    default    { Write-Warning "unknown MOON_LLM_MODEL='$profile'; using lfm3"; 'assets\llama-cpp\models\LFM3-Omni-2B-Q4_K_M.gguf' }
+}
+$model = Join-Path $root $modelRel
+$swaFull = $profile -eq 'lfm3'
 $port = 8081
 $stderrLog = Join-Path $env:TEMP 'igris-llama-server-stderr.log'
 $bootLog = Join-Path $env:TEMP 'igris-llama-boot.log'
@@ -27,7 +36,7 @@ function Server-Health {
 function Server-IsOurs {
     try {
         $p = Invoke-WebRequest "http://127.0.0.1:$port/props" -UseBasicParsing -TimeoutSec 3
-        return $p.Content -like '*LFM3*'
+        return ($p.Content -match 'LFM3|qwen3-5|Qwen35-2B')
     } catch { return $false }
 }
 function Test-Generation {
@@ -41,8 +50,9 @@ function Test-Generation {
 }
 function Start-Backend($exe, $gpu) {
     if (-not (Test-Path $exe)) { Log "missing exe: $exe"; return $null }
-    $args = @('-m', $model, '-c', '8000', '-fa', 'on', '--swa-full',
-        '--cache-reuse', '1', '--no-webui', '--port', "$port")
+    $args = @('-m', $model, '-c', '8000', '-fa', 'on')
+    if ($swaFull) { $args += '--swa-full' }
+    $args += @('--cache-reuse', '1', '--no-webui', '--port', "$port")
     if ($gpu) { $args += @('-ngl', '99') }
     Remove-Item $stderrLog -ErrorAction SilentlyContinue
     $p = Start-Process -FilePath $exe -ArgumentList $args -WindowStyle Hidden `

@@ -74,8 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  assist --hotkey  push-to-talk assistant: the mic opens only while");
         eprintln!("                   CTRL+SPACE is held anywhere; on release the");
         eprintln!("                   answer streams (press again to barge-in)");
-        eprintln!("  chat             prompt the local LLM (LFM3-1.7B via llama.cpp);");
+        eprintln!("  chat             prompt the local LLM via llama.cpp;");
         eprintln!("                   without PROMPT it runs an interactive loop");
+        eprintln!("                   MOON_LLM_MODEL=lfm3|qwen|qwen-moe picks the GGUF");
         eprintln!("  speak            say TEXT out loud through piper TTS (assets/piper);");
         eprintln!("                   the voice in assets/tts downloads on first run;");
         eprintln!("                   --voice en_US-amy-low picks the smaller/faster voice");

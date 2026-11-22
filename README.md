@@ -28,6 +28,30 @@ find the binaries no matter where they are launched from.
 cargo build --release
 ```
 
+## Choose the local LLM
+
+`MOON_LLM_MODEL` selects which GGUF in `assets/llama-cpp/models/` the Rust
+code serves through the bundled llama.cpp (GPU first, CPU fallback). The
+prompt renderer, tool protocol and server flags follow the chosen model, so
+no code change is needed to switch:
+
+| `MOON_LLM_MODEL` | GGUF | Notes |
+|---|---|---|
+| `lfm3` (default) | `LFM3-Omni-2B-Q4_K_M.gguf` | LFM3 ChatML dialect; `--swa-full` for its sliding-window layers |
+| `qwen` | `qwen3-5-4B-Q4_K_M.gguf` | Qwen3.5-4B (~2.7 GB); its own ChatML/thinking prefix, no SWA flag |
+| `qwen-moe` | `Qwen35-2B-MoE-A1.3B-Q4_K_M.gguf` | Qwen3.5-2B MoE (1.3 B active), fastest of the three |
+
+```powershell
+$env:MOON_LLM_MODEL = 'qwen'
+cargo run --release -- chat "who are you"
+```
+
+An unknown value warns and falls back to `lfm3`. Note that `llama-server`
+stays alive after the app exits, so after switching models stop the old
+server first (`Stop-Process -Name llama-server`) — the app refuses to reuse
+a server serving a different GGUF. The logon autostart script honours the
+same variable.
+
 ## Get an audio file
 
 Record or generate a WAV (16 kHz mono is fine, the code re-samples). A quick synthetic test on Windows:
@@ -88,7 +112,7 @@ cargo run --release -- chat                     # interactive loop, replies stre
 cargo run --release -- chat "who are you"       # one-shot
 ```
 
-Backed by `assets/llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf` through the bundled llama.cpp.
+Backed by the GGUF selected with `MOON_LLM_MODEL` (default: LFM3-Omni-2B) through the bundled llama.cpp — see [Choose the local LLM](#choose-the-local-llm).
 On first use the app starts `llama-server` detached on `127.0.0.1:8081`; the
 process intentionally keeps running after the app exits so later runs skip
 the model load. Stop it manually with `taskkill /IM llama-server.exe /F`.
@@ -243,7 +267,7 @@ completes, the reply streams back token-by-token (first token typically
   `-ngl 99 -fa on -c 8000 --swa-full --cache-reuse 1` — the flags matter, see
   `crates/igris-core/src/llm.rs`). The CPU
   build stays in `assets/llama-cpp/cpu/` as fallback.
-- Model: `assets/llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf` (LiquidAI LFM3-Omni-2B, ~1.1 GB).
+- Model: selected with `MOON_LLM_MODEL` (default `assets/llama-cpp/models/LFM3-Omni-2B-Q4_K_M.gguf`, ~1.1 GB; `qwen` and `qwen-moe` also bundled).
   The `llama-server` process keeps running after the app exits so the next
   run skips the model load; `Stop-Process -Name llama-server` frees it.
 - Test without a mic (streams a WAV in real time through the same
