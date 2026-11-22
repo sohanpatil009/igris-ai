@@ -10,7 +10,7 @@ igris-ai/
 │   ├── igris-core/   # agent core lib: STT, LLM, TTS, toolparse, tools, assist, live, hotkey
 │   └── igris-cli/    # reference terminal front-end (binary keeps the name igris-ai)
 ├── assets/           # gitignored runtime assets (provisioned once, reused forever)
-│   ├── llama-cpp/    # vulkan/ + cpu/ llama-server builds, models/ LFM3-Omni-2B GGUF
+│   ├── llama-cpp/    # vulkan/ + cpu/ llama-server builds, models/ {LFM3-Omni-2B,Qwen3.5-4B} GGUFs
 │   ├── piper/        # piper.exe + espeak-ng-data
 │   ├── tts/          # piper voice files (downloaded on first use)
 │   └── stt/          # small-streaming/, medium-streaming/ Moonshine models
@@ -123,23 +123,29 @@ the model load. Stop it manually with `taskkill /IM llama-server.exe /F`.
 Two llama.cpp builds ship with the repo, and the app picks between them
 automatically:
 
-- **GPU first** — the Vulkan build in `assets/llama-cpp/vulkan/` (fast: ~33 tok/s,
-  ~1.3 GB VRAM). Used whenever the machine can run it.
-- **CPU fallback** — the CPU build in `assets/llama-cpp/cpu/` (slower: ~16 tok/s,
-  0 VRAM). Takes over automatically when the GPU build cannot run: no
-  Vulkan driver, too little VRAM, early crash, or a startup timeout.
-  The console prints which backend came up, e.g.
-  `llm : llama.cpp gpu backend ready (NVIDIA GeForce MX350)`.
+- **GPU first** — the Vulkan build in `assets/llama-cpp/vulkan/`. Used whenever
+  the machine can run it.
+- **CPU fallback** — the CPU build in `assets/llama-cpp/cpu/`. Takes over
+  automatically when the GPU build cannot run: no Vulkan driver, too little
+  VRAM, early crash, or a startup timeout. The console prints which backend
+  came up, e.g. `llm : llama.cpp gpu backend ready (NVIDIA GeForce RTX 4050 Laptop GPU)`.
 
 Pass `--cpu` (or set `MOON_LLM_CPU=1`) to skip the GPU attempt entirely —
 useful on office laptops where you would rather keep the VRAM free.
 
-The server runs with `--no-webui` (API only) plus `--swa-full --cache-reuse 1` —
-LFM3 is a sliding-window-attention model, and these flags are what unlock
-prompt-prefix reuse (the KV-shift path is rejected with the default SWA cache).
-Prompts are rendered as ChatML in `crates/igris-core/src/llm.rs` and sent to the raw
-`/v1/completions` endpoint; the chat endpoint would re-tokenize per request and
-defeat the reuse.
+The server runs with `--no-webui` (API only) plus `--cache-reuse 1`; LFM3 also
+gets `--swa-full` because its sliding-window-attention layers reject the
+default SWA cache on KV-shift reuse (Qwen3.5 has no SWA layers). Prompts are
+rendered as the chosen model's ChatML dialect in `crates/igris-core/src/llm.rs`
+and sent to the raw `/v1/completions` endpoint; the chat endpoint would
+re-tokenize per request and defeat the reuse.
+
+The agent loop remembers each `(tool name, canonical arguments)` for one turn:
+a repeated call returns the original result with a "do not repeat" note instead
+of re-executing it. This prevents the model from burning rounds re-running the
+same search — measured 7.63 s → 4.31 s on a web task and 11.52 s → 8.53 s on a
+research task (both on a warm GPU server, 2026-11-22). Gated tools' two-step
+confirmation still works because the guard is scoped to a single turn.
 
 Replies stream live after a minimal `ai:-` label — no timing or status lines
 around them.
@@ -337,3 +343,28 @@ Last-Modified: Mon, 16 Nov 2026 00:30:20 GMT
 Result shapes are assembled by pure formatters with hermetic unit
 tests; the benchmark trail for this and earlier remediation phases
 lives in `benchmark.md`.
+
+## Benchmarks
+
+`benchmark.md` holds the full evidence trail (goal.md category matrices,
+browser tasks, runtime upgrade and cleanup records). Latest headline numbers
+from the nine category probes on a warm RTX 4050 Vulkan server:
+
+| Category | LFM3-Omni-2B | Qwen3.5-4B |
+|---|---:|---:|
+| Open an app | 0.97 s | 1.39 s |
+| Media key | 1.09 s | 1.25 s |
+| Find a file | 10.93 s | 1.72 s |
+| Project structure | 2.02 s | 3.47 s |
+| Web search | 4.31 s | 7.40 s |
+| Open a URL | 4.61 s | 1.93 s |
+| System stats | 1.95 s | 1.74 s |
+| Memory save/recall | 0.87 s | 1.88 s |
+| Research + summarize | 5.12 s | 8.53 s |
+
+Both models pass 8/9 categories. LFM3 is faster on simple tool calls; Qwen is
+much faster on file lookup (it picks `list_dir` instead of `file_search` +
+`read_file`). The slow rows are long-output bound, not thinking bound.
+
+`scripts/update_llama_binaries.ps1` re-provisions the bundled llama.cpp
+runtime (b12359) if you need to restore it on a fresh machine.
