@@ -1,5 +1,10 @@
 /target
-/assets
+# llama.cpp runtime binaries are tracked; models and other assets stay local
+/assets/*
+!/assets/llama-cpp/
+/assets/llama-cpp/*
+!/assets/llama-cpp/cpu/
+!/assets/llama-cpp/vulkan/
 /.tts-utt
 tts_dump*.raw
 speech.wav
