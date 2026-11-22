@@ -1017,9 +1017,29 @@ pub fn agent_turn(
             return Ok(AgentTurnEnd::Final);
         }
 
+        /* An envelope that parses but names NO registered tool is protocol
+         * drift (LFM3's `tool_name` placeholder measured 2026-11-22), not
+         * work. Dispatching it burns a round on an "unknown tool" result.
+         * Grammar-force a clean retry instead. Gated tools and real calls
+         * are unaffected. */
+        let known: std::collections::HashSet<String> = registry
+            .specs()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        let registered: Vec<_> = calls
+            .into_iter()
+            .filter(|c| known.contains(&c.name))
+            .collect();
+        if registered.is_empty() {
+            constrained = true;
+            history.push(json!({"role": "assistant", "content": raw}));
+            history.push(json!({"role": "user", "content": "That tool name is not in the available tools. Emit a valid tool call using exactly one of the listed tool names and the documented envelope format."}));
+            continue;
+        }
         // De-duplicate repeated identical calls before dispatch: a
         // degenerate reply can loop its envelope several times.
-        let calls = dedup_tool_calls(calls);
+        let calls = dedup_tool_calls(registered);
         state.retries = 0;
         state.executed_any = true;
         let stored = toolparse::strip_trailing_terminal_markers(&raw);

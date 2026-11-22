@@ -1551,3 +1551,33 @@ Skills are kept because they are cheap (~200 tokens, cached) and give
 explicit tool-selection guidance; they are **not** presented as a speed win.
 Recommendation unchanged: LFM3-Omni-2B or Qwen3.5-4B, and `MOON_NO_TOOLS=1`
 skips both the protocol block and the skill.
+
+## Grammar-forced retry for unknown tool names (2026-11-22)
+
+Branch `perf/lfm-grammar`. An envelope can parse yet name a tool that is not
+in the registry (LFM3's `tool_name` placeholder). That used to dispatch,
+burn a round on an "unknown tool" result, and only then trigger a grammar
+retry. The agent loop now checks parsed names against the registry and, when
+none are registered, immediately appends a corrective note and forces the
+next round under the GBNF tool grammar.
+
+Same nine probes, warm server per model (previous run -> after):
+
+| Probe | LFM3 | Qwen |
+|---|---:|---:|
+| desktop | 0.96 -> 0.95 s | 1.60 -> 1.45 s |
+| music | 0.58 -> 0.57 s | 1.28 -> 1.24 s |
+| files | 11.27 -> 10.97 s | 8.91 -> 7.95 s |
+| developer | 1.91 -> 2.02 s | 3.54 -> 4.08 s |
+| browser | 23.44 -> 7.91 s* | 14.43 -> 9.64 s* |
+| comm | 2.42 -> 1.76 s | 2.02 -> 1.94 s |
+| system | 1.90 -> **1.42 s** | 1.77 -> 1.76 s |
+| memory | 0.88 -> 0.87 s | 1.60 -> 1.86 s |
+| advanced | 18.73 -> 13.05 s* | 17.56 -> 17.46 s |
+
+\* Web rows remain upstream-latency bound; treat the large deltas as noisy.
+The deterministic win is the system row: LFM3's two bogus `tool_name`
+envelopes are gone, leaving a single `sys_stats` call. No new failure mode:
+unknown names are still reported to the model, just earlier and under a
+constraint that makes the bad spelling unrepresentable. Tests unchanged
+(470 passed / 1 pre-existing environment failure / 1 ignored).
