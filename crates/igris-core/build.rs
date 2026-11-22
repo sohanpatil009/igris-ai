@@ -46,8 +46,9 @@ fn main() {
      * directory shape around it varies by cargo version, so walk the whole
      * build dir recursively and accept any hit below a moonshine-sys path
      * component. */
+    let build_dir = profile.join("build");
     let mut newest: Option<(SystemTime, PathBuf)> = None;
-    let mut stack = vec![profile.join("build")];
+    let mut stack = vec![build_dir.clone()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
@@ -72,6 +73,12 @@ fn main() {
         }
     }
 
+    /* Watching the exact dll (a file, not its parent build dir) keeps the
+     * copy fresh across a moonshine-sys revision bump without making cargo
+     * rebuild on every unrelated build-script output change. */
+    if let Some((_, p)) = &newest {
+        println!("cargo:rerun-if-changed={}", p.display());
+    }
     let Some((src_mtime, bundled)) = newest else {
         println!(
             "cargo:warning=no bundled onnxruntime.dll under {}/build/**/moonshine-sys*/; \
@@ -89,7 +96,7 @@ fn main() {
      * dll on the next build-script rerun (build.rs itself is a
      * rerun-if-changed input). */
     let mut dests = vec![profile.join("onnxruntime.dll")];
-    let mut stack = vec![profile.join("build")];
+    let mut stack = vec![build_dir];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;

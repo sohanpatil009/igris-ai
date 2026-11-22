@@ -76,6 +76,19 @@ returned null, and the process died with an access violation.
   `1.23`. Quick manual fix: copy it from the moonshine-sys build out dir
   shown above (or just rebuild — `build.rs` restores it).
 - `cargo clean` is now safe; do not delete anything from `System32`.
+
+### Follow-up 2026-11-22 — debug profile / stale build-script cache
+
+The same warning + 0xc0000005 reappeared on `target\debug\igris-ai.exe
+assist --hotkey`: `target\debug\onnxruntime.dll` was missing while the release
+copy was correct (1.23.20251021.3). Cause: igris-core's build script had been
+cached from a run BEFORE moonshine-sys unpacked its dll, so it never copied
+one and cargo never reran it. Fix: `build.rs` now also emits
+`cargo:rerun-if-changed=<the bundled dll path>` (the file, not the whole
+build dir — watching the dir caused a rebuild loop). Touching/rebuilding
+`build.rs` reran the script and copied the correct dll to the debug profile;
+`cargo build` then verified stable (second build cached, 0.71 s) and the STT
+batch-mode run loaded both Moonshine models without the ORT warning or crash.
 - The version in the warning is the giveaway: "Current ORT Version is:
   1.17.1" means the OS copy from System32 got loaded instead of the bundled
   one.
