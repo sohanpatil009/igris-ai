@@ -311,6 +311,10 @@ fn media_js(action: &str) -> String {
 
 const MEDIA_STATE_JS: &str = "JSON.stringify({paused: (function(){var v=document.querySelector('video');return v?v.paused:null})(), t: (function(){var v=document.querySelector('video');return v?Math.round(v.currentTime):null})(), title: document.title})";
 
+/* Cheap probe: is there an actually VISIBLE skip button (Skip Ad, Skip intro)
+ * on the page? Only then is it worth paying for a Mirage screenshot+locate. */
+const SKIP_PROBE_JS: &str = "JSON.stringify((function(){var els=document.querySelectorAll('button,[role=\"button\"],div[class*=skip]');for(var i=0;i<els.length;i++){var e=els[i],t=((e.innerText||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||'')).toLowerCase();if(t.indexOf('skip')>=0&&t.indexOf('content')<0&&t.indexOf('navigation')<0&&t.indexOf('main')<0&&e.offsetParent!==null)return{found:true,text:t.trim().slice(0,60)};}return{found:false};})())";
+
 static SESSION: OnceLock<Mutex<Option<BrowserSession>>> = OnceLock::new();
 
 fn session_cell() -> &'static Mutex<Option<BrowserSession>> {
@@ -1010,28 +1014,52 @@ pub(crate) fn run_browser_media(args: &Value) -> Result<String, String> {
         if before_paused.is_none() {
             return Err("no video element on the page - open a video first".into());
         }
-        sess.screenshot(&shot, deadline)?;
-        let how = match crate::vision::locate_in_image(&shot, query) {
-            Ok(loc) => {
-                sess.click_xy(loc.x, loc.y, deadline)?;
-                format!("vision click at ({:.0},{:.0}) on {}", loc.x, loc.y, loc.name)
+        let dom_click = |sess: &mut BrowserSession, reason: &str| -> Result<String, String> {
+            let reply = sess.call(
+                "Runtime.evaluate",
+                json!({ "expression": media_js(&action), "returnByValue": true }),
+                deadline,
+            )?;
+            let p = reply["result"]["value"].as_str().unwrap_or("");
+            if std::env::var_os("MOON_DEBUG_RAW").is_some() {
+                eprintln!("[media] dom payload={p} exception={}", reply["exceptionDetails"]);
             }
-            Err(e) => {
-                let reply = sess.call(
-                    "Runtime.evaluate",
-                    json!({ "expression": media_js(&action), "returnByValue": true }),
-                    deadline,
-                )?;
-                let p = reply["result"]["value"].as_str().unwrap_or("");
-                if std::env::var_os("MOON_DEBUG_RAW").is_some() {
-                    eprintln!("[media] dom payload={p} exception={}", reply["exceptionDetails"]);
+            let v: Value = serde_json::from_str(p).unwrap_or(Value::Null);
+            Ok(format!(
+                "dom via {} ({reason})",
+                v["clicked"].as_str().unwrap_or("unknown")
+            ))
+        };
+        let how = if action == "skip" {
+            /* Skip is special: only spend ~10s on Mirage when a real, visible
+             * Skip button exists (Skip Ad / Skip intro). Otherwise seek. */
+            let probe = sess.call(
+                "Runtime.evaluate",
+                json!({ "expression": SKIP_PROBE_JS, "returnByValue": true }),
+                deadline,
+            )?;
+            let pp = probe["result"]["value"].as_str().unwrap_or("");
+            let pv: Value = serde_json::from_str(pp).unwrap_or(Value::Null);
+            if pv["found"].as_bool() == Some(true) {
+                sess.screenshot(&shot, deadline)?;
+                match crate::vision::locate_in_image(&shot, query) {
+                    Ok(loc) => {
+                        sess.click_xy(loc.x, loc.y, deadline)?;
+                        format!("vision click at ({:.0},{:.0}) on {}", loc.x, loc.y, loc.name)
+                    }
+                    Err(e) => dom_click(&mut sess, &format!("vision failed: {e}"))?,
                 }
-                let v: Value = serde_json::from_str(p).unwrap_or(Value::Null);
-                format!(
-                    "dom fallback ({}) via {}",
-                    e,
-                    v["clicked"].as_str().unwrap_or("unknown")
-                )
+            } else {
+                dom_click(&mut sess, "no visible skip button")?
+            }
+        } else {
+            sess.screenshot(&shot, deadline)?;
+            match crate::vision::locate_in_image(&shot, query) {
+                Ok(loc) => {
+                    sess.click_xy(loc.x, loc.y, deadline)?;
+                    format!("vision click at ({:.0},{:.0}) on {}", loc.x, loc.y, loc.name)
+                }
+                Err(e) => dom_click(&mut sess, &format!("vision failed: {e}"))?,
             }
         };
         if std::env::var_os("MOON_DEBUG_RAW").is_some() {
@@ -1060,6 +1088,12 @@ pub(crate) fn run_browser_media(args: &Value) -> Result<String, String> {
         .is_some_and(|e| e.starts_with("CDP "))
     {
         *cell = Some(sess);
+    }
+    if std::env::var_os("MOON_DEBUG_RAW").is_some() {
+        let _ = std::fs::copy(
+            &shot,
+            std::env::temp_dir().join("igris-media-debug.png"),
+        );
     }
     let _ = std::fs::remove_file(&shot);
     result

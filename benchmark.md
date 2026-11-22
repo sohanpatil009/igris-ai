@@ -1773,3 +1773,11 @@ Both models dispatch the controls from one short prompt and give a one-line
 confirmation. Cost is ~12 s per action when Mirage runs (vision attempt +
 inference) even though the click itself falls back to DOM; this is the price
 of trying vision first as requested.
+
+Skip special-case: YouTube's "Skip to content" accessibility link was fooling
+the visibility probe, so every skip paid the ~10 s Mirage cost and still
+failed. The probe now excludes content/navigation/main links. With no real
+Skip button on a normal video, `skip` seeks +10 s through DOM in ~1 s instead;
+total task (browser launch + LLM + skip) dropped to **6.43 s**. When a real,
+visible Skip button does exist (Skip Ad / Skip intro), Mirage vision is used
+to locate and click it, with DOM as the fallback.
