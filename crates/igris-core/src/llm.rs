@@ -329,10 +329,22 @@ pub fn tools_enabled(no_tools_flag: bool) -> bool {
 /// turn never changes mid-session, keeping the KV-cache prefix stable.
 /// Specs come from the tool registry (src/tools.rs), the single owner of
 /// the tool list.
-pub fn system_prompt_with_tools(base: &str, tools_on: bool) -> String {
+pub fn system_prompt_with_tools(base: &str, tools_on: bool, user_hint: &str) -> String {
     let mut s = String::from(base);
     if tools_on {
         s.push_str(&tools_protocol_block(&tools::registry().specs()));
+        /* Workflow skill is chosen once at seed time from the first user
+         * text (or the generic voice skill when there is none yet), so the
+         * system message stays a stable KV-cache prefix. */
+        let skill = if user_hint.is_empty() {
+            Some(crate::skills::voice_skill())
+        } else {
+            crate::skills::skill_for(user_hint)
+        };
+        if let Some(skill) = skill {
+            s.push_str("\n\n");
+            s.push_str(skill);
+        }
     }
     s
 }
@@ -1901,7 +1913,7 @@ fn stream_persona(
     let mut history: Vec<Value> = vec![
         json!({
             "role": "system",
-            "content": system_prompt_with_tools(SYSTEM_PROMPT, tools_on)
+            "content": system_prompt_with_tools(SYSTEM_PROMPT, tools_on, prompt)
         }),
         json!({"role": "user", "content": prompt}),
     ];
@@ -2136,18 +2148,29 @@ Gated tools: their first call only validates the action and announces the plan Ã
     #[test]
     fn system_prompt_with_tools_disabled_is_exactly_base() {
         assert_eq!(
-            system_prompt_with_tools(VOICE_SYSTEM_PROMPT, false),
+            system_prompt_with_tools(VOICE_SYSTEM_PROMPT, false, ""),
             VOICE_SYSTEM_PROMPT
         );
     }
 
     #[test]
     fn system_prompt_with_tools_is_deterministic() {
-        let a = system_prompt_with_tools(VOICE_SYSTEM_PROMPT, true);
-        let b = system_prompt_with_tools(VOICE_SYSTEM_PROMPT, true);
+        let a = system_prompt_with_tools(VOICE_SYSTEM_PROMPT, true, "");
+        let b = system_prompt_with_tools(VOICE_SYSTEM_PROMPT, true, "");
         assert_eq!(a, b);
         assert!(a.starts_with(VOICE_SYSTEM_PROMPT));
         assert!(a.contains("## Tool Use Protocol"));
+        assert!(a.contains("## Workflow skill"));
+    }
+
+    #[test]
+    fn system_prompt_skill_follows_the_user_hint() {
+        let browser = system_prompt_with_tools(SYSTEM_PROMPT, true, "play on youtube");
+        assert!(browser.contains("## Workflow skill: browser"));
+        let memory = system_prompt_with_tools(SYSTEM_PROMPT, true, "remember my exam");
+        assert!(memory.contains("## Workflow skill: memory"));
+        let plain = system_prompt_with_tools(SYSTEM_PROMPT, true, "hello there");
+        assert!(!plain.contains("## Workflow skill"));
     }
 
     #[test]

@@ -1525,3 +1525,29 @@ Qwen's advanced task went 5 -> 2 real calls. Remaining slow rows are now
 long-output bound (LFM3 `file_search` + `read_file` echoing a 16 KB README,
 ~11 s), not loop bound. Further gains there would require capping answer
 length, which trades answer completeness for speed and was not applied.
+
+## Workflow skills - first pass (2026-11-22)
+
+Added `crates/igris-core/src/skills.rs`: five short instruction blocks
+(browser, media, files, memory, research) plus a generic voice block.
+`system_prompt_with_tools` selects one at session seed from the first user
+text (empty hint in `assist` selects the generic voice block), appending it
+after the tool protocol. Selection is deterministic and cache-safe: the
+system message is fixed for the session. Unit tests pin the matching.
+
+Measured on the same nine probes, three reruns each, the skills produced
+**no reliable speed gain** and some regressions on web rows:
+
+| Probe | No skill | With skill | Note |
+|---|---:|---:|---|
+| desktop / music / system | ~1 s | ~1 s | unchanged |
+| files | 1.72 s (Qwen) | 8.9–9.8 s | skill asked to read a file; removed that suggestion |
+| research | 5.1–8.5 s | 14–23 s | web_fetch chosen by the model and slow upstream; wording loosened, still slow |
+
+The final skill text avoids suggesting `web_fetch` and says to answer from
+search snippets. Web-row timings remain dominated by upstream search/page
+latency and the models' own fetch decisions, not by the prompt addition.
+Skills are kept because they are cheap (~200 tokens, cached) and give
+explicit tool-selection guidance; they are **not** presented as a speed win.
+Recommendation unchanged: LFM3-Omni-2B or Qwen3.5-4B, and `MOON_NO_TOOLS=1`
+skips both the protocol block and the skill.

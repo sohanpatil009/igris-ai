@@ -729,7 +729,7 @@ pub fn cmd_assist(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     asst.tools_on = tools_on;
     let mut history: Vec<Value> = vec![json!({
         "role": "system",
-        "content": llm::system_prompt_with_tools(llm::VOICE_SYSTEM_PROMPT, tools_on)
+        "content": llm::system_prompt_with_tools(llm::VOICE_SYSTEM_PROMPT, tools_on, "")
     })];
     let mut prev_status = String::new();
     let mut last_pass = Instant::now();

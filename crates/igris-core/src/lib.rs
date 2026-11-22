@@ -1,4 +1,4 @@
-//! IGRIS agent core: Moonshine STT, LFM3-1.7B LLM through llama.cpp, piper
+//! IGRIS agent core: Moonshine STT, LFM3-Omni-2B / Qwen3.5-4B LLM through llama.cpp, piper
 //! TTS, the ZeroClaw-derived tool parser, the dynamic tool registry, and
 //! the agent loop that ties them together.
 //!
@@ -20,6 +20,7 @@ pub mod live;
 pub mod memory;
 pub mod models;
 pub mod paths;
+pub mod skills;
 pub mod toolgrammar;
 pub mod toolparse;
 pub mod tools;

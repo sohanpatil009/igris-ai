@@ -147,6 +147,14 @@ same search — measured 7.63 s → 4.31 s on a web task and 11.52 s → 8.53 s 
 research task (both on a warm GPU server, 2026-11-22). Gated tools' two-step
 confirmation still works because the guard is scoped to a single turn.
 
+Short **workflow skills** (browser, media, files, memory, research) are appended
+to the system prompt when the first user message matches one, giving the model
+explicit tool-selection rules for that task. `assist` uses a generic voice
+skill. Skill choice is fixed at session seed so the KV-cache prefix stays
+stable; `MOON_NO_TOOLS=1` skips both the protocol block and the skill. See
+`crates/igris-core/src/skills.rs` and `benchmark.md` (the skills are guidance,
+not a measured speed win).
+
 Replies stream live after a minimal `ai:-` label — no timing or status lines
 around them.
 
