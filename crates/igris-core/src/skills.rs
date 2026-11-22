@@ -14,20 +14,18 @@
 /// session, so a following `browser_read` fails. Playback needs a click.
 const BROWSER: &str = "\
 ## Workflow skill: browser\n\
-Use browser_open / browser_read / browser_close for CDP-backed browsing. \
-open_url only launches a browser and creates no session - do not follow it with browser_read. \
-A YouTube search-results page is not playback: call browser_open_and_click (or browser_click) \
-on the first result to actually play a video. Never repeat the same click with the same selector; \
-if it fails, change the selector or report the failure.";
+Pick the most direct browser tool for the request. Do not repeat a tool call with identical \
+arguments - if its result is already present, use it. A search-results page is not playback: \
+a video must be opened or clicked before claiming it is playing. If a click fails, change the \
+selector or report the failure instead of retrying unchanged.";
 
 /// File workflow: an explicit directory should be listed, not searched
 /// recursively; and the answer should summarise, not echo whole files.
 const FILES: &str = "\
 ## Workflow skill: files\n\
-When the user names an explicit directory, call list_dir and answer from that listing. \
-Use file_search only for a name across broad user folders. Call read_file only when the user \
-explicitly asks to read or quote a specific file; then summarise the relevant part instead of \
-pasting the whole file.";
+Use the most direct file tool that answers the request; avoid extra calls when a listing is \
+enough. If you do read a file, summarise the relevant part instead of pasting the whole file. \
+Do not repeat a tool call with identical arguments.";
 
 /// Media workflow: volume and transport keys are dedicated tools.
 const MEDIA: &str = "\

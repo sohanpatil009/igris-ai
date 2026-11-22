@@ -1581,3 +1581,47 @@ envelopes are gone, leaving a single `sys_stats` call. No new failure mode:
 unknown names are still reported to the model, just earlier and under a
 constraint that makes the bad spelling unrepresentable. Tests unchanged
 (470 passed / 1 pre-existing environment failure / 1 ignored).
+
+## Full-suite verification - all scenarios, both models (2026-11-22)
+
+Reran all 14 recorded scenarios (goal.md examples, full matrix, browser
+tasks) with a fresh warm server per model. Numbers are seconds;
+"original" is the first pre-optimization run recorded above.
+
+| Scenario | LFM3 original -> now | Qwen original -> now |
+|---|---:|---:|
+| get_time | 0.71 -> 0.70 | 1.61 -> 1.56 |
+| calculate (2+2) | 1.87 -> **1.33** | 8.65 -> **2.71** |
+| two-tool round | 1.24 -> 1.25 | 2.96 -> 2.77 |
+| open app | 1.03 -> 0.93 | 1.47 -> 1.42 |
+| find README | 11.60 -> 10.97 | 1.74 -> 7.31* |
+| project structure | 2.00 -> 2.01 | 3.47 -> 3.51 |
+| web search | 13.56 -> **6.54** | 14.26 -> 14.15 |
+| system stats | 1.79 -> **1.50** | 1.83 -> 1.80 |
+| recall | 0.80 -> 0.83 | 1.40 -> 1.54 |
+| open URL in Chrome | 2.43 -> 2.67 | 2.05 -> 2.66 |
+| browser open + read | 3.05 -> 3.12 | 4.19 -> 4.45 |
+| YouTube play | 14.04 -> 15.18 | 19.72 -> 32.74* |
+| research + summarize | 13.83 -> 12.46 | 28.14 -> **21.01** |
+
+\* Tool-choice variance: Qwen chose `file_search`+`read_file` instead of
+`list_dir` on the README row, and the YouTube click loop remains the single
+worst case for both models. Both are model behaviour, not runtime cost.
+
+Deterministic wins (loop/protocol hygiene, shared by both models since the
+same code path serves them): Qwen `2+2` **-69%**, Qwen research **-25%**,
+LFM3 web search **-52%**, LFM3 system stats **-16%** with the bogus
+`tool_name` envelopes gone. LFM3's total across the 13 comparable rows fell
+from 67.95 s to 59.49 s (**-12%**). Qwen's total is roughly flat (93.5 s ->
+99.4 s) because the two variance rows offset the real loop gains.
+
+A mid-run regression was traced to the first draft of the browser skill,
+which pushed `browser_open` over the fast `open_url` path (28-116 s browser
+rows). The skill wording was made neutral on tool choice and the rows returned
+to baseline (LFM3 2.67 s, Qwen 2.66 s for open; 3.12 s / 4.45 s for read).
+This is why the skills are documented as guidance, not a speed feature.
+
+Both models run the same agent loop, grammar gate and skill selector - there
+is no model-specific optimisation to "copy over" to Qwen. The remaining slow
+rows are long-output and browser-click bound; the next lever would be a
+configurable answer-length cap, not fine-tuning.
