@@ -1380,3 +1380,52 @@ that dispatch open+read together.
 Chrome was left running on the YouTube search page after the final retry
 and was closed manually. No sign-in, no volume or power changes, no file
 writes beyond the dedicated browser profile and `browser.json`.
+
+## Full task matrix - LFM3 / Qwen / MoE (2026-11-22)
+
+One scripted pass over 13 prompts (the goal.md set plus get_time /
+calculate / two-tool / browser variants), warm Vulkan server per model,
+one-shot `chat`, wall-clock seconds. The MoE leg was stopped after three
+rows because every one of them failed to dispatch any tool.
+
+| # | Prompt | LFM3-Omni-2B | Qwen3.5-4B | Qwen3.5-2B-MoE |
+|---|---|---:|---:|---:|
+| 1 | what time is it | 0.71 | 1.61 | 0.80 (no tool, wrong answer) |
+| 2 | 2 plus 2 | 1.87 (3x calculate) | 8.65 (7x calculate) | 0.40 (no tool, answered from memory) |
+| 3 | time + RAM | 1.24 | 2.96 | 0.85 (no tool, wrong answer) |
+| 4 | Open Notepad | 1.03 | 1.47 | - (stopped) |
+| 5 | Find README in D:\igris-ai | 11.60 (file_search+read_file) | 1.74 (list_dir) | - |
+| 6 | Show project structure | 2.00 | 3.47 | - |
+| 7 | Search latest AI models | 13.56 (6 calls) | 14.26 (3 calls) | - |
+| 8 | How much RAM am I using? | 1.79 (2 bogus tool_name + sys_stats) | 1.83 | - |
+| 9 | Remember exam March 3rd | 0.88 (memory_recall - already saved) | 1.98 (memory_save) | - |
+| 10 | When is my exam? | 0.80 | 1.40 | - |
+| 11 | Open example.com in Chrome | 2.43 (browser_open) | 2.05 (open_url) | - |
+| 12 | browser_open + browser_read | 3.05 | 4.19 | - |
+| 13 | YouTube rabhata + click | 14.04 (8 calls) | 19.72 (4 calls) | - |
+
+Findings: LFM3 is fastest on the simple rows (0.7-2 s) but dithers on
+long-answer / browser rows; Qwen is more consistent on tool *selection*
+(list_dir instead of file_search+read_file) but loops `calculate` 7x and
+click 4x. MoE never dispatched a tool in any completed row - it is not a
+usable agent. Repeated bogus `tool_name` / duplicate-calculate envelopes
+are filtered by the parser (no double execution) but cost rounds.
+
+## New user-added models - function-calling check (2026-11-22)
+
+Three more GGUFs appeared in `assets/llama-cpp/models/`. Each got its own
+profile in `llm.rs` with a prompt dialect derived from its own GGUF chat
+template; the check prompt was `chat "what time is it"` on a warm server.
+
+| Model | ARCH / dialect | Time | Result |
+|---|---|---:|---|
+| `qwen3-5-4B-Q4_K_M(omni).gguf` | `qwen35`, same template as qwen | 1.57 s | PASS - `[tools] get_time`, correct time |
+| `Spark-X2.6-1.7B-Q4_K_M.gguf` | `spark2_5`, fullwidth sentinels + `<|System|>/<|User|>/<|Bot|>/<|Tool|>`, native `<arg_key>/<arg_value>` tool format | 18.29 s | PARTIAL - got `get_time` + correct time only after repeated malformed envelopes and grammar retries; prompt dialect added but native attr format is not taught to the model yet |
+| `TinyMixtral-4x248M-MoE.i1-Q4_K_M.gguf` | `llama`, plain ChatML, no think token | 10.88 s | FAIL - emitted only quote/dot gibberish, no tool call, no usable answer |
+
+Notes: the `(omni)` file has byte-identical metadata/template to the
+existing 4B Qwen - it is a renamed copy, not a different model. Spark's
+own native tool format (`<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`)
+is not in the parser's accepted families, so it had to fall back to our
+generic JSON protocol, which explains the retries. TinyMixtral is too
+small for the tool protocol; do not use it for agent tasks.
