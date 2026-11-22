@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket};
@@ -130,7 +130,7 @@ struct BrowserSession {
     /// The browser's OS pid (from our spawn, or the port file on reattach).
     pid: u32,
     /// Some when we spawned it (we hold the Child); None on reattach.
-    child: Option<Child>,
+    child: Option<crate::llm::IsolatedChild>,
 }
 
 impl BrowserSession {
@@ -294,7 +294,10 @@ fn launch_args(port: u16, headless: bool, profile: &Path) -> Vec<String> {
 
 /// Pick a free port, spawn the automation-dedicated browser and wait for
 /// its DevTools discovery endpoint to answer.
-fn spawn_browser(exe: &Path, headless: bool) -> Result<(u16, u32, Child), String> {
+fn spawn_browser(
+    exe: &Path,
+    headless: bool,
+) -> Result<(u16, u32, crate::llm::IsolatedChild), String> {
     let port = {        let listener =
             TcpListener::bind("127.0.0.1:0").map_err(|e| format!("no free local debug port: {e}"))?;
         listener
@@ -309,14 +312,16 @@ fn spawn_browser(exe: &Path, headless: bool) -> Result<(u16, u32, Child), String
     let mut args = launch_args(port, headless, &profile);
     args.push("about:blank".into());
 
-    let mut child = Command::new(exe)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    /* Isolated spawn: a plain std::process::Command sets
+     * bInheritHandles=TRUE with no handle list, so a browser launched
+     * under a redirected shell keeps the caller's pipe write-ends alive
+     * after the app exits and the shell hangs waiting for EOF (observed
+     * 392 s on the example.com probe). The shared isolated spawn passes
+     * only NUL/NUL/log to the child. */
+    let log = std::env::temp_dir().join("igris-browser-launch-stderr.log");
+    let child = crate::llm::spawn_isolated(exe, &args, &log)
         .map_err(|e| format!("could not launch {}: {e}", exe.display()))?;
-    let pid = child.id();
+    let pid = child.pid();
 
     let deadline = Instant::now() + DISCOVERY_BUDGET;
     loop {
@@ -324,8 +329,7 @@ fn spawn_browser(exe: &Path, headless: bool) -> Result<(u16, u32, Child), String
             break;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.kill();
             return Err(format!(
                 "the browser's DevTools endpoint never came up on port {port}"
             ));
@@ -806,14 +810,13 @@ pub(crate) fn run_browser_close(_args: &Value) -> Result<String, String> {
 /// Make sure the browser process is gone: give a graceful close ~3 s,
 /// then kill the whole tree (taskkill /T covers Chrome's helper
 /// processes; needed for reattached orphans, belt-and-braces for ours).
-fn ensure_dead(mut child: Option<&mut Child>, pid: u32) {
+fn ensure_dead(mut child: Option<&mut crate::llm::IsolatedChild>, pid: u32) {
     if let Some(c) = child.as_mut() {
         for _ in 0..30 {
-            match c.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(_) => break,
+            if c.try_wait() {
+                return;
             }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
     let _ = Command::new("taskkill")
@@ -822,7 +825,7 @@ fn ensure_dead(mut child: Option<&mut Child>, pid: u32) {
         .stderr(Stdio::null())
         .status();
     if let Some(c) = child {
-        let _ = c.wait();
+        c.kill();
     }
 }
 

@@ -1334,20 +1334,30 @@ pub fn ensure_server(force_cpu: bool) -> Result<(), Box<dyn std::error::Error>> 
 /// three std handles and nothing else, no matter what we happen to
 /// hold. Closing our process handle never kills the child â€” the server
 /// outlives this process by design.
-struct IsolatedChild {
+pub(crate) struct IsolatedChild {
     process: windows::Win32::Foundation::HANDLE,
+    pid: u32,
 }
 
+// The owned HANDLE is an opaque process handle: moving it between threads
+// is safe, and BrowserSession keeps it behind a Mutex (one caller at a time).
+unsafe impl Send for IsolatedChild {}
+unsafe impl Sync for IsolatedChild {}
+
 impl IsolatedChild {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// Has the child exited? Non-blocking.
-    fn try_wait(&self) -> bool {
+    pub(crate) fn try_wait(&self) -> bool {
         use windows::Win32::Foundation::WAIT_OBJECT_0;
         use windows::Win32::System::Threading::WaitForSingleObject;
         unsafe { WaitForSingleObject(self.process, 0) == WAIT_OBJECT_0 }
     }
 
     /// Terminate the child (startup-failure paths) and reap it briefly.
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
         unsafe {
             let _ = TerminateProcess(self.process, 1);
@@ -1364,9 +1374,24 @@ impl Drop for IsolatedChild {
     }
 }
 
+/// Spawn a detached process with the same isolated handle table used for
+/// llama-server. Other tools (notably `open_url` launching Chrome) used
+/// plain `std::process::Command`, which sets bInheritHandles=TRUE without a
+/// handle list: a browser spawned under a redirected shell then kept the
+/// parent's pipe write-ends alive after the app exited, so the caller hung
+/// for minutes waiting for EOF (measured 392 s on the example.com probe).
+/// Dropping the returned child closes only our handle - the process lives.
+pub(crate) fn spawn_detached(
+    exe: &std::path::Path,
+    args: &[String],
+    stderr_log: &std::path::Path,
+) -> Result<(), String> {
+    spawn_isolated(exe, args, stderr_log).map(|_| ())
+}
+
 /// Spawn `exe` with `args`, stdio = NUL / NUL / `stderr_log`, inheriting
 /// no handle beyond those three (see [`IsolatedChild`]).
-fn spawn_isolated(
+pub(crate) fn spawn_isolated(
     exe: &std::path::Path,
     args: &[String],
     stderr_log: &std::path::Path,
@@ -1505,7 +1530,7 @@ fn spawn_isolated(
     unsafe {
         let _ = CloseHandle(pi.hThread);
     }
-    Ok(IsolatedChild { process: pi.hProcess })
+    Ok(IsolatedChild { process: pi.hProcess, pid: pi.dwProcessId })
 }
 
 /// Compose a Windows command line with the same quoting rules

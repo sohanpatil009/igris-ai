@@ -1319,3 +1319,64 @@ Notepad was opened by both `open_app` runs and closed afterwards. The
 `%APPDATA%\igris\memory.json` - persistent by design. The two web rows
 made real DuckDuckGo / page requests. No volume, power, shutdown or
 delete tools were exercised.
+
+## Browser tasks - Qwen3.5-4B vs Qwen3.5-2B-MoE (2026-11-22)
+
+Same branch/runtime as the previous section (b12359, warm Vulkan server,
+one-shot `chat`). Each model got a fresh Chrome profile
+(`%LOCALAPPDATA%\igris\browser-profile`) and `browser.json`. There is **no
+`%APPDATA%\igris\tools.toml` on this box**, so the old `play_song` config
+tool is not registered - the YouTube task uses the built-in
+`browser_open_and_click` (the capability that actually clicks a result).
+
+Because `browser_read`/`browser_close` only see the process-global session
+(a fresh `chat` process has an empty `session_cell`, even when `browser.json`
+holds a reattachable pid/port), the prompts are self-contained single turns
+that dispatch open+read together.
+
+| Task | Tool(s) | Qwen3.5-4B | Qwen3.5-2B-MoE |
+|---|---|---:|---:|
+| Open example.com and read it | `browser_open` + `browser_read` | 4.13 s, PASS (Example Domain text) | 6.47 s, FAIL (bare tool names, no dispatch) |
+| Open YouTube rabhata search + click first video | `browser_open_and_click` | 6.89 s, PARTIAL (search page opened, click missed) | 21.73 s, FAIL (malformed envelopes, no playback) |
+| Retry click with explicit selectors | `browser_open` + `browser_click` x2 + `browser_open_and_click` | 24.88 s, PARTIAL (selector drift) | - (not run) |
+| "Open https://example.com in Chrome" (`open_url` path) | `open_url` | 392 s before fix -> **1.95 s** after | - (not run) |
+
+### Findings
+
+- **Handle inheritance was the 392 s/464 s hang, not the model.** Both
+  `open_url` (launching Chrome) and `browser_open` used plain
+  `std::process::Command::spawn()`: Windows sets `bInheritHandles=TRUE`
+  with no handle list, so the browser inherited the caller's pipe
+  write-ends. The app printed its answer and exited, but the outer shell
+  kept waiting for EOF. File redirection did not help - the harness's own
+  pipe was still in the app's handle table (464 s rerun). Both launch
+  paths now use `llm.rs::spawn_isolated` (the same
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` fix as llama-server): verified
+  `open_url` 1.95 s, `browser_open`+`browser_read` 4.13 s, no hang.
+  The user independently confirmed example.com was visibly open during
+  the original 392 s run, so the tool action itself always succeeded.
+- **MoE cannot drive tools at all.** On the open+read task it emitted
+  `browser_open` / `browser_read` as bare text; the parser logged repeated
+  `Malformed <tool_call>` warnings and nothing was dispatched. On YouTube
+  it eventually produced one proper `browser_open_and_click` envelope but
+  finished with "I apologize for the error" and no browser window. This
+  matches its earlier `get_time` miss - the `K12H2 Bbtm` finetune ignores
+  the ZeroClaw tool protocol, so it is unusable as an agent.
+- **YouTube click is genuinely flaky here.** The search page loads (Chrome
+  window title `rabhata - YouTube - Google Chrome`), but
+  `ytd-video-renderer a#video-title` did not match, a retry with
+  `a#thumbnail` also missed, and the page then drifted to a plain
+  `YouTube - Google Chrome` title. Playback was **not** verified. The
+  historical acceptance run needed steering plus eight rounds; that
+  recipe is not reproducible without the `play_song` description here.
+- **Session scope is per-process.** A separate `browser_read` process
+  reported "No browser session is currently open" even though the first
+  process had just opened the page and written `browser.json`. The
+  long-running `assist` process is the intended shape; one-shot `chat`
+  needs open+read in the same turn.
+
+### Side effects
+
+Chrome was left running on the YouTube search page after the final retry
+and was closed manually. No sign-in, no volume or power changes, no file
+writes beyond the dedicated browser profile and `browser.json`.

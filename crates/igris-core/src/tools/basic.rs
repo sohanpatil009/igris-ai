@@ -507,9 +507,14 @@ fn expand_env_path_with(
 pub(crate) fn open_in_named_browser(browser: &str, url: &str) -> Result<String, String> {
     let exe = browser_exe(browser)?;
     let label = browser.trim().to_lowercase();
-    std::process::Command::new(&exe)
-        .arg(url)
-        .spawn()
+    /* Use llm.rs's isolated spawn, not std::process::Command: a plain
+     * spawn marks every inheritable handle in our process for inheritance
+     * (no handle list), so a browser launched under a redirected shell
+     * keeps the parent's pipe ends open after we exit and the caller hangs
+     * waiting for EOF. The isolated spawn passes only NUL/NUL/log. */
+    let log = std::env::temp_dir().join("igris-browser-launch-stderr.log");
+    let args = vec![url.to_string()];
+    crate::llm::spawn_detached(&exe, &args, &log)
         .map_err(|e| format!("Could not launch {}: {e}", exe.display()))?;
     Ok(format!("Opened {url} in {label}."))
 }
