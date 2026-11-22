@@ -1429,3 +1429,33 @@ own native tool format (`<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_va
 is not in the parser's accepted families, so it had to fall back to our
 generic JSON protocol, which explains the retries. TinyMixtral is too
 small for the tool protocol; do not use it for agent tasks.
+
+## MoE branch - native tool envelope experiment (2026-11-22)
+
+Branch `moe` (merged from the feature branch). Hypothesis: the
+`K12H2 Bbtm` MoE finetune ignored our generic ZeroClaw JSON protocol but
+might follow Qwen3.5's own `<function=NAME><parameter=KEY>value</parameter></function>`
+spelling, which its chat template teaches and the vendored parser already
+accepts (`parse_function_attr_calls`). The native instructions were added
+for all Qwen35 profiles plus a matching GBNF constraint for corrective
+rounds; two follow-up tweaks (a parameterized few-shot, a native
+`<tool_response>` result carrier) were tried and **reverted** because they
+made the final answer worse.
+
+| Probe | Generic protocol (before) | Native protocol (after) |
+|---|---|---|
+| `what time is it` | no tool, wrong answer (0.80 s) | `get_time` dispatched on some runs (best 1.14 s); other runs still no tool |
+| `how much RAM am I using?` | no tool, wrong answer | still no tool (0.68-0.85 s) |
+| browser open + read | no tool | one or two tools dispatched (2.2-3.3 s), then apologetic/incorrect final text |
+
+Verdict: **partial, not production-ready.** The native envelope fixes the
+*syntax* problem (malformed `<tool_call>` bodies drop sharply) and makes
+simple tool dispatch possible, but this finetune remains unreliable at
+tool selection and at using results. The GBNF grammar is now native too,
+so corrective rounds no longer force the wrong (JSON) shape. No training
+was attempted: a 2 B model in Q4 cannot be fine-tuned on a 4 GB laptop.
+
+Regression check on Qwen3.5-4B with the native protocol: `get_time` 1.92 s
+(correct), browser open+read 5.36 s (correct) — no regression. Recommendation
+stands: use `qwen` (4B) or `lfm3` for agent work; `qwen-moe` is chat-only
+until a much stronger steering recipe or an external fine-tune exists.
