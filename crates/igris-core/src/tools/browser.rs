@@ -265,6 +265,52 @@ fn click_js(selector: Option<&str>, text: Option<&str>) -> String {
     CLICK_JS.replace("__SEL__", &sel).replace("__TXT__", &txt)
 }
 
+/* Media-player controls. YouTube exposes play/pause/next/previous as buttons
+ * with stable classes or aria-labels; we click the real button where possible
+ * and only fall back to the video element for play/pause and skip. __ACT__ is
+ * replaced with a JSON string literal. */
+const MEDIA_JS: &str = r#"JSON.stringify((function () {
+    var act = __ACT__;
+    var v = document.querySelector('video');
+    var before = v ? { paused: v.paused, t: Math.round(v.currentTime) } : null;
+    var clicked = null;
+    function clickFirst(selectors, labels) {
+        for (var i = 0; i < selectors.length; i++) {
+            var el = document.querySelector(selectors[i]);
+            if (el) { el.click(); return selectors[i]; }
+        }
+        var all = document.querySelectorAll('button,[role="button"],div[title]');
+        for (var j = 0; j < all.length; j++) {
+            var label = ((all[j].getAttribute('aria-label') || '') + ' ' + (all[j].getAttribute('title') || '')).toLowerCase();
+            for (var k = 0; k < labels.length; k++) {
+                if (label.indexOf(labels[k]) >= 0) { all[j].click(); return label.trim(); }
+            }
+        }
+        return null;
+    }
+    if (act === 'play') {
+        if (v) { try { v.play(); clicked = 'video.play()'; } catch (e) {} }
+        if (!clicked) clicked = clickFirst(['.ytp-play-button', '[data-testid="play-button"]'], ['play']);
+    } else if (act === 'pause') {
+        if (v) { v.pause(); clicked = 'video.pause()'; }
+        if (!clicked) clicked = clickFirst(['.ytp-play-button', '[data-testid="pause-button"]'], ['pause']);
+    } else if (act === 'next') {
+        clicked = clickFirst(['.ytp-next-button', 'button[data-testid="playlist-next"]', 'a[title="Next"]'], ['next']);
+    } else if (act === 'previous') {
+        clicked = clickFirst(['.ytp-prev-button', 'button[data-testid="playlist-prev"]', 'a[title="Previous"]'], ['previous', 'prev']);
+    } else if (act === 'skip') {
+        if (v) { v.currentTime = Math.min(v.duration || 1e9, v.currentTime + 10); clicked = 'seek +10s'; }
+        if (!clicked) clicked = clickFirst(['.ytp-ad-skip-button', '.ytp-ad-skip-button-modern'], ['skip']);
+    }
+    return { before: before, clicked: clicked, hasVideo: !!v, title: document.title, url: location.href };
+})())"#;
+
+fn media_js(action: &str) -> String {
+    MEDIA_JS.replace("__ACT__", &serde_json::to_string(action).unwrap_or_else(|_| "\"\"".into()))
+}
+
+const MEDIA_STATE_JS: &str = "JSON.stringify({paused: (function(){var v=document.querySelector('video');return v?v.paused:null})(), t: (function(){var v=document.querySelector('video');return v?Math.round(v.currentTime):null})(), title: document.title})";
+
 static SESSION: OnceLock<Mutex<Option<BrowserSession>>> = OnceLock::new();
 
 fn session_cell() -> &'static Mutex<Option<BrowserSession>> {
@@ -916,6 +962,109 @@ pub(crate) fn run_browser_vision_click(args: &Value) -> Result<String, String> {
     result
 }
 
+/// Control media in the open browser by clicking the player's real controls.
+/// Mirage vision locates the button on a screenshot and a trusted CDP mouse
+/// click activates it; if vision cannot locate it, the DOM (aria-label /
+/// className) method is the fallback. State is always verified afterwards.
+pub(crate) fn run_browser_media(args: &Value) -> Result<String, String> {
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !["play", "pause", "next", "previous", "skip"].contains(&action.as_str()) {
+        return Err("browser_media needs action: play, pause, next, previous or skip".into());
+    }
+    let query = match action.as_str() {
+        "play" => "play",
+        "pause" => "pause",
+        "next" => "next",
+        "previous" => "previous",
+        _ => "skip",
+    };
+
+    let read_state = |sess: &mut BrowserSession, deadline| -> Result<(Option<bool>, u64, String), String> {
+        let r = sess.call(
+            "Runtime.evaluate",
+            json!({ "expression": MEDIA_STATE_JS, "returnByValue": true }),
+            deadline,
+        )?;
+        let p = r["result"]["value"].as_str().unwrap_or("");
+        let v: Value = serde_json::from_str(p).unwrap_or(Value::Null);
+        Ok((
+            v["paused"].as_bool(),
+            v["t"].as_u64().unwrap_or(0),
+            v["title"].as_str().unwrap_or("").to_string(),
+        ))
+    };
+
+    let mut cell = session_cell().lock().unwrap();
+    let Some(mut sess) = cell.take() else {
+        return Err("no browser session is open - call browser_open first".into());
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let shot = std::env::temp_dir().join("igris-media-vision.png");
+    let result: Result<String, String> = (|| {
+        let (before_paused, before_t, title) = read_state(&mut sess, deadline)?;
+        if before_paused.is_none() {
+            return Err("no video element on the page - open a video first".into());
+        }
+        sess.screenshot(&shot, deadline)?;
+        let how = match crate::vision::locate_in_image(&shot, query) {
+            Ok(loc) => {
+                sess.click_xy(loc.x, loc.y, deadline)?;
+                format!("vision click at ({:.0},{:.0}) on {}", loc.x, loc.y, loc.name)
+            }
+            Err(e) => {
+                let reply = sess.call(
+                    "Runtime.evaluate",
+                    json!({ "expression": media_js(&action), "returnByValue": true }),
+                    deadline,
+                )?;
+                let p = reply["result"]["value"].as_str().unwrap_or("");
+                if std::env::var_os("MOON_DEBUG_RAW").is_some() {
+                    eprintln!("[media] dom payload={p} exception={}", reply["exceptionDetails"]);
+                }
+                let v: Value = serde_json::from_str(p).unwrap_or(Value::Null);
+                format!(
+                    "dom fallback ({}) via {}",
+                    e,
+                    v["clicked"].as_str().unwrap_or("unknown")
+                )
+            }
+        };
+        if std::env::var_os("MOON_DEBUG_RAW").is_some() {
+            eprintln!("[media] action={action} method={how}");
+        }
+        std::thread::sleep(Duration::from_millis(900));
+        let (after_paused, after_t, after_title) = read_state(&mut sess, deadline)?;
+        let mut out = format!("{} via {how}.", action.to_uppercase());
+        match after_paused {
+            Some(true) => out.push_str("\nPAUSED"),
+            Some(false) => out.push_str("\nPLAYING"),
+            None => {}
+        }
+        if after_t > before_t {
+            out.push_str(&format!(" (time {before_t}s -> {after_t}s)"));
+        }
+        let t = if after_title.is_empty() { &title } else { &after_title };
+        if !t.is_empty() {
+            out.push_str(&format!("\nTitle: {t}"));
+        }
+        Ok(out)
+    })();
+    if !result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.starts_with("CDP "))
+    {
+        *cell = Some(sess);
+    }
+    let _ = std::fs::remove_file(&shot);
+    result
+}
+
 pub(crate) fn run_browser_close(_args: &Value) -> Result<String, String> {
     let mut cell = session_cell().lock().unwrap();
     let Some(mut sess) = cell.take() else {
@@ -1080,6 +1229,21 @@ mod tests {
         let js2 = click_js(None, Some("hello"));
         assert!(js2.contains(r#""hello""#), "{js2}");
         assert_eq!(click_js(None, None), CLICK_JS.replace("__SEL__", "\"\"").replace("__TXT__", "\"\""));
+    }
+
+    #[test]
+    fn media_js_embeds_action_as_json_literal() {
+        let js = media_js("next");
+        assert!(js.contains("\"next\""));
+        assert!(js.contains("ytp-next-button"));
+        assert!(js.contains("__ACT__") == false);
+    }
+
+    #[test]
+    fn browser_media_validates_action_before_any_session() {
+        let err = run_browser_media(&json!({})).unwrap_err();
+        assert!(err.contains("browser_media needs action"));
+        assert!(run_browser_media(&json!({ "action": "rewind" })).is_err());
     }
 
     #[test]

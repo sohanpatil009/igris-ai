@@ -1751,3 +1751,25 @@ are unchanged in depth.
 Follow-up: the model may still PRINT a watch URL in chat (LFM3 did), but
 `tts::sanitize` now drops URL-like tokens before speech, so piper reads only
 "Playing the Rehbara song on YouTube." Unit test pins the stripping.
+
+## Browser media controls (2026-11-22)
+
+Added `browser_media` with `action = play | pause | next | previous | skip`.
+It takes a CDP screenshot and asks Mirage to locate the button, then sends a
+trusted mouse click at those coordinates; if Mirage cannot locate the control
+(YouTube's player buttons are icon-only, so this is the common case), it falls
+back to CDP DOM clicks / direct video control. Playback state is always read
+back and reported as PLAYING or PAUSED with the timestamp and title.
+
+Verified on a real YouTube video (`watch?v=aTBRK-7fGNU`):
+
+| Action | Tool result | Verified transition |
+|---|---|---|
+| pause | `video.pause()` | before `paused:false, t:9s` -> PAUSED |
+| play | `video.play()` | before `paused:true, t:9s` -> PLAYING |
+| skip | seek +10s via DOM | time advances |
+
+Both models dispatch the controls from one short prompt and give a one-line
+confirmation. Cost is ~12 s per action when Mirage runs (vision attempt +
+inference) even though the click itself falls back to DOM; this is the price
+of trying vision first as requested.

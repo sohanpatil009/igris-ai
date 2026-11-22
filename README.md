@@ -163,6 +163,12 @@ song." — while informational questions still get a full answer. Any URL the
 model prints is stripped before it reaches piper, so TTS only ever speaks
 human-listenable words ("Playing the Rehbara song on YouTube", never a link).
 
+For a video already open in the automation browser, `browser_media` controls
+play / pause / next / previous / skip. It tries Mirage vision first on a
+screenshot (trusted coordinate click) and falls back to the player's DOM
+controls when the buttons are icon-only; the result reports the verified
+PLAYING/PAUSED state.
+
 ### Image understanding (optional, via Cactus Mirage)
 
 ```bash

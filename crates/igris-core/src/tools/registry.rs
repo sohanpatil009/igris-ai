@@ -32,6 +32,8 @@ fn tool_budget(name: &str) -> Duration {
         "browser_click" => Duration::from_secs(10),
         // screenshot + Mirage inference + click + verify
         "browser_vision_click" => Duration::from_secs(45),
+        // screenshot + Mirage locate + click + verified state
+        "browser_media" => Duration::from_secs(30),
         "browser_close" => Duration::from_secs(10),
         // walk + hash budget inside find_duplicates itself
         "find_duplicates" => Duration::from_secs(120),
@@ -612,6 +614,7 @@ mod tests {
                 "activity_log",
                 "browser_click",
                 "browser_close",
+                "browser_media",
                 "browser_open",
                 "browser_open_and_click",
                 "browser_read",

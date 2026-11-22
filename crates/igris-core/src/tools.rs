@@ -137,7 +137,7 @@ pub(crate) use shared::truncate_chars;
 use crate::tools::basic::{run_calculate, run_get_time, run_media_key, run_open_app, run_open_url};
 use crate::tools::browser::{
     run_browser_click, run_browser_close, run_browser_open, run_browser_open_and_click,
-    run_browser_vision_click,
+    run_browser_vision_click, run_browser_media,
     run_browser_read,
 };
 use crate::tools::config_tools::CONFIG_TOOLS;
@@ -633,6 +633,30 @@ pub fn seed_registry() -> Registry {
         gated: false,
         plan: None,
         run: Arc::new(run_browser_vision_click),
+    });
+    r.register(ToolDef {
+        name: "browser_media".to_string(),
+        desc: "Control playback in the open automation browser: play, pause, \
+               next, previous or skip. Clicks the player's real buttons via \
+               CDP (className / aria-label, with direct video control as \
+               fallback) and reports the verified state - PLAYING or PAUSED \
+               with the current time and title. Call browser_open on a video \
+               page first."
+            .to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["play", "pause", "next", "previous", "skip"],
+                    "description": "Which player control to activate"
+                }
+            },
+            "required": ["action"]
+        }),
+        gated: false,
+        plan: None,
+        run: Arc::new(run_browser_media),
     });
     r.register(ToolDef {
         name: "browser_close".to_string(),

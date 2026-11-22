@@ -2170,7 +2170,7 @@ Gated tools: their first call only validates the action and announces the plan Ã
         // Every entry carries ONE canonical call-arguments example (plan
         // P0): the raw schema dump made the model echo "properties"
         // shapes as data (the open_app defect class).
-        assert_eq!(block.matches("Call arguments: `").count(), 47);
+        assert_eq!(block.matches("Call arguments: `").count(), 48);
         assert!(!block.contains("\"required\""));
         assert!(!block.contains("properties"));
         // The calculate tenant's function enum is enumerated in its
