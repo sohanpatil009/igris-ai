@@ -1712,3 +1712,23 @@ YouTube task:
 Window controls: headed mode now uses only `--start-maximized` (kiosk mode
 removed) so minimise / maximise / close buttons stay visible and operable by
 the user. Headless automation is unaffected. Master was not touched.
+
+## "play rehbara song on youtube" - end-to-end timing (2026-11-22)
+
+The exact spoken-style task, warm Vulkan server per model, fresh browser and
+`browser.json` per run, wall-clock seconds from process start to exit. Ground
+truth = Chrome window title after the run (a real video title, not just a
+search-results page).
+
+| Run | LFM3-Omni-2B | Qwen3.5-4B |
+|---|---:|---:|
+| 1 | 5.40 s | 7.63 s |
+| 2 | 4.50 s | 7.58 s |
+| 3 | 5.27 s | 5.74 s |
+| **Avg** | **5.06 s** | **6.98 s** |
+| Video page reached | 3/3 | 3/3 |
+
+LFM3 is ~1.9 s faster (~28%) on this task. Both models reached a real video
+page (titles such as "'REHBARA' Official Lyrical Video | Abhijeet Srivastava"),
+not just the search results. Playback state (paused vs playing) was not
+instrumented here - the check is page-opened, not audio-decoding.
