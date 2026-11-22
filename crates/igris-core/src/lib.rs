@@ -25,3 +25,4 @@ pub mod toolgrammar;
 pub mod toolparse;
 pub mod tools;
 pub mod tts;
+pub mod vision;

@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Usage: {} <AUDIO_FILE> [REFERENCE_TXT]", args[0]);
         eprintln!("       {} live [WAV] [--model DIR]", args[0]);
         eprintln!("       {} hotkey [--model DIR]", args[0]);
-        eprintln!("       {} chat [PROMPT]", args[0]);
+        eprintln!("       {} chat [PROMPT] [--image PATH]", args[0]);
         eprintln!("       {} assist [WAV] [--model DIR] [--hotkey] [--no-tts] [--voice ID] [--cpu] [--no-tools]", args[0]);
         eprintln!("       {} speak \"TEXT\" [--voice ID]", args[0]);
         eprintln!();
@@ -76,7 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("                   answer streams (press again to barge-in)");
         eprintln!("  chat             prompt the local LLM via llama.cpp;");
         eprintln!("                   without PROMPT it runs an interactive loop");
-        eprintln!("                   MOON_LLM_MODEL=lfm3|qwen|qwen-moe picks the GGUF");
+        eprintln!("                   MOON_LLM_MODEL=lfm3|qwen picks the GGUF");
+        eprintln!("  chat --image   describe an image with Mirage, then ask the LLM about it");
         eprintln!("  speak            say TEXT out loud through piper TTS (assets/piper);");
         eprintln!("                   the voice in assets/tts downloads on first run;");
         eprintln!("                   --voice en_US-amy-low picks the smaller/faster voice");

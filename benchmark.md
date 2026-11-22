@@ -1625,3 +1625,25 @@ Both models run the same agent loop, grammar gate and skill selector - there
 is no model-specific optimisation to "copy over" to Qwen. The remaining slow
 rows are long-output and browser-click bound; the next lever would be a
 configurable answer-length cap, not fine-tuning.
+
+## Vision sidecar - Cactus Mirage (2026-11-22)
+
+Branch `vision`. Downloaded `Cactus-Compute/mirage` (`mirage.cact` 20.6 MB,
+`mirage.safetensors` 206.4 MB) and installed `cactus-compute` 4.2.6. Mirage is
+a standalone `.cact` vision model — it cannot be attached to LFM3/Qwen as an
+mmproj, so the CLI runs it as a Python sidecar, turns its large structured
+output into a short text summary (`scripts/mirage_describe.py`), and prefixes
+that to the normal chat prompt.
+
+| Probe | LFM3-Omni-2B | Qwen3.5-4B |
+|---|---:|---:|
+| Mirage engine load (first call) | 6.2 s | 6.2 s |
+| Mirage describe (one 1024x~ image) | 8.7 s | 8.7 s |
+| `chat --image overview.png "What does this image show?"` total | 15.17 s | 13.60 s |
+
+Both models answered correctly from the image description; Qwen stayed closer
+to the extracted text, LFM3 added plausible background knowledge about the
+site. LFM3 also emitted a `browser_open` call on this prompt (model behaviour,
+not a skill selection - the skill hint uses only the user's words). Text-only
+chat is unchanged; the vision path is opt-in via `--image`. The cost is ~10 s
+per image in this first implementation (no long-lived Python sidecar yet).

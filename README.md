@@ -158,6 +158,29 @@ not a measured speed win).
 Replies stream live after a minimal `ai:-` label — no timing or status lines
 around them.
 
+### Image understanding (optional, via Cactus Mirage)
+
+```bash
+cargo run --release -- chat --image photo.png "What does this image show?"
+```
+
+Mirage is a **standalone** vision model in Cactus's `.cact` format — it is not
+an llama.cpp projector, so it does not attach to LFM3-Omni or Qwen directly.
+Instead the CLI describes the image with Mirage (via the `cactus-compute`
+Python package as a local sidecar), then prepends that text to the normal
+chat prompt, and either model answers through the existing path. Text-only
+chats are unaffected. Setup:
+
+```bash
+python -m pip install -U cactus-compute
+# weights already provisioned in assets/mirage/ (mirage.cact ~21 MB, safetensors ~206 MB)
+```
+
+The first image in a process costs ~10 s (engine load + inference); later
+ones only pay inference. Set `MOON_PYTHON` if your interpreter is not `python`.
+Skill selection is based on your question only, never on the image text.
+See `scripts/mirage_describe.py` and `crates/igris-core/src/vision.rs`.
+
 ## Voice assistant: live STT -> LLM
 
 ```bash

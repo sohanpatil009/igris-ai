@@ -1929,11 +1929,12 @@ fn stream_persona(
     prompt: &str,
     max_tokens: i64,
     tools_on: bool,
+    skill_hint: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut history: Vec<Value> = vec![
         json!({
             "role": "system",
-            "content": system_prompt_with_tools(SYSTEM_PROMPT, tools_on, prompt)
+            "content": system_prompt_with_tools(SYSTEM_PROMPT, tools_on, skill_hint)
         }),
         json!({"role": "user", "content": prompt}),
     ];
@@ -1977,22 +1978,39 @@ fn stream_persona(
 pub fn cmd_chat(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut force_cpu = false;
     let mut no_tools = false;
+    let mut image: Option<String> = None;
     let mut rest: Vec<&str> = Vec::new();
-    for a in args {
-        if a == "--cpu" {
-            force_cpu = true;
-        } else if a == "--no-tools" {
-            no_tools = true;
-        } else {
-            rest.push(a.as_str());
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--cpu" => force_cpu = true,
+            "--no-tools" => no_tools = true,
+            "--image" => {
+                image = Some(
+                    iter.next()
+                        .ok_or("chat --image needs a path to an image file")?
+                        .clone(),
+                );
+            }
+            _ => rest.push(a.as_str()),
         }
     }
     let tools_on = tools_enabled(no_tools);
-    let prompt = rest.join(" ");
+    let question = rest.join(" ");
+    /* Skill selection must see only the user's words: an image description
+     * can contain 'website'/'file'/'search' and would pick a bogus skill. */
+    let skill_hint = question.clone();
+    let prompt = if let Some(path) = image {
+        println!("  vision   : describing {path} with Mirage (first run loads the engine)...");
+        let description = crate::vision::describe_image(std::path::Path::new(&path))?;
+        format!("[Image analysis]\n{description}\n\nUser question: {question}")
+    } else {
+        question
+    };
     ensure_server(force_cpu)?;
 
     if !prompt.is_empty() {
-        return stream_persona(&prompt, 1024, tools_on);
+        return stream_persona(&prompt, 1024, tools_on, &skill_hint);
     }
 
     println!("Type a prompt (empty line or 'exit' to quit):");
@@ -2007,7 +2025,7 @@ pub fn cmd_chat(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if q.is_empty() || q.eq_ignore_ascii_case("exit") || q.eq_ignore_ascii_case("quit") {
             break;
         }
-        if let Err(e) = stream_persona(q, 1024, tools_on) {
+        if let Err(e) = stream_persona(q, 1024, tools_on, q) {
             println!("  error: {e}");
         }
     }
